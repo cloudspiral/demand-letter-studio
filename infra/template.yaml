@@ -1,0 +1,81 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Demand Letter Studio local-first AWS deployment shape
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 1024
+    Runtime: nodejs22.x
+    Architectures: [arm64]
+    Environment:
+      Variables:
+        DOCUMENT_BUCKET: !Ref DocumentBucket
+        GENERATION_QUEUE_URL: !Ref GenerationQueue
+        DATABASE_URL: '{{resolve:secretsmanager:demand-letter-studio/database-url}}'
+
+Resources:
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../apps/api
+      Handler: dist/lambda.handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /api/{proxy+}
+            Method: ANY
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref DocumentBucket
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt GenerationQueue.QueueName
+
+  DocumentWorker:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: python3.13
+      CodeUri: ../services/document-worker
+      Handler: lambda_handler.handler
+      Timeout: 900
+      MemorySize: 2048
+      Events:
+        Generation:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt GenerationQueue.Arn
+            BatchSize: 1
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref DocumentBucket
+
+  GenerationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 960
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt GenerationDeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  GenerationDeadLetterQueue:
+    Type: AWS::SQS::Queue
+
+  DocumentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+Outputs:
+  ApiUrl:
+    Value: !Sub https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com

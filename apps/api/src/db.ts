@@ -1,0 +1,183 @@
+import pg from "pg";
+import { config } from "./config";
+
+const { Pool } = pg;
+export const pool = new Pool({ connectionString: config.databaseUrl, max: 10 });
+
+const migrations = `
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+CREATE TABLE IF NOT EXISTS workspaces (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  name text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS actors (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id uuid NOT NULL REFERENCES workspaces(id),
+  actor_type text NOT NULL CHECK (actor_type IN ('human','agent')),
+  display_name text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS templates (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id uuid NOT NULL REFERENCES workspaces(id),
+  name text NOT NULL,
+  status text NOT NULL CHECK (status IN ('analyzed','confirmed')),
+  storage_key text NOT NULL,
+  sha256 text NOT NULL,
+  analysis jsonb NOT NULL,
+  confirmed_regions jsonb,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS matters (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id uuid NOT NULL REFERENCES workspaces(id),
+  name text NOT NULL,
+  template_id uuid REFERENCES templates(id),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS source_documents (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  matter_id uuid NOT NULL REFERENCES matters(id) ON DELETE CASCADE,
+  name text NOT NULL,
+  mime_type text NOT NULL,
+  storage_key text NOT NULL,
+  sha256 text NOT NULL,
+  page_count integer NOT NULL DEFAULT 0,
+  status text NOT NULL CHECK (status IN ('processing','ready','failed')),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS source_pages (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  source_id uuid NOT NULL REFERENCES source_documents(id) ON DELETE CASCADE,
+  page_number integer NOT NULL,
+  extracted_text text NOT NULL,
+  UNIQUE(source_id, page_number)
+);
+CREATE TABLE IF NOT EXISTS facts (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  matter_id uuid NOT NULL REFERENCES matters(id) ON DELETE CASCADE,
+  source_id uuid NOT NULL REFERENCES source_documents(id) ON DELETE CASCADE,
+  page_number integer NOT NULL,
+  kind text NOT NULL CHECK (kind IN ('amount','person','date')),
+  label text NOT NULL,
+  value text NOT NULL,
+  confidence numeric(4,3) NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS jobs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  matter_id uuid NOT NULL REFERENCES matters(id) ON DELETE CASCADE,
+  job_type text NOT NULL DEFAULT 'generation',
+  status text NOT NULL CHECK (status IN ('queued','processing','completed','failed')),
+  progress integer NOT NULL DEFAULT 0,
+  step text NOT NULL DEFAULT 'Queued',
+  draft_id uuid,
+  error text,
+  attempts integer NOT NULL DEFAULT 0,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS job_events (
+  id bigserial PRIMARY KEY,
+  job_id uuid NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+  event_type text NOT NULL,
+  payload jsonb NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS drafts (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  matter_id uuid NOT NULL REFERENCES matters(id) ON DELETE CASCADE,
+  current_version integer NOT NULL DEFAULT 1,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS draft_versions (
+  draft_id uuid NOT NULL REFERENCES drafts(id) ON DELETE CASCADE,
+  version integer NOT NULL,
+  content jsonb NOT NULL,
+  actor_id uuid REFERENCES actors(id),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (draft_id, version)
+);
+CREATE TABLE IF NOT EXISTS citations (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  draft_id uuid NOT NULL REFERENCES drafts(id) ON DELETE CASCADE,
+  draft_version integer NOT NULL,
+  block_id text NOT NULL,
+  source_id uuid NOT NULL REFERENCES source_documents(id),
+  page_number integer NOT NULL,
+  quote text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  FOREIGN KEY (draft_id, draft_version) REFERENCES draft_versions(draft_id, version) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS edit_proposals (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  draft_id uuid NOT NULL REFERENCES drafts(id) ON DELETE CASCADE,
+  base_version integer NOT NULL,
+  status text NOT NULL CHECK (status IN ('pending','accepted','rejected')),
+  instruction text NOT NULL,
+  proposal jsonb NOT NULL,
+  actor_id uuid REFERENCES actors(id),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  resolved_at timestamptz
+);
+CREATE TABLE IF NOT EXISTS activity_events (
+  id bigserial PRIMARY KEY,
+  workspace_id uuid NOT NULL REFERENCES workspaces(id),
+  matter_id uuid REFERENCES matters(id),
+  actor_id uuid REFERENCES actors(id),
+  event_type text NOT NULL,
+  summary text NOT NULL,
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS ai_runs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id uuid NOT NULL REFERENCES workspaces(id),
+  matter_id uuid REFERENCES matters(id),
+  provider text NOT NULL,
+  model text NOT NULL,
+  purpose text NOT NULL,
+  status text NOT NULL,
+  input_tokens integer,
+  output_tokens integer,
+  latency_ms integer,
+  error_code text,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+`;
+
+export async function migrate(): Promise<void> {
+  await pool.query(migrations);
+  await pool.query(`
+    INSERT INTO workspaces (id, name)
+    VALUES ('00000000-0000-4000-8000-000000000001', 'Steno Demo Firm')
+    ON CONFLICT (id) DO NOTHING;
+    INSERT INTO actors (id, workspace_id, actor_type, display_name)
+    VALUES ('00000000-0000-4000-8000-000000000101', '00000000-0000-4000-8000-000000000001', 'human', 'Faby Rivera')
+    ON CONFLICT (id) DO NOTHING;
+  `);
+}
+
+export const WORKSPACE_ID = "00000000-0000-4000-8000-000000000001";
+export const ACTOR_ID = "00000000-0000-4000-8000-000000000101";
+
+export async function persistCitations(
+  client: pg.PoolClient,
+  draftId: string,
+  version: number,
+  content: { sections: Array<{ blocks: Array<{ id: string; citations: Array<{ sourceId: string; page: number | null; quote: string }> }> }> },
+): Promise<void> {
+  for (const block of content.sections.flatMap((section) => section.blocks)) {
+    for (const citation of block.citations) {
+      if (citation.page !== null) {
+        await client.query(`
+          INSERT INTO citations (draft_id, draft_version, block_id, source_id, page_number, quote)
+          VALUES ($1, $2, $3, $4, $5, $6)
+        `, [draftId, version, block.id, citation.sourceId, citation.page, citation.quote]);
+      }
+    }
+  }
+}

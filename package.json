@@ -1,0 +1,23 @@
+{
+  "name": "demand-letter-studio",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@10.15.0",
+  "scripts": {
+    "dev": "concurrently -n api,web -c blue,green \"pnpm --filter @steno/api dev\" \"pnpm --filter @steno/web dev\"",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test && python3 -m unittest discover -s services/document-worker -p 'test_*.py'",
+    "test:unit": "pnpm --filter @steno/contracts test && pnpm --filter @steno/api test",
+    "test:e2e": "pnpm --filter @steno/web test:e2e",
+    "verify": "pnpm typecheck && pnpm test && pnpm build",
+    "db:up": "docker compose up -d postgres",
+    "db:down": "docker compose down",
+    "db:logs": "docker compose logs -f postgres"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}

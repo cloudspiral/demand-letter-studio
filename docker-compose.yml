@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: steno
+      POSTGRES_USER: steno
+      POSTGRES_PASSWORD: steno
+    ports:
+      - "5438:5432"
+    volumes:
+      - steno-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U steno -d steno"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  steno-postgres:
