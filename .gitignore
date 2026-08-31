@@ -1,0 +1,79 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment variables and credentials
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+credentials*.json
+
+# Node.js / TypeScript
+node_modules/
+.pnpm-store/
+.yarn/
+.npm/
+dist/
+build/
+.next/
+.vite/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Tests and local tooling
+coverage/
+playwright-report/
+test-results/
+.cache/
+.turbo/
+
+# AWS / infrastructure build output
+.aws-sam/
+.serverless/
+cdk.out/
+
+# Local runtime data
+tmp/
+temp/
+logs/
+uploads/
+artifacts/
+*.log
+
+# Source case files and handoff archives stay local by default.
+# Sanitized fixtures may be explicitly committed under tests/fixtures/.
+design-handoff/
+.data/
+*.doc
+*.docx
+*.pdf
+*.zip
+!tests/fixtures/**/*.docx
+!tests/fixtures/**/*.pdf
+!tests/fixtures/**/*.zip
