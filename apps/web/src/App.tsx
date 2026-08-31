@@ -1,16 +1,18 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useEditor, EditorContent } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import {
   Activity, ArrowLeft, Check, ChevronRight, CircleAlert, Clock3, Download, FileImage, FileText,
   History, LoaderCircle, PanelRightClose, PanelRightOpen, Save, Send, ShieldCheck, Sparkles, Upload,
-  UserRound, X,
+  UserRound, UsersRound, X,
 } from "lucide-react";
 import type { DraftBlock, GeneratedDraft, TemplateRegion } from "@steno/contracts";
-import { api, upload } from "./api";
+import { api, download, setDemoToken, upload } from "./api";
 import type {
-  ActivityResponse, DraftResponse, JobResponse, MatterResponse, ProposalResponse, SourceResponse, TemplateResponse,
+  ActivityResponse, CollaborationIdentitiesResponse, DemoIdentityResponse, DraftResponse, JobResponse, MatterResponse,
+  ProposalResponse, SourceResponse, TemplateResponse,
 } from "./types";
+import { CollaborativeEditor } from "./CollaborativeEditor";
 
 type SetupStep = "template" | "regions" | "sources" | "ready";
 
@@ -181,6 +183,10 @@ export function App() {
   const [activityOpen, setActivityOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [collaborationConfig, setCollaborationConfig] = useState<CollaborationIdentitiesResponse | null>(null);
+  const [identity, setIdentity] = useState<DemoIdentityResponse | null>(null);
+  const [collaborationMode, setCollaborationMode] = useState(() => new URLSearchParams(window.location.search).get("collab") === "1");
+  const restoredFromUrl = useRef(false);
 
   const loadActivity = useCallback(async (matterId: string) => setActivity(await api(`/api/matters/${matterId}/activity`)), []);
   const openMatter = useCallback(async (matterId: string) => {
@@ -193,6 +199,36 @@ export function App() {
     setDraft(loaded); setWorkingContent(loaded.content); setDirty(false);
     setSelectedBlockId(loaded.content.sections.flatMap((section) => section.blocks)[0]?.id ?? null);
   }, []);
+
+  useEffect(() => {
+    void api<CollaborationIdentitiesResponse>("/api/collaboration/identities").then((result) => {
+      setCollaborationConfig(result);
+      const requested = new URLSearchParams(window.location.search).get("identity");
+      const selected = result.identities.find((candidate) => candidate.slug === requested) ?? result.identities[0] ?? null;
+      setIdentity(selected);
+      setDemoToken(selected?.token ?? null);
+    });
+  }, []);
+
+  useEffect(() => {
+    if (restoredFromUrl.current) return;
+    const params = new URLSearchParams(window.location.search);
+    const matterId = params.get("matterId");
+    const draftId = params.get("draftId");
+    if (!matterId || !draftId) return;
+    restoredFromUrl.current = true;
+    void openMatter(matterId).then(() => loadDraft(draftId));
+  }, [loadDraft, openMatter]);
+
+  useEffect(() => {
+    if (!matter || !draft) return;
+    const params = new URLSearchParams();
+    params.set("matterId", matter.id);
+    params.set("draftId", draft.id);
+    if (identity) params.set("identity", identity.slug);
+    if (collaborationMode) params.set("collab", "1");
+    window.history.replaceState(null, "", `/?${params.toString()}`);
+  }, [collaborationMode, draft, identity, matter]);
 
   const generate = async () => {
     if (!matter) return;
@@ -262,6 +298,19 @@ export function App() {
     finally { setBusy(false); }
   };
 
+  const exportDraft = async () => {
+    if (!draft) return;
+    setNotice(null);
+    try {
+      const result = await download(`/api/drafts/${draft.id}/export.docx`);
+      const url = URL.createObjectURL(result.blob);
+      const link = document.createElement("a");
+      link.href = url; link.download = result.filename; link.click();
+      URL.revokeObjectURL(url);
+      if (matter) await loadActivity(matter.id);
+    } catch (caught) { setNotice(caught instanceof Error ? caught.message : "Export failed"); }
+  };
+
   const showCitation = async (sourceId: string, sourceName: string, page: number) => {
     const source = await api<{ sourceId: string; sourceName: string; page: number; text: string }>(`/api/sources/${sourceId}/pages/${page}`);
     setSelectedSource({ ...source, sourceName }); setSourceOpen(true);
@@ -276,8 +325,12 @@ export function App() {
         <div className="matter-title"><span>MATTER</span><strong>{matter.name}</strong></div>
         <div className="top-actions">
           <button className="icon-button" title="Activity" onClick={() => setActivityOpen((value) => !value)}><History size={18} /></button>
-          <button className="avatar" title="Local demo user">FR</button>
-          {draft && <a className="export-button" href={`/api/drafts/${draft.id}/export.docx`}><Download size={16} /> Export Word</a>}
+          {identity && collaborationConfig && <select className="identity-picker" aria-label="Demo identity" value={identity.slug} onChange={(event) => {
+            const selected = collaborationConfig.identities.find((candidate) => candidate.slug === event.target.value) ?? identity;
+            setIdentity(selected); setDemoToken(selected.token);
+          }}>{collaborationConfig.identities.map((candidate) => <option key={candidate.id} value={candidate.slug}>{candidate.name}</option>)}</select>}
+          <button className="avatar" title={identity?.name ?? "Local demo user"}>{identity?.name.split(" ").map((part) => part[0]).join("") ?? "FR"}</button>
+          {draft && <button className="export-button" onClick={() => void exportDraft()}><Download size={16} /> Export Word</button>}
         </div>
       </header>
 
@@ -286,7 +339,7 @@ export function App() {
           <button className="nav-item active"><FileText size={18} /><span>Draft</span></button>
           <button className="nav-item" onClick={() => setActivityOpen(true)}><Activity size={18} /><span>Activity</span></button>
           <div className="nav-spacer" />
-          <button className="nav-item" onClick={() => setMatter(null)}><ArrowLeft size={18} /><span>New matter</span></button>
+          <button className="nav-item" onClick={() => { setMatter(null); setDraft(null); setWorkingContent(null); window.history.replaceState(null, "", "/"); }}><ArrowLeft size={18} /><span>New matter</span></button>
         </aside>
 
         <main className="workspace">
@@ -311,12 +364,22 @@ export function App() {
               <div><p className="eyebrow">Draft editor</p><span>Version {draft.version} · {dirty ? "Unsaved changes" : "All changes saved"}</span></div>
               <div className="toolbar-actions">
                 {notice && <span className="notice">{notice}</span>}
+                {collaborationConfig && identity && <button className={`secondary small collaboration-toggle ${collaborationMode ? "active" : ""}`} onClick={() => setCollaborationMode((value) => !value)}>
+                  <UsersRound size={15} /> {collaborationMode ? "Reviewed blocks" : "Live collaboration"}
+                </button>}
                 <button className="secondary small" onClick={() => void save()} disabled={!dirty || busy}><Save size={15} /> Save</button>
                 <button className="icon-button" onClick={() => setSourceOpen((value) => !value)} title="Toggle source rail">{sourceOpen ? <PanelRightClose size={18} /> : <PanelRightOpen size={18} />}</button>
               </div>
             </div>
             <div className="document-scroll">
-              <article className="paper">
+              {collaborationMode && collaborationConfig && identity ? <article className="paper collaboration-paper">
+                <CollaborativeEditor
+                  draftId={draft.id}
+                  content={workingContent}
+                  websocketUrl={collaborationConfig.websocketUrl}
+                  identity={identity}
+                />
+              </article> : <article className="paper">
                 <div className="letterhead"><span className="letterhead-mark">AV</span><div><strong>ATTORNEY REVIEW DRAFT</strong><small>Generated from reviewed template · Not ready to send</small></div></div>
                 <h1>{workingContent.title}</h1>
                 {workingContent.warnings.map((warning) => <div className="document-warning" key={warning}><CircleAlert size={16} />{warning}</div>)}
@@ -330,7 +393,7 @@ export function App() {
                     <BlockEditor block={block} active={selectedBlockId === block.id} onFocus={() => setSelectedBlockId(block.id)} onChange={(text) => updateBlock(block.id, text)} />
                   </div>)}
                 </section>)}
-              </article>
+              </article>}
             </div>
             <div className="refine-bar">
               <div className="ai-glyph"><Sparkles size={18} /></div>

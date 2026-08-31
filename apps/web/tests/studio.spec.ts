@@ -32,11 +32,11 @@ test("complete reviewed-template workflow", async ({ page }) => {
 
   await page.getByRole("button", { name: "Activity" }).first().click();
   await expect(page.getByText("Accepted an AI edit proposal")).toBeVisible();
-  await expect(page.getByText("Faby Rivera").first()).toBeVisible();
+  await expect(page.locator(".activity-drawer").getByText("Faby Rivera", { exact: true }).first()).toBeVisible();
   await page.locator(".activity-drawer .icon-button").click();
 
   const downloadPromise = page.waitForEvent("download");
-  await page.getByRole("link", { name: "Export Word" }).click();
+  await page.getByRole("button", { name: "Export Word" }).click();
   const download = await downloadPromise;
   expect(download.suggestedFilename()).toMatch(/\.docx$/);
 });

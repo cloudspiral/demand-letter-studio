@@ -156,6 +156,14 @@ CREATE TABLE IF NOT EXISTS ai_runs (
   error_code text,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS collaboration_documents (
+  document_name text PRIMARY KEY,
+  workspace_id uuid NOT NULL REFERENCES workspaces(id),
+  draft_id uuid NOT NULL UNIQUE REFERENCES drafts(id) ON DELETE CASCADE,
+  snapshot bytea NOT NULL,
+  version bigint NOT NULL DEFAULT 1,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
 
 ALTER TABLE jobs ALTER COLUMN status SET DEFAULT 'queued';
 `;
@@ -167,7 +175,11 @@ export async function migrate(): Promise<void> {
     VALUES ('00000000-0000-4000-8000-000000000001', 'Steno Demo Firm')
     ON CONFLICT (id) DO NOTHING;
     INSERT INTO actors (id, workspace_id, actor_type, display_name)
-    VALUES ('00000000-0000-4000-8000-000000000101', '00000000-0000-4000-8000-000000000001', 'human', 'Faby Rivera')
+    VALUES
+      ('00000000-0000-4000-8000-000000000101', '00000000-0000-4000-8000-000000000001', 'human', 'Faby Rivera'),
+      ('00000000-0000-4000-8000-000000000102', '00000000-0000-4000-8000-000000000001', 'human', 'Alex Chen'),
+      ('00000000-0000-4000-8000-000000000201', '00000000-0000-4000-8000-000000000001', 'agent', 'Faby Rivera Agent'),
+      ('00000000-0000-4000-8000-000000000202', '00000000-0000-4000-8000-000000000001', 'agent', 'Alex Chen Agent')
     ON CONFLICT (id) DO NOTHING;
   `);
 }

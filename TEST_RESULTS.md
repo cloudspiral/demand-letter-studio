@@ -1,18 +1,20 @@
 # Test Results
 
-Last run: 2026-08-31 on macOS, Node 22.23, PostgreSQL 17 (Docker), locked Python 3.13 worker environment, headless LibreOffice, and installed Google Chrome.
+Last run: 2026-08-31 on macOS, Node 22.23, PostgreSQL 17 (Docker), locked Python 3.13 worker environment, headless LibreOffice, and installed Google Chrome. Collaboration results apply to `stretch/collaboration`; the DOCX evidence below remains the verified `v1-checkpoint` evidence.
 
 ## Automated
 
 | Gate | Result |
 |---|---|
 | `pnpm typecheck` | Passed for contracts, API, and web |
-| `pnpm test` | Passed: 2 contract tests, 8 API tests, 6 Python document-worker tests |
-| `pnpm --filter @steno/web test:e2e` | Passed: one complete Playwright workflow (setup, five sources, source page, generation/SSE, edit/save, proposal/accept, activity, Word download) |
+| `pnpm test` | Passed: 2 contract tests, 11 API tests, 6 Python document-worker tests |
+| `pnpm --filter @steno/web exec playwright test --workers=1` | Passed: two Playwright workflows—the complete v1 upload-to-export flow plus two-context collaboration |
 | Refinement SSE smoke | Passed: emitted `status` followed by the persisted `proposal` event |
 | `pnpm build` | Passed for contracts, API/Lambda bundles, and production web assets |
 
 Coverage includes schema rejection, provider adapter parity, citation resolution, unsupported-fact handling, completed-letter canary names/amounts, editable-region coverage, template classification, tracked-change rejection, name/date/amount extraction, OOXML patching, and opaque asset preservation.
+
+Collaboration coverage additionally verifies token round-trips and tamper rejection, two signed identities, presence, real-time text convergence, persisted snapshot versions, reload/reconnect, paired agent attribution, explicit rejection, activity history, and unchanged v1 Word download behavior.
 
 ## Live integration
 
@@ -22,6 +24,8 @@ Coverage includes schema rejection, provider adapter parity, citation resolution
 - Activity attributed generation, save, acceptance, and rejection to the local actor.
 - Browser console had no warnings or errors.
 - A live OpenAI `gpt-5.6-sol` generation completed in 73.241 seconds with the strict response schema, page-citation validation, editable-region coverage guard, and verified header replacement path enabled.
+- The stretch server ran Fastify on port 3001 and Hocuspocus on port 1234. A raw two-provider Yjs smoke test and the two-Chrome-context workflow both converged.
+- Yjs snapshot publication into reviewed `draft_versions` remains intentionally incomplete; collaboration working-copy text is not included in DOCX export. See `STRETCH_RESULTS.md`.
 
 ## DOCX verification
 

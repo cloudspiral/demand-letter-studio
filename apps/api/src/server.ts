@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import Fastify, { type FastifyInstance } from "fastify";
+import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
 import cors from "@fastify/cors";
 import multipart from "@fastify/multipart";
 import AdmZip from "adm-zip";
@@ -14,10 +14,11 @@ import {
 } from "@steno/contracts";
 import { createAiProvider, type EvidencePage } from "./ai";
 import { config } from "./config";
-import { ACTOR_ID, migrate, persistCitations, pool, WORKSPACE_ID } from "./db";
+import { migrate, persistCitations, pool, WORKSPACE_ID } from "./db";
 import { analyzeTemplate, exportDocx, extractSource } from "./document-worker";
 import { appendJobEvent, processGenerationJob, resumeQueuedJobs } from "./jobs";
 import { pathForKey, putFile } from "./storage";
+import { DEMO_IDENTITIES, publicDemoIdentities, verifyDemoIdentity } from "./identity";
 
 const CreateMatterSchema = z.object({ name: z.string().min(1).max(200), templateId: z.string().uuid() });
 const ConfirmTemplateSchema = z.object({ regions: z.array(TemplateRegionSchema).min(1) });
@@ -37,6 +38,18 @@ function requiredRow<T>(rows: T[], message: string): T {
   const row = rows[0];
   if (!row) throw new Error(message);
   return row;
+}
+
+function identityForRequest(request: FastifyRequest) {
+  const supplied = request.headers["x-demo-token"];
+  const token = Array.isArray(supplied) ? supplied[0] : supplied;
+  if (!token) return requiredRow(DEMO_IDENTITIES, "A local demo identity is required.");
+  const identity = verifyDemoIdentity(token);
+  if (!identity) {
+    const error = Object.assign(new Error("Invalid local demo identity."), { statusCode: 401 });
+    throw error;
+  }
+  return identity;
 }
 
 async function insertTemplate(buffer: Buffer, filename: string) {
@@ -136,7 +149,7 @@ async function evidenceForDraft(draftId: string): Promise<EvidencePage[]> {
 
 export async function buildApp(options: { runMigrations?: boolean } = {}): Promise<FastifyInstance> {
   if (options.runMigrations !== false) await migrate();
-  const app = Fastify({ logger: { redact: ["req.headers.authorization", "req.headers.cookie", "req.body"] } });
+  const app = Fastify({ logger: { redact: ["req.headers.authorization", "req.headers.cookie", "req.headers.x-demo-token", "req.body"] } });
   await app.register(cors, { origin: config.webOrigin });
   await app.register(multipart, { limits: { fileSize: 30 * 1024 * 1024, files: 10 } });
 
@@ -148,6 +161,21 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
   });
 
   app.get("/api/health", async () => ({ ok: true }));
+
+  app.get("/api/collaboration/identities", async () => ({
+    websocketUrl: `ws://127.0.0.1:${config.collaborationPort}`,
+    identities: publicDemoIdentities(),
+  }));
+
+  app.get("/api/collaboration/drafts/:id/status", async (request) => {
+    const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+    const result = await pool.query(`
+      SELECT document_name AS "documentName", version, updated_at AS "updatedAt"
+      FROM collaboration_documents WHERE draft_id = $1
+    `, [id]);
+    const status = result.rows[0] as { documentName: string; version: string | number; updatedAt: string } | undefined;
+    return status ? { ...status, version: Number(status.version) } : { documentName: `draft:${id}`, version: 0, updatedAt: null };
+  });
 
   app.get("/api/templates", async () => {
     const result = await pool.query(`
@@ -318,6 +346,7 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
   app.put("/api/drafts/:id", async (request, reply) => {
     const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
     const body = SaveDraftSchema.parse(request.body);
+    const identity = identityForRequest(request);
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
@@ -337,14 +366,14 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
       const nextVersion = body.version + 1;
       await client.query(
         "INSERT INTO draft_versions (draft_id, version, content, actor_id) VALUES ($1, $2, $3, $4)",
-        [id, nextVersion, JSON.stringify(body.content), ACTOR_ID],
+        [id, nextVersion, JSON.stringify(body.content), identity.id],
       );
       await persistCitations(client, id, nextVersion, body.content);
       await client.query("UPDATE drafts SET current_version = $2, updated_at = now() WHERE id = $1", [id, nextVersion]);
       await client.query(`
         INSERT INTO activity_events (workspace_id, matter_id, actor_id, event_type, summary, metadata)
         VALUES ($1, $2, $3, 'draft.saved', 'Saved direct draft edits', $4)
-      `, [WORKSPACE_ID, lockedDraft.matter_id, ACTOR_ID, JSON.stringify({ draftId: id, version: nextVersion })]);
+      `, [WORKSPACE_ID, lockedDraft.matter_id, identity.id, JSON.stringify({ draftId: id, version: nextVersion })]);
       await client.query("COMMIT");
       return await loadDraft(id);
     } catch (error) {
@@ -358,6 +387,7 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
   app.post("/api/drafts/:id/refinements", async (request, reply) => {
     const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
     const body = RefineSchema.parse(request.body);
+    const identity = identityForRequest(request);
     const draft = await loadDraft(id);
     if (!draft) return reply.status(404).send({ error: "Draft not found." });
     const content = GeneratedDraftSchema.parse(draft.content);
@@ -397,8 +427,18 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
       INSERT INTO edit_proposals (draft_id, base_version, status, instruction, proposal, actor_id)
       VALUES ($1, $2, 'pending', $3, $4, $5)
       RETURNING id, draft_id AS "draftId", base_version AS "baseVersion", status, instruction, proposal, created_at AS "createdAt"
-    `, [id, draft.version, body.instruction, JSON.stringify(proposal), ACTOR_ID]);
+    `, [id, draft.version, body.instruction, JSON.stringify(proposal), identity.agentId]);
     const savedProposal = requiredRow(saved.rows, "Proposal insert did not return a record.");
+    await pool.query(`
+      INSERT INTO activity_events (workspace_id, matter_id, actor_id, event_type, summary, metadata)
+      VALUES ($1, $2, $3, 'agent.proposal.created', $4, $5)
+    `, [
+      WORKSPACE_ID,
+      draft.matterId,
+      identity.agentId,
+      `${identity.agentName} proposed an edit for ${identity.name}`,
+      JSON.stringify({ proposalId: savedProposal.id, draftId: id, onBehalfOf: identity.id }),
+    ]);
     if (wantsStream) {
       reply.raw.write(`event: proposal\ndata: ${JSON.stringify(savedProposal)}\n\n`);
       reply.raw.end();
@@ -409,6 +449,7 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
 
   app.post("/api/proposals/:id/accept", async (request, reply) => {
     const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+    const identity = identityForRequest(request);
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
@@ -451,7 +492,7 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
       const nextVersion = row.current_version + 1;
       await client.query(
         "INSERT INTO draft_versions (draft_id, version, content, actor_id) VALUES ($1, $2, $3, $4)",
-        [row.draft_id, nextVersion, JSON.stringify(updated), ACTOR_ID],
+        [row.draft_id, nextVersion, JSON.stringify(updated), identity.id],
       );
       await persistCitations(client, row.draft_id, nextVersion, updated);
       await client.query("UPDATE drafts SET current_version = $2, updated_at = now() WHERE id = $1", [row.draft_id, nextVersion]);
@@ -459,7 +500,7 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
       await client.query(`
         INSERT INTO activity_events (workspace_id, matter_id, actor_id, event_type, summary, metadata)
         VALUES ($1, $2, $3, 'proposal.accepted', 'Accepted an AI edit proposal', $4)
-      `, [WORKSPACE_ID, row.matter_id, ACTOR_ID, JSON.stringify({ proposalId: id, version: nextVersion })]);
+      `, [WORKSPACE_ID, row.matter_id, identity.id, JSON.stringify({ proposalId: id, version: nextVersion })]);
       await client.query("COMMIT");
       return reply.send({ proposalId: id, status: "accepted", draft: await loadDraft(row.draft_id) });
     } catch (error) {
@@ -472,6 +513,7 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
 
   app.post("/api/proposals/:id/reject", async (request, reply) => {
     const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+    const identity = identityForRequest(request);
     const result = await pool.query(`
       UPDATE edit_proposals SET status = 'rejected', resolved_at = now()
       WHERE id = $1 AND status = 'pending'
@@ -483,12 +525,13 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
     await pool.query(`
       INSERT INTO activity_events (workspace_id, matter_id, actor_id, event_type, summary, metadata)
       VALUES ($1, $2, $3, 'proposal.rejected', 'Rejected an AI edit proposal', $4)
-    `, [WORKSPACE_ID, matter.rows[0]?.matter_id ?? null, ACTOR_ID, JSON.stringify({ proposalId: id })]);
+    `, [WORKSPACE_ID, matter.rows[0]?.matter_id ?? null, identity.id, JSON.stringify({ proposalId: id })]);
     return rejected;
   });
 
   app.get("/api/drafts/:id/export.docx", async (request, reply) => {
     const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+    const identity = identityForRequest(request);
     const result = await pool.query<{
       matter_name: string; storage_key: string; content: unknown; current_version: number;
     }>(`
@@ -512,7 +555,7 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
     await pool.query(`
       INSERT INTO activity_events (workspace_id, matter_id, actor_id, event_type, summary, metadata)
       SELECT $1, matter_id, $2, 'draft.exported', 'Exported a versioned Word document', $3 FROM drafts WHERE id = $4
-    `, [WORKSPACE_ID, ACTOR_ID, JSON.stringify({ draftId: id, version: row.current_version }), id]);
+    `, [WORKSPACE_ID, identity.id, JSON.stringify({ draftId: id, version: row.current_version }), id]);
     const buffer = await fs.readFile(outputPath);
     return reply.header("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
       .header("Content-Disposition", `attachment; filename="${safeDownloadName(row.matter_name)}-v${row.current_version}.docx"`)

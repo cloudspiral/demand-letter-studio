@@ -60,3 +60,19 @@ export interface ActivityResponse {
   actorType: "human" | "agent";
   createdAt: string;
 }
+
+export interface DemoIdentityResponse {
+  id: string;
+  slug: "faby" | "alex";
+  name: string;
+  email: string;
+  color: string;
+  agentId: string;
+  agentName: string;
+  token: string;
+}
+
+export interface CollaborationIdentitiesResponse {
+  websocketUrl: string;
+  identities: DemoIdentityResponse[];
+}

@@ -35,6 +35,10 @@
 
 The local API runner and filesystem store are development adapters. `infra/template.yaml` maps the interfaces to API Gateway/Lambda, SQS with a DLQ, and encrypted/versioned/private S3. PostgreSQL remains external and is expected to use a managed private database in a deployment. Cognito is a future identity boundary, not implemented in v1.
 
-## Collaboration seam
+## Collaboration implementation
 
-The v1 schema already carries workspace/actor attribution, version history, proposals, and activity semantics. The stretch branch can layer Hocuspocus/Yjs transport and snapshots over the editor while retaining proposals as the boundary for agent edits. See ADR 0004.
+The stretch branch runs an authenticated Hocuspocus server beside Fastify. A document name is strictly `draft:<uuid>`; authentication verifies an HMAC-signed local identity, resolves the draft through its matter, and enforces the workspace boundary before loading state. Hocuspocus stores debounced Yjs state updates in `collaboration_documents`, while awareness remains ephemeral. The React client creates providers in an effect with deterministic cleanup so development Strict Mode cannot leave ghost sessions.
+
+Faby Rivera and Alex Chen each have a human actor and a paired agent actor. Human requests carry a redacted `x-demo-token`. Direct saves, exports, proposal decisions, and collaboration snapshots use the verified human actor. Refinement proposals use the paired agent actor and record the human in `onBehalfOf` metadata. Agents never mutate shared text silently.
+
+The v1 versioned JSON representation remains the citation/export authority. The Yjs document is currently an attributed, persisted working copy; publishing it back into `draft_versions` is intentionally unresolved because a safe bridge must retain stable block IDs, citations, unsupported markers, and optimistic version semantics. Word export therefore ignores unreviewed Yjs snapshots. See ADR 0004 and `STRETCH_RESULTS.md`.

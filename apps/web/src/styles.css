@@ -76,6 +76,23 @@ button { color: inherit; }
 .proposal-toast { position: fixed; z-index: 70; right: 354px; bottom: 92px; width: min(560px, calc(100vw - 30px)); padding: 18px; border: 1px solid #b8c9ed; border-radius: 12px; background: white; box-shadow: 0 18px 60px rgba(26,42,72,.23); }.proposal-head { display: flex; align-items: center; gap: 8px; color: var(--blue); }.proposal-head strong { color: var(--navy); font-size: 13px; }.proposal-head span { margin-left: auto; padding: 3px 6px; border-radius: 4px; color: #7d5d20; background: #fff3d9; font-size: 8px; font-weight: 700; text-transform: uppercase; }.proposal-toast > p { color: var(--muted); font-size: 11px; }.diff { display: grid; gap: 7px; max-height: 170px; overflow: auto; font-family: Georgia, serif; font-size: 11px; line-height: 1.5; }.diff del,.diff ins { padding: 9px; border-radius: 5px; text-decoration: none; }.diff del { color: #8f3d3d; background: #fff1f1; text-decoration: line-through; }.diff ins { color: #245f4c; background: #edf9f5; }.proposal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }.proposal-actions button { min-height: 34px; font-size: 10px; }
 .drawer-backdrop { position: fixed; z-index: 80; inset: 0; background: rgba(18,29,48,.32); }.activity-drawer { position: absolute; top: 0; right: 0; width: min(400px, 94vw); height: 100%; background: white; box-shadow: -12px 0 40px rgba(21,34,57,.16); }.timeline { height: calc(100% - 72px); padding: 18px; overflow-y: auto; }.timeline-event { display: grid; grid-template-columns: 32px 1fr; gap: 11px; padding: 0 0 22px; }.timeline-event > span { display: grid; place-items: center; width: 30px; height: 30px; border-radius: 50%; color: var(--blue); background: var(--blue-light); }.timeline-event strong { color: #37445a; font-size: 11px; }.timeline-event p { margin: 3px 0; color: #737e91; font-size: 9px; }.timeline-event small { display: flex; align-items: center; gap: 4px; color: #9aa3b2; font-size: 8px; }
 
+.identity-picker { border: 1px solid var(--line); border-radius: 9px; background: white; color: var(--ink); padding: 7px 9px; font: inherit; font-size: 12px; }
+.collaboration-toggle.active { border-color: #2a9d8f; color: #18786f; background: #edf9f7; }
+.collaboration-paper { padding: 34px 42px 48px; }
+.collaboration-panel { min-height: 760px; }
+.collaboration-status { display: flex; align-items: center; gap: 12px; border-bottom: 1px solid var(--line); padding-bottom: 14px; margin-bottom: 8px; }
+.connection { display: inline-flex; align-items: center; gap: 7px; padding: 6px 10px; border-radius: 999px; background: #f7ede8; color: #9a4c35; font-size: 12px; font-weight: 700; text-transform: capitalize; }
+.connection.connected { background: #eaf7f4; color: #18786f; }
+.presence { display: flex; align-items: center; flex: 1; gap: 7px; color: var(--muted); font-size: 12px; }
+.presence span { border: 1px solid; border-radius: 999px; padding: 4px 8px; background: white; color: var(--ink); }
+.collaboration-note { font-size: 11px; color: var(--muted); margin: 10px 0 28px; }
+.collaborative-editor { min-height: 650px; outline: none; color: #25282c; font-family: Georgia, "Times New Roman", serif; font-size: 15px; line-height: 1.72; }
+.collaborative-editor p { margin: 0 0 16px; }
+.collaborative-editor h2 { margin: 28px 0 14px; font: 700 17px/1.3 Inter, sans-serif; letter-spacing: .03em; }
+.collaborative-editor h3 { margin: 20px 0 10px; font: 700 15px/1.3 Inter, sans-serif; }
+.collaborative-editor .collaboration-carets__caret { border-left: 2px solid; border-right: 2px solid; margin-left: -1px; margin-right: -1px; pointer-events: none; position: relative; word-break: normal; }
+.collaborative-editor .collaboration-carets__label { border-radius: 4px 4px 4px 0; color: white; font: 600 11px/1 Inter, sans-serif; left: -1px; padding: 4px 6px; position: absolute; top: -1.65em; user-select: none; white-space: nowrap; }
+
 @media (max-width: 1000px) {
   .setup-layout { grid-template-columns: 1fr; gap: 35px; max-width: 680px; padding-top: 50px; }.setup-steps h1 { margin-bottom: 22px; }.step-row,.security-note { display: none; }
   .studio.with-rail { grid-template-columns: 58px minmax(0,1fr); }.left-nav { width: 58px; }.source-rail { position: fixed; z-index: 50; top: 62px; right: 0; width: 330px; box-shadow: -10px 0 30px rgba(20,34,56,.14); }.proposal-toast { right: 20px; }.topbar { grid-template-columns: 180px 1fr auto; }.brand.compact small { display: none; }

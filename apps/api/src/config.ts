@@ -27,4 +27,6 @@ export const config = {
   aiProvider: process.env.AI_PROVIDER ?? "openai",
   openaiModel: process.env.OPENAI_MODEL ?? "gpt-5.6-sol",
   anthropicModel: process.env.ANTHROPIC_MODEL ?? "claude-opus-5",
+  collaborationPort: Number(process.env.COLLABORATION_PORT ?? 1234),
+  collaborationSecret: process.env.COLLABORATION_SECRET ?? "steno-local-collaboration-demo-secret",
 };
