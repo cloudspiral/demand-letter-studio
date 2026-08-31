@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
+import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import cors from "@fastify/cors";
 import multipart from "@fastify/multipart";
 import AdmZip from "adm-zip";
@@ -19,11 +19,26 @@ import { analyzeTemplate, exportDocx, extractSource } from "./document-worker";
 import { appendJobEvent, processGenerationJob, resumeQueuedJobs } from "./jobs";
 import { pathForKey, putFile } from "./storage";
 import { DEMO_IDENTITIES, publicDemoIdentities, verifyDemoIdentity } from "./identity";
+import {
+  documentFromBase64Update,
+  draftFromCollaborationDocument,
+  persistCollaborationDocument,
+  validateCollaborativeDraft,
+} from "./collaboration-document";
 
 const CreateMatterSchema = z.object({ name: z.string().min(1).max(200), templateId: z.string().uuid() });
 const ConfirmTemplateSchema = z.object({ regions: z.array(TemplateRegionSchema).min(1) });
 const SaveDraftSchema = z.object({ version: z.number().int().positive(), content: GeneratedDraftSchema });
-const RefineSchema = z.object({ instruction: z.string().min(1).max(2_000), selectedText: z.string().min(1).max(20_000) });
+const SnapshotSchema = z.object({ update: z.string().min(1).max(20_000_000) });
+const RefineSchema = z.object({
+  instruction: z.string().min(1).max(2_000),
+  selectedText: z.string().min(1).max(20_000),
+  snapshotUpdate: z.string().min(1).max(20_000_000).optional(),
+});
+const ResolveProposalSchema = z.object({
+  collaboration: z.boolean().optional(),
+  snapshotUpdate: z.string().min(1).max(20_000_000).optional(),
+});
 
 const mimeFor = (filename: string): string => {
   const extension = path.extname(filename).toLowerCase();
@@ -147,9 +162,83 @@ async function evidenceForDraft(draftId: string): Promise<EvidencePage[]> {
   }));
 }
 
+async function collaborationContent(draftId: string, encodedUpdate: string) {
+  const draft = await loadDraft(draftId);
+  if (!draft) return null;
+  const base = GeneratedDraftSchema.parse(draft.content);
+  const document = documentFromBase64Update(encodedUpdate);
+  const content = draftFromCollaborationDocument(document, base);
+  const validation = validateCollaborativeDraft(document, content, await evidenceForDraft(draftId));
+  return { draft, document, ...validation };
+}
+
+async function checkpointCollaborativeDraft(draftId: string, content: GeneratedDraft, actorId: string) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const locked = await client.query<{ matter_id: string; current_version: number; content: unknown }>(`
+      SELECT d.matter_id, d.current_version, dv.content
+      FROM drafts d JOIN draft_versions dv ON dv.draft_id = d.id AND dv.version = d.current_version
+      WHERE d.id = $1 FOR UPDATE OF d
+    `, [draftId]);
+    const current = requiredRow(locked.rows, "Draft checkpoint context was not found.");
+    if (JSON.stringify(GeneratedDraftSchema.parse(current.content)) === JSON.stringify(content)) {
+      await client.query("COMMIT");
+      return { version: current.current_version, matterId: current.matter_id, created: false };
+    }
+    const version = current.current_version + 1;
+    await client.query(
+      "INSERT INTO draft_versions (draft_id, version, content, actor_id) VALUES ($1, $2, $3, $4)",
+      [draftId, version, JSON.stringify(content), actorId],
+    );
+    await persistCitations(client, draftId, version, content);
+    await client.query("UPDATE drafts SET current_version = $2, updated_at = now() WHERE id = $1", [draftId, version]);
+    await client.query("COMMIT");
+    return { version, matterId: current.matter_id, created: true };
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function sendDocxExport(
+  reply: FastifyReply,
+  draftId: string,
+  content: GeneratedDraft,
+  version: number,
+  actorId: string,
+  validation?: { snapshotHash: string; warnings: number },
+) {
+  const result = await pool.query<{ matter_name: string; storage_key: string }>(`
+    SELECT m.name AS matter_name, t.storage_key
+    FROM drafts d JOIN matters m ON m.id = d.matter_id JOIN templates t ON t.id = m.template_id
+    WHERE d.id = $1
+  `, [draftId]);
+  if (!result.rowCount) return reply.status(404).send({ error: "Draft not found." });
+  const row = requiredRow(result.rows, "Draft export context was not found.");
+  const outputName = `${safeDownloadName(row.matter_name)}-v${version}-${randomUUID()}.docx`;
+  const outputPath = path.join(config.storageDir, "exports", outputName);
+  const patches = content.sections.flatMap((section) => section.blocks)
+    .filter((block) => block.templateParagraphIndex !== null)
+    .map((block) => ({ paragraphIndex: block.templateParagraphIndex as number, text: block.text }));
+  const fieldReplacements = Object.fromEntries(Object.entries(content.fields).map(([key, field]) => [key, field.value]));
+  await exportDocx({ templatePath: pathForKey(row.storage_key), outputPath, patches, fieldReplacements });
+  await pool.query(`
+    INSERT INTO activity_events (workspace_id, matter_id, actor_id, event_type, summary, metadata)
+    SELECT $1, matter_id, $2, 'draft.exported', 'Exported a validated collaborative Word document', $3 FROM drafts WHERE id = $4
+  `, [WORKSPACE_ID, actorId, JSON.stringify({ draftId, version, ...validation }), draftId]);
+  const buffer = await fs.readFile(outputPath);
+  return reply.header("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    .header("Content-Disposition", `attachment; filename="${safeDownloadName(row.matter_name)}-v${version}.docx"`)
+    .header("X-Steno-Validation-Warnings", String(validation?.warnings ?? 0))
+    .send(buffer);
+}
+
 export async function buildApp(options: { runMigrations?: boolean } = {}): Promise<FastifyInstance> {
   if (options.runMigrations !== false) await migrate();
-  const app = Fastify({ logger: { redact: ["req.headers.authorization", "req.headers.cookie", "req.headers.x-demo-token", "req.body"] } });
+  const app = Fastify({ bodyLimit: 20 * 1024 * 1024, logger: { redact: ["req.headers.authorization", "req.headers.cookie", "req.headers.x-demo-token", "req.body"] } });
   await app.register(cors, { origin: config.webOrigin });
   await app.register(multipart, { limits: { fileSize: 30 * 1024 * 1024, files: 10 } });
 
@@ -175,6 +264,31 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
     `, [id]);
     const status = result.rows[0] as { documentName: string; version: string | number; updatedAt: string } | undefined;
     return status ? { ...status, version: Number(status.version) } : { documentName: `draft:${id}`, version: 0, updatedAt: null };
+  });
+
+  app.post("/api/collaboration/drafts/:id/validate", async (request, reply) => {
+    const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+    identityForRequest(request);
+    const body = SnapshotSchema.parse(request.body);
+    const canonical = await collaborationContent(id, body.update);
+    if (!canonical) return reply.status(404).send({ error: "Draft not found." });
+    canonical.document.destroy();
+    return canonical.report;
+  });
+
+  app.post("/api/collaboration/drafts/:id/sync", async (request, reply) => {
+    const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+    const identity = identityForRequest(request);
+    const body = SnapshotSchema.parse(request.body);
+    const canonical = await collaborationContent(id, body.update);
+    if (!canonical) return reply.status(404).send({ error: "Draft not found." });
+    const snapshotVersion = await persistCollaborationDocument(id, canonical.document);
+    await pool.query(`
+      INSERT INTO activity_events (workspace_id, matter_id, actor_id, event_type, summary, metadata)
+      VALUES ($1, $2, $3, 'collaboration.synced', 'Synchronized the canonical collaborative draft', $4)
+    `, [WORKSPACE_ID, canonical.draft.matterId, identity.id, JSON.stringify({ draftId: id, snapshotVersion, snapshotHash: canonical.report.snapshotHash })]);
+    canonical.document.destroy();
+    return { snapshotVersion, validation: canonical.report };
   });
 
   app.get("/api/templates", async () => {
@@ -390,9 +504,14 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
     const identity = identityForRequest(request);
     const draft = await loadDraft(id);
     if (!draft) return reply.status(404).send({ error: "Draft not found." });
-    const content = GeneratedDraftSchema.parse(draft.content);
+    let content = GeneratedDraftSchema.parse(draft.content);
+    if (body.snapshotUpdate) {
+      const document = documentFromBase64Update(body.snapshotUpdate);
+      content = draftFromCollaborationDocument(document, content);
+      document.destroy();
+    }
     const exists = content.sections.some((section) => section.blocks.some((block) => block.text === body.selectedText));
-    if (!exists) return reply.status(409).send({ error: "Selected text is not part of the current draft version." });
+    if (!exists) return reply.status(409).send({ error: "Selected text is not part of the current collaborative draft." });
     const wantsStream = request.headers.accept?.includes("text/event-stream") ?? false;
     if (wantsStream) {
       reply.hijack();
@@ -407,11 +526,11 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
     const evidence = await evidenceForDraft(id);
     let proposal;
     try {
-      proposal = RefinementProposalSchema.parse(await createAiProvider().refine({ ...body, evidence }));
+      proposal = RefinementProposalSchema.parse(await createAiProvider().refine({ instruction: body.instruction, selectedText: body.selectedText, evidence }));
     } catch (primaryError) {
       try {
         if ((process.env.AI_PROVIDER ?? "openai") === "anthropic" || !process.env.ANTHROPIC_API_KEY) throw primaryError;
-        proposal = RefinementProposalSchema.parse(await createAiProvider("anthropic").refine({ ...body, evidence }));
+        proposal = RefinementProposalSchema.parse(await createAiProvider("anthropic").refine({ instruction: body.instruction, selectedText: body.selectedText, evidence }));
       } catch (fallbackError) {
         if (wantsStream) {
           reply.raw.write(`event: failed\ndata: ${JSON.stringify({ error: "Refinement failed" })}\n\n`);
@@ -450,6 +569,33 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
   app.post("/api/proposals/:id/accept", async (request, reply) => {
     const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
     const identity = identityForRequest(request);
+    const resolution = ResolveProposalSchema.parse(request.body ?? {});
+    if (resolution.collaboration) {
+      if (!resolution.snapshotUpdate) return reply.status(400).send({ error: "The current collaborative snapshot is required." });
+      const pending = await pool.query<{
+        draft_id: string; proposal: unknown; matter_id: string; current_version: number; content: unknown;
+      }>(`
+        SELECT p.draft_id, p.proposal, d.matter_id, d.current_version, dv.content
+        FROM edit_proposals p JOIN drafts d ON d.id = p.draft_id
+        JOIN draft_versions dv ON dv.draft_id = d.id AND dv.version = d.current_version
+        WHERE p.id = $1 AND p.status = 'pending'
+      `, [id]);
+      if (!pending.rowCount) return reply.status(404).send({ error: "Pending proposal not found." });
+      const row = requiredRow(pending.rows, "Proposal lookup failed.");
+      const proposal = RefinementProposalSchema.parse(row.proposal);
+      const document = documentFromBase64Update(resolution.snapshotUpdate);
+      const current = draftFromCollaborationDocument(document, GeneratedDraftSchema.parse(row.content));
+      document.destroy();
+      const targetExists = current.sections.some((section) => section.blocks.some((block) => block.text === proposal.targetText));
+      if (!targetExists) return reply.status(409).send({ error: "The proposal target changed in the collaborative draft." });
+      const updated = await pool.query("UPDATE edit_proposals SET status = 'accepted', resolved_at = now() WHERE id = $1 AND status = 'pending' RETURNING id", [id]);
+      if (!updated.rowCount) return reply.status(409).send({ error: "The proposal was already resolved." });
+      await pool.query(`
+        INSERT INTO activity_events (workspace_id, matter_id, actor_id, event_type, summary, metadata)
+        VALUES ($1, $2, $3, 'proposal.accepted', 'Accepted an AI edit into the collaborative draft', $4)
+      `, [WORKSPACE_ID, row.matter_id, identity.id, JSON.stringify({ proposalId: id, collaborative: true })]);
+      return { proposalId: id, status: "accepted", proposal };
+    }
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
@@ -527,6 +673,36 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
       VALUES ($1, $2, $3, 'proposal.rejected', 'Rejected an AI edit proposal', $4)
     `, [WORKSPACE_ID, matter.rows[0]?.matter_id ?? null, identity.id, JSON.stringify({ proposalId: id })]);
     return rejected;
+  });
+
+  app.post("/api/drafts/:id/export.docx", async (request, reply) => {
+    const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+    const identity = identityForRequest(request);
+    const body = SnapshotSchema.parse(request.body);
+    const canonical = await collaborationContent(id, body.update);
+    if (!canonical) return reply.status(404).send({ error: "Draft not found." });
+    try {
+      if (canonical.report.status === "blocked") {
+        return reply.status(409).send({ error: "Resolve the blocked evidence checks before export.", validation: canonical.report });
+      }
+      const snapshotVersion = await persistCollaborationDocument(id, canonical.document);
+      const checkpoint = await checkpointCollaborativeDraft(id, canonical.content, identity.id);
+      if (checkpoint.created) {
+        await pool.query(`
+          INSERT INTO activity_events (workspace_id, matter_id, actor_id, event_type, summary, metadata)
+          VALUES ($1, $2, $3, 'collaboration.published', 'Published a validated collaborative snapshot', $4)
+        `, [WORKSPACE_ID, checkpoint.matterId, identity.id, JSON.stringify({
+          draftId: id,
+          version: checkpoint.version,
+          snapshotVersion,
+          snapshotHash: canonical.report.snapshotHash,
+          warnings: canonical.report.warnings,
+        })]);
+      }
+      return await sendDocxExport(reply, id, canonical.content, checkpoint.version, identity.id, canonical.report);
+    } finally {
+      canonical.document.destroy();
+    }
   });
 
   app.get("/api/drafts/:id/export.docx", async (request, reply) => {

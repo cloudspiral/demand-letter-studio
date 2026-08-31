@@ -76,3 +76,19 @@ export interface CollaborationIdentitiesResponse {
   websocketUrl: string;
   identities: DemoIdentityResponse[];
 }
+
+export interface CollaborationValidationIssue {
+  blockId: string | null;
+  severity: "warning" | "error";
+  code: "unsupported" | "edited-citation" | "broken-citation" | "unsupported-value" | "unmapped-block" | "duplicate-template-mapping" | "empty-document";
+  message: string;
+}
+
+export interface CollaborationValidationReport {
+  status: "ready" | "needs-review" | "blocked";
+  checkedAt: string;
+  snapshotHash: string;
+  errors: number;
+  warnings: number;
+  issues: CollaborationValidationIssue[];
+}

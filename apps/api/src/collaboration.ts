@@ -3,6 +3,7 @@ import * as Y from "yjs";
 import { config } from "./config";
 import { pool, WORKSPACE_ID } from "./db";
 import { verifyDemoIdentity, type DemoIdentity } from "./identity";
+import { persistCollaborationDocument, storedCollaborationDocument } from "./collaboration-document";
 
 interface CollaborationContext {
   identity: DemoIdentity;
@@ -37,14 +38,8 @@ export function createCollaborationServer(): Server<CollaborationContext> {
       return { identity, draftId, matterId: draft.matter_id };
     },
     async onLoadDocument({ documentName }) {
-      const result = await pool.query<{ snapshot: Buffer }>(
-        "SELECT snapshot FROM collaboration_documents WHERE document_name = $1",
-        [documentName],
-      );
-      const document = new Y.Doc();
-      const snapshot = result.rows[0]?.snapshot;
-      if (snapshot?.length) Y.applyUpdate(document, new Uint8Array(snapshot));
-      return document;
+      const draftId = draftIdFor(documentName);
+      return draftId ? await storedCollaborationDocument(draftId) ?? new Y.Doc() : new Y.Doc();
     },
     async onStoreDocument({ documentName, document, lastContext }) {
       const draftId = draftIdFor(documentName);
@@ -52,14 +47,7 @@ export function createCollaborationServer(): Server<CollaborationContext> {
       const lookup = await pool.query<{ matter_id: string }>("SELECT matter_id FROM drafts WHERE id = $1", [draftId]);
       const matterId = lookup.rows[0]?.matter_id;
       if (!matterId) return;
-      const snapshot = Buffer.from(Y.encodeStateAsUpdate(document));
-      const stored = await pool.query<{ version: number }>(`
-        INSERT INTO collaboration_documents (document_name, workspace_id, draft_id, snapshot, version)
-        VALUES ($1, $2, $3, $4, 1)
-        ON CONFLICT (document_name) DO UPDATE
-          SET snapshot = EXCLUDED.snapshot, version = collaboration_documents.version + 1, updated_at = now()
-        RETURNING version
-      `, [documentName, WORKSPACE_ID, draftId, snapshot]);
+      const snapshotVersion = await persistCollaborationDocument(draftId, document);
       const identity = lastContext?.identity;
       if (identity) {
         await pool.query(`
@@ -70,7 +58,7 @@ export function createCollaborationServer(): Server<CollaborationContext> {
           matterId,
           identity.id,
           `${identity.name} edited the collaborative draft`,
-          JSON.stringify({ draftId, snapshotVersion: stored.rows[0]?.version ?? 1 }),
+          JSON.stringify({ draftId, snapshotVersion }),
         ]);
       }
     },

@@ -18,15 +18,18 @@ Demand Letter Studio turns a reviewed firm Word template and a case evidence pac
 
 ## Collaboration stretch branch
 
-The `stretch/collaboration` branch starts from the immutable `v1-checkpoint` tag and adds a self-hosted Hocuspocus/Yjs working copy without changing the v1 checkpoint. It includes:
+The `stretch/collaboration` branch starts from the immutable `v1-checkpoint` tag and makes a self-hosted Hocuspocus/Yjs document canonical without changing the v1 checkpoint. It includes:
 
 - Two HMAC-signed local demo identities, Faby Rivera and Alex Chen, selectable in separate browser sessions.
 - Shared Tiptap editing with live carets, presence, reconnect, shareable matter/draft URLs, and PostgreSQL-persisted Yjs snapshots.
-- Human attribution for direct saves, collaboration snapshots, proposal decisions, and exports.
+- Evidence metadata inside collaborative nodes: stable block IDs, source/page citations, verification state, original text, and Word-template paragraph mappings. At validation/export, immutable metadata for existing blocks is re-anchored to the persisted draft instead of trusting browser-supplied attributes.
+- Debounced live checks for changed citations, broken evidence links, unsupported amounts/dates, and unmapped new paragraphs.
+- An authoritative export gate that freezes the exact submitted Yjs snapshot, re-runs validation, creates a citation-bearing `draft_version` checkpoint, and exports that same content.
+- Human attribution for collaboration snapshots, proposal decisions, validation checkpoints, and exports.
 - A paired agent actor for each person. Refinement requests are stored and logged as that person's agent, and still require explicit acceptance or rejection.
 - A two-context Playwright test covering convergence, persisted reconnect, human/agent attribution, and the proposal boundary.
 
-The collaboration editor is intentionally labeled a working copy. Its snapshots do not yet publish back into the citation-bearing `draft_versions` representation, so Word export continues to use the last reviewed block version. That bridge is the remaining stretch gap; merging the representations without preserving block IDs and citations would weaken v1's evidence guarantees. See [STRETCH_RESULTS.md](./STRETCH_RESULTS.md).
+The live Yjs document is the editing authority; `draft_versions` now records validated export checkpoints instead of competing with it. Newly inserted free-form paragraphs are allowed while editing but block Word export until they are mapped to a reviewed template region. See [STRETCH_RESULTS.md](./STRETCH_RESULTS.md).
 
 ## Quick start
 
@@ -53,7 +56,7 @@ pnpm --filter @steno/web test:e2e
 
 The e2e test expects the API and web application to be running with `AI_PROVIDER=mock` and the supplied local artifacts present. See [TEST_RESULTS.md](./TEST_RESULTS.md) for the latest evidence and Word-rendering boundary.
 
-On the collaboration branch the API also listens for WebSockets on `COLLABORATION_PORT` (default `1234`). Open a generated draft, choose **Live collaboration**, copy the resulting URL into another browser session, and select the other demo identity.
+On the collaboration branch the API also listens for WebSockets on `COLLABORATION_PORT` (default `1234`). Open a generated draft, copy the resulting URL into another browser session, and select the other demo identity.
 
 ## Repository map
 
@@ -78,5 +81,7 @@ docs                     Architecture and decision records
 - `GET /api/drafts/:id/export.docx`
 - `GET /api/collaboration/identities`
 - `GET /api/collaboration/drafts/:id/status`
+- `POST /api/collaboration/drafts/:id/validate|sync`
+- `POST /api/drafts/:id/export.docx` — validate and export an exact collaborative snapshot
 
 See [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) for data flow, storage boundaries, failure behavior, and the collaboration seam.

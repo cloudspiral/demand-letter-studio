@@ -3,16 +3,16 @@ import { useEditor, EditorContent } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import {
   Activity, ArrowLeft, Check, ChevronRight, CircleAlert, Clock3, Download, FileImage, FileText,
-  History, LoaderCircle, PanelRightClose, PanelRightOpen, Save, Send, ShieldCheck, Sparkles, Upload,
-  UserRound, UsersRound, X,
+  History, LoaderCircle, PanelRightClose, PanelRightOpen, Send, ShieldCheck, Sparkles, Upload,
+  UserRound, X,
 } from "lucide-react";
 import type { DraftBlock, GeneratedDraft, TemplateRegion } from "@steno/contracts";
 import { api, download, setDemoToken, upload } from "./api";
 import type {
   ActivityResponse, CollaborationIdentitiesResponse, DemoIdentityResponse, DraftResponse, JobResponse, MatterResponse,
-  ProposalResponse, SourceResponse, TemplateResponse,
+  CollaborationValidationReport, ProposalResponse, SourceResponse, TemplateResponse,
 } from "./types";
-import { CollaborativeEditor } from "./CollaborativeEditor";
+import { CollaborativeEditor, type CollaborativeEditorHandle } from "./CollaborativeEditor";
 
 type SetupStep = "template" | "regions" | "sources" | "ready";
 
@@ -185,7 +185,9 @@ export function App() {
   const [notice, setNotice] = useState<string | null>(null);
   const [collaborationConfig, setCollaborationConfig] = useState<CollaborationIdentitiesResponse | null>(null);
   const [identity, setIdentity] = useState<DemoIdentityResponse | null>(null);
-  const [collaborationMode, setCollaborationMode] = useState(() => new URLSearchParams(window.location.search).get("collab") === "1");
+  const [selectedCollaborativeText, setSelectedCollaborativeText] = useState<string | null>(null);
+  const [collaborationValidation, setCollaborationValidation] = useState<CollaborationValidationReport | null>(null);
+  const collaborationEditor = useRef<CollaborativeEditorHandle | null>(null);
   const restoredFromUrl = useRef(false);
 
   const loadActivity = useCallback(async (matterId: string) => setActivity(await api(`/api/matters/${matterId}/activity`)), []);
@@ -226,9 +228,9 @@ export function App() {
     params.set("matterId", matter.id);
     params.set("draftId", draft.id);
     if (identity) params.set("identity", identity.slug);
-    if (collaborationMode) params.set("collab", "1");
+    params.set("collab", "1");
     window.history.replaceState(null, "", `/?${params.toString()}`);
-  }, [collaborationMode, draft, identity, matter]);
+  }, [draft, identity, matter]);
 
   const generate = async () => {
     if (!matter) return;
@@ -276,11 +278,12 @@ export function App() {
   const selectedBlock = useMemo(() => workingContent?.sections.flatMap((section) => section.blocks).find((block) => block.id === selectedBlockId), [selectedBlockId, workingContent]);
 
   const refine = async () => {
-    if (!draft || !selectedBlock || !refineInstruction.trim()) return;
+    const snapshotUpdate = collaborationEditor.current?.snapshotUpdate();
+    if (!draft || !selectedCollaborativeText || !snapshotUpdate || !refineInstruction.trim()) return;
     setBusy(true); setNotice(null);
     try {
       const result = await api<ProposalResponse>(`/api/drafts/${draft.id}/refinements`, {
-        method: "POST", body: JSON.stringify({ instruction: refineInstruction, selectedText: selectedBlock.text }),
+        method: "POST", body: JSON.stringify({ instruction: refineInstruction, selectedText: selectedCollaborativeText, snapshotUpdate }),
       });
       setProposal(result); setRefineInstruction("");
     } catch (caught) { setNotice(caught instanceof Error ? caught.message : "Refinement failed"); }
@@ -291,8 +294,16 @@ export function App() {
     if (!proposal) return;
     setBusy(true);
     try {
-      const result = await api<{ draft?: DraftResponse }>(`/api/proposals/${proposal.id}/${resolution}`, { method: "POST", body: "{}" });
+      const snapshotUpdate = collaborationEditor.current?.snapshotUpdate();
+      const result = await api<{ draft?: DraftResponse; proposal?: ProposalResponse["proposal"] }>(`/api/proposals/${proposal.id}/${resolution}`, {
+        method: "POST",
+        body: JSON.stringify(resolution === "accept" ? { collaboration: true, snapshotUpdate } : {}),
+      });
+      if (resolution === "accept" && result.proposal && !collaborationEditor.current?.applyProposal(result.proposal)) {
+        throw new Error("The proposed paragraph changed before it could be applied.");
+      }
       if (result.draft) { setDraft(result.draft); setWorkingContent(result.draft.content); setDirty(false); }
+      setNotice(resolution === "accept" ? "Accepted into the shared draft" : "Proposal rejected");
       setProposal(null); if (matter) await loadActivity(matter.id);
     } catch (caught) { setNotice(caught instanceof Error ? caught.message : "Proposal update failed"); }
     finally { setBusy(false); }
@@ -300,13 +311,16 @@ export function App() {
 
   const exportDraft = async () => {
     if (!draft) return;
+    const update = collaborationEditor.current?.snapshotUpdate();
+    if (!update) { setNotice("Wait for the collaborative draft to finish syncing before export."); return; }
     setNotice(null);
     try {
-      const result = await download(`/api/drafts/${draft.id}/export.docx`);
+      const result = await download(`/api/drafts/${draft.id}/export.docx`, { method: "POST", body: JSON.stringify({ update }) });
       const url = URL.createObjectURL(result.blob);
       const link = document.createElement("a");
       link.href = url; link.download = result.filename; link.click();
       URL.revokeObjectURL(url);
+      setNotice(result.warnings ? `Exported with ${result.warnings} attorney-review warnings` : "Exported validated snapshot");
       if (matter) await loadActivity(matter.id);
     } catch (caught) { setNotice(caught instanceof Error ? caught.message : "Export failed"); }
   };
@@ -361,44 +375,29 @@ export function App() {
 
           {draft && workingContent && <>
             <div className="editor-toolbar">
-              <div><p className="eyebrow">Draft editor</p><span>Version {draft.version} · {dirty ? "Unsaved changes" : "All changes saved"}</span></div>
+              <div><p className="eyebrow">Canonical collaborative draft</p><span>Live autosave · Export checkpoint v{draft.version}</span></div>
               <div className="toolbar-actions">
                 {notice && <span className="notice">{notice}</span>}
-                {collaborationConfig && identity && <button className={`secondary small collaboration-toggle ${collaborationMode ? "active" : ""}`} onClick={() => setCollaborationMode((value) => !value)}>
-                  <UsersRound size={15} /> {collaborationMode ? "Reviewed blocks" : "Live collaboration"}
-                </button>}
-                <button className="secondary small" onClick={() => void save()} disabled={!dirty || busy}><Save size={15} /> Save</button>
                 <button className="icon-button" onClick={() => setSourceOpen((value) => !value)} title="Toggle source rail">{sourceOpen ? <PanelRightClose size={18} /> : <PanelRightOpen size={18} />}</button>
               </div>
             </div>
             <div className="document-scroll">
-              {collaborationMode && collaborationConfig && identity ? <article className="paper collaboration-paper">
+              {collaborationConfig && identity ? <article className="paper collaboration-paper">
                 <CollaborativeEditor
+                  ref={collaborationEditor}
                   draftId={draft.id}
                   content={workingContent}
                   websocketUrl={collaborationConfig.websocketUrl}
                   identity={identity}
+                  onSelection={setSelectedCollaborativeText}
+                  onValidation={setCollaborationValidation}
                 />
-              </article> : <article className="paper">
-                <div className="letterhead"><span className="letterhead-mark">AV</span><div><strong>ATTORNEY REVIEW DRAFT</strong><small>Generated from reviewed template · Not ready to send</small></div></div>
-                <h1>{workingContent.title}</h1>
-                {workingContent.warnings.map((warning) => <div className="document-warning" key={warning}><CircleAlert size={16} />{warning}</div>)}
-                {workingContent.sections.map((section) => <section className="draft-section" key={section.id}>
-                  {section.heading && <h2>{section.heading}</h2>}
-                  {section.blocks.map((block) => <div key={block.id} onClickCapture={(event) => {
-                    const target = event.target as HTMLElement;
-                    const citation = target.closest<HTMLButtonElement>(".citation-pill");
-                    if (citation?.dataset.sourceId && citation.dataset.page) void showCitation(citation.dataset.sourceId, citation.textContent?.split(" · ")[0] ?? "Source", Number(citation.dataset.page));
-                  }}>
-                    <BlockEditor block={block} active={selectedBlockId === block.id} onFocus={() => setSelectedBlockId(block.id)} onChange={(text) => updateBlock(block.id, text)} />
-                  </div>)}
-                </section>)}
-              </article>}
+              </article> : <section className="generation-card"><LoaderCircle className="spin" /><h1>Starting collaborative editor…</h1></section>}
             </div>
             <div className="refine-bar">
               <div className="ai-glyph"><Sparkles size={18} /></div>
-              <div className="refine-input"><span>Refine selected paragraph</span><input value={refineInstruction} onChange={(event) => setRefineInstruction(event.target.value)} placeholder={selectedBlock ? "e.g. Make this more concise without changing facts" : "Select a paragraph first"} disabled={!selectedBlock} onKeyDown={(event) => event.key === "Enter" && void refine()} /></div>
-              <button onClick={() => void refine()} disabled={!selectedBlock || !refineInstruction.trim() || busy}><Send size={17} /></button>
+              <div className="refine-input"><span>Ask your agent to refine the current paragraph</span><input value={refineInstruction} onChange={(event) => setRefineInstruction(event.target.value)} placeholder={selectedCollaborativeText ? "e.g. Make this more concise without changing facts" : "Place the cursor in a paragraph first"} disabled={!selectedCollaborativeText} onKeyDown={(event) => event.key === "Enter" && void refine()} /></div>
+              <button onClick={() => void refine()} disabled={!selectedCollaborativeText || !refineInstruction.trim() || busy}><Send size={17} /></button>
             </div>
           </>}
         </main>
@@ -421,7 +420,7 @@ export function App() {
         <div className="proposal-head"><Sparkles size={18} /><strong>AI edit proposal</strong><span>Not applied</span></div>
         <p>{proposal.proposal.summary}</p>
         <div className="diff"><del>{proposal.proposal.targetText}</del><ins>{proposal.proposal.replacementText}</ins></div>
-        <div className="proposal-actions"><button className="secondary" onClick={() => void resolveProposal("reject")}><X size={15} /> Reject</button><button className="primary" onClick={() => void resolveProposal("accept")}><Check size={15} /> Accept as new version</button></div>
+        <div className="proposal-actions"><button className="secondary" onClick={() => void resolveProposal("reject")}><X size={15} /> Reject</button><button className="primary" onClick={() => void resolveProposal("accept")}><Check size={15} /> Accept into shared draft</button></div>
       </div>}
 
       {activityOpen && <div className="drawer-backdrop" onClick={() => setActivityOpen(false)}><aside className="activity-drawer" onClick={(event) => event.stopPropagation()}>
