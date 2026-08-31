@@ -363,13 +363,33 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
     const content = GeneratedDraftSchema.parse(draft.content);
     const exists = content.sections.some((section) => section.blocks.some((block) => block.text === body.selectedText));
     if (!exists) return reply.status(409).send({ error: "Selected text is not part of the current draft version." });
+    const wantsStream = request.headers.accept?.includes("text/event-stream") ?? false;
+    if (wantsStream) {
+      reply.hijack();
+      reply.raw.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+        "Access-Control-Allow-Origin": config.webOrigin,
+      });
+      reply.raw.write(`event: status\ndata: ${JSON.stringify({ step: "Generating proposal" })}\n\n`);
+    }
     const evidence = await evidenceForDraft(id);
     let proposal;
     try {
       proposal = RefinementProposalSchema.parse(await createAiProvider().refine({ ...body, evidence }));
     } catch (primaryError) {
-      if ((process.env.AI_PROVIDER ?? "openai") === "anthropic" || !process.env.ANTHROPIC_API_KEY) throw primaryError;
-      proposal = RefinementProposalSchema.parse(await createAiProvider("anthropic").refine({ ...body, evidence }));
+      try {
+        if ((process.env.AI_PROVIDER ?? "openai") === "anthropic" || !process.env.ANTHROPIC_API_KEY) throw primaryError;
+        proposal = RefinementProposalSchema.parse(await createAiProvider("anthropic").refine({ ...body, evidence }));
+      } catch (fallbackError) {
+        if (wantsStream) {
+          reply.raw.write(`event: failed\ndata: ${JSON.stringify({ error: "Refinement failed" })}\n\n`);
+          reply.raw.end();
+          return;
+        }
+        throw fallbackError;
+      }
     }
     const allowedSourceIds = new Set(evidence.map((page) => page.sourceId));
     proposal = { ...proposal, citedSourceIds: proposal.citedSourceIds.filter((sourceId) => allowedSourceIds.has(sourceId)) };
@@ -378,7 +398,13 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
       VALUES ($1, $2, 'pending', $3, $4, $5)
       RETURNING id, draft_id AS "draftId", base_version AS "baseVersion", status, instruction, proposal, created_at AS "createdAt"
     `, [id, draft.version, body.instruction, JSON.stringify(proposal), ACTOR_ID]);
-    return reply.status(201).send(saved.rows[0]);
+    const savedProposal = requiredRow(saved.rows, "Proposal insert did not return a record.");
+    if (wantsStream) {
+      reply.raw.write(`event: proposal\ndata: ${JSON.stringify(savedProposal)}\n\n`);
+      reply.raw.end();
+      return;
+    }
+    return reply.status(201).send(savedProposal);
   });
 
   app.post("/api/proposals/:id/accept", async (request, reply) => {
@@ -479,7 +505,7 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
     const outputName = `${safeDownloadName(row.matter_name)}-v${row.current_version}-${randomUUID()}.docx`;
     const outputPath = path.join(config.storageDir, "exports", outputName);
     const patches = content.sections.flatMap((section) => section.blocks)
-      .filter((block) => block.templateParagraphIndex !== null && block.kind !== "warning")
+      .filter((block) => block.templateParagraphIndex !== null)
       .map((block) => ({ paragraphIndex: block.templateParagraphIndex as number, text: block.text }));
     const fieldReplacements = Object.fromEntries(Object.entries(content.fields).map(([key, field]) => [key, field.value]));
     await exportDocx({ templatePath: pathForKey(row.storage_key), outputPath, patches, fieldReplacements });
@@ -519,7 +545,7 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
     const zip = new AdmZip(zipPath);
     const sources = [];
     for (const entry of zip.getEntries().filter((item) => !item.isDirectory)) {
-      if (!entry.entryName.startsWith("__MACOSX/") && !path.basename(entry.entryName).startsWith("._")) {
+      if (!entry.entryName.startsWith("__MACOSX/") && !path.basename(entry.entryName).startsWith(".")) {
         sources.push(await insertSource(insertedMatter.id, entry.getData(), path.basename(entry.entryName), mimeFor(entry.entryName)));
       }
     }

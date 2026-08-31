@@ -70,7 +70,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   matter_id uuid NOT NULL REFERENCES matters(id) ON DELETE CASCADE,
   job_type text NOT NULL DEFAULT 'generation',
-  status text NOT NULL CHECK (status IN ('queued','processing','completed','failed')),
+  status text NOT NULL DEFAULT 'queued' CHECK (status IN ('queued','processing','completed','failed')),
   progress integer NOT NULL DEFAULT 0,
   step text NOT NULL DEFAULT 'Queued',
   draft_id uuid,
@@ -85,6 +85,15 @@ CREATE TABLE IF NOT EXISTS job_events (
   event_type text NOT NULL,
   payload jsonb NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS dead_letter_jobs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  job_id uuid NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+  job_type text NOT NULL,
+  error_code text NOT NULL,
+  payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(job_id)
 );
 CREATE TABLE IF NOT EXISTS drafts (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -147,6 +156,8 @@ CREATE TABLE IF NOT EXISTS ai_runs (
   error_code text,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+
+ALTER TABLE jobs ALTER COLUMN status SET DEFAULT 'queued';
 `;
 
 export async function migrate(): Promise<void> {

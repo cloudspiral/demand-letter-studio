@@ -1,5 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import OpenAI from "openai";
+import { z } from "zod";
 import {
   GeneratedDraftSchema,
   RefinementProposalSchema,
@@ -38,17 +39,19 @@ export interface AiProvider {
 const generatedDraftJsonSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["title", "matterName", "fields", "sections", "warnings"],
+  required: ["title", "matterName", "sections", "warnings", "replacements"],
   properties: {
     title: { type: "string" },
     matterName: { type: "string" },
-    fields: {
-      type: "object",
-      additionalProperties: {
-        type: "object",
-        additionalProperties: false,
-        required: ["value", "verified", "sourceLabel"],
-        properties: { value: { type: "string" }, verified: { type: "boolean" }, sourceLabel: { type: ["string", "null"] } },
+    replacements: {
+      type: "array",
+      items: {
+        type: "object", additionalProperties: false,
+        required: ["oldValue", "newValue", "sourceId", "page"],
+        properties: {
+          oldValue: { type: "string", minLength: 1 }, newValue: { type: "string", minLength: 1 },
+          sourceId: { type: "string" }, page: { type: "integer" },
+        },
       },
     },
     sections: {
@@ -110,12 +113,43 @@ Accuracy rules:
 - If a template section cannot be supported, create a warning block stating what source is missing; never copy case facts from TEMPLATE REGIONS.
 - Preserve the template's section order and legal boilerplate. Return concise text, not HTML or OOXML.
 - templateParagraphIndex must refer to the editable template paragraph being replaced, or null for a warning.
+- For each TEMPLATE REPLACEMENT CANDIDATE supported by evidence, return its exact oldValue and grounded newValue with sourceId/page. Omit unsupported candidates.
 
 TEMPLATE REGIONS:
 ${JSON.stringify(editable)}
 
+TEMPLATE REPLACEMENT CANDIDATES:
+${JSON.stringify(input.template.replacementCandidates)}
+
 EVIDENCE:
 ${JSON.stringify(input.evidence)}`;
+}
+
+const ModelOutputSchema = GeneratedDraftSchema.omit({ fields: true }).extend({
+  replacements: z.array(z.object({
+    oldValue: z.string().min(1), newValue: z.string().min(1), sourceId: z.string().uuid(), page: z.number().int().positive(),
+  })),
+});
+
+export function parseModelDraft(raw: unknown, evidence: EvidencePage[], template: TemplateAnalysis): GeneratedDraft {
+  const parsed = ModelOutputSchema.parse(raw);
+  const pages = new Map(evidence.map((page) => [`${page.sourceId}:${page.page}`, page]));
+  const allowedOldValues = new Set(template.replacementCandidates.map((candidate) => candidate.value));
+  const fields: GeneratedDraft["fields"] = {};
+  for (const replacement of parsed.replacements) {
+    const source = pages.get(`${replacement.sourceId}:${replacement.page}`);
+    const normalizedEvidence = source?.text.toLocaleLowerCase().replace(/\s+/g, " ") ?? "";
+    const normalizedReplacement = replacement.newValue.toLocaleLowerCase().replace(/\s+/g, " ");
+    if (source && allowedOldValues.has(replacement.oldValue) && normalizedEvidence.includes(normalizedReplacement)) {
+      fields[replacement.oldValue] = {
+      value: replacement.newValue,
+      verified: true,
+      sourceLabel: `${source.sourceName} p. ${source.page}`,
+      };
+    }
+  }
+  const { replacements: _replacements, ...draft } = parsed;
+  return GeneratedDraftSchema.parse({ ...draft, fields });
 }
 
 function promptForRefinement(input: RefineInput): string {
@@ -139,7 +173,7 @@ class OpenAiProvider implements AiProvider {
       store: false,
       text: { format: { type: "json_schema", name: "generated_draft", strict: true, schema: generatedDraftJsonSchema } },
     });
-    return GeneratedDraftSchema.parse(JSON.parse(response.output_text));
+    return parseModelDraft(JSON.parse(response.output_text), input.evidence, input.template);
   }
 
   async refine(input: RefineInput): Promise<RefinementProposal> {
@@ -157,7 +191,12 @@ class OpenAiProvider implements AiProvider {
 class AnthropicProvider implements AiProvider {
   readonly name = "anthropic";
   readonly model = config.anthropicModel;
-  private readonly client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  private readonly client = new Anthropic({
+    apiKey: process.env.ANTHROPIC_API_KEY,
+    ...(process.env.ANTHROPIC_WORKSPACE_ID
+      ? { defaultHeaders: { "anthropic-workspace-id": process.env.ANTHROPIC_WORKSPACE_ID } }
+      : {}),
+  });
 
   private async json(prompt: string, schema: unknown): Promise<unknown> {
     const response = await this.client.messages.create({
@@ -173,7 +212,7 @@ class AnthropicProvider implements AiProvider {
   }
 
   async generate(input: GenerateInput): Promise<GeneratedDraft> {
-    return GeneratedDraftSchema.parse(await this.json(promptForGeneration(input), generatedDraftJsonSchema));
+    return parseModelDraft(await this.json(promptForGeneration(input), generatedDraftJsonSchema), input.evidence, input.template);
   }
 
   async refine(input: RefineInput): Promise<RefinementProposal> {
@@ -186,7 +225,7 @@ class MockProvider implements AiProvider {
   readonly model = "deterministic-fixture";
 
   async generate(input: GenerateInput): Promise<GeneratedDraft> {
-    const evidence = input.evidence.filter((page) => page.text.trim());
+    const evidence = input.evidence.filter((page) => page.text.trim() && !page.text.startsWith("[Image evidence:"));
     const citations = evidence.slice(0, 4).map((page) => ({
       sourceId: page.sourceId, sourceName: page.sourceName, page: page.page, quote: page.text.slice(0, 180),
     }));

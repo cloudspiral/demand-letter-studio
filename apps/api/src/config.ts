@@ -5,6 +5,10 @@ import dotenv from "dotenv";
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 dotenv.config({ path: path.join(repositoryRoot, ".env") });
 
+const executable = (value: string): string => (
+  value.includes(path.sep) && !path.isAbsolute(value) ? path.resolve(repositoryRoot, value) : value
+);
+
 const required = (name: string, fallback?: string): string => {
   const value = process.env[name] ?? fallback;
   if (!value) throw new Error(`Missing required environment variable: ${name}`);
@@ -18,7 +22,7 @@ export const config = {
   storageDir: path.resolve(repositoryRoot, process.env.STORAGE_DIR ?? ".data/storage"),
   demoAssetDir: path.resolve(repositoryRoot, process.env.DEMO_ASSET_DIR ?? "."),
   webOrigin: process.env.WEB_ORIGIN ?? "http://127.0.0.1:5173",
-  pythonBin: process.env.PYTHON_BIN ?? "/Users/matt/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3",
+  pythonBin: executable(process.env.PYTHON_BIN ?? "services/document-worker/.venv/bin/python"),
   documentWorker: path.join(repositoryRoot, "services/document-worker/worker.py"),
   aiProvider: process.env.AI_PROVIDER ?? "openai",
   openaiModel: process.env.OPENAI_MODEL ?? "gpt-5.6-sol",

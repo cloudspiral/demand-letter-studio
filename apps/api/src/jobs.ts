@@ -93,6 +93,7 @@ export function validateGrounding(draft: GeneratedDraft, evidence: EvidencePage[
       }
       return {
         ...block,
+        text: supported ? block.text : "[ATTORNEY REVIEW REQUIRED — this generated block lacks a valid source-page citation.]",
         citations,
         verified: block.kind !== "warning" && supported && block.verified,
         kind: supported ? block.kind : "warning" as const,
@@ -100,6 +101,41 @@ export function validateGrounding(draft: GeneratedDraft, evidence: EvidencePage[
     }),
   }));
   return GeneratedDraftSchema.parse({ ...draft, sections, warnings: [...warnings] });
+}
+
+export function ensureEditableCoverage(draft: GeneratedDraft, template: ReturnType<typeof TemplateAnalysisSchema.parse>): GeneratedDraft {
+  const used = new Set(draft.sections.flatMap((section) => section.blocks)
+    .map((block) => block.templateParagraphIndex)
+    .filter((index): index is number => index !== null));
+  const missing = template.regions.filter((region) => region.role === "editable" && !used.has(region.paragraphIndex));
+  const fields = { ...draft.fields };
+  const missingReplacements = template.replacementCandidates.filter((candidate) => !Object.hasOwn(fields, candidate.value));
+  for (const candidate of missingReplacements) {
+    fields[candidate.value] = { value: "[ATTORNEY REVIEW REQUIRED]", verified: false, sourceLabel: null };
+  }
+  if (!missing.length && !missingReplacements.length) return draft;
+  const coverageSection = {
+    id: "attorney-review-required",
+    heading: "ATTORNEY REVIEW REQUIRED",
+    blocks: missing.map((region) => ({
+      id: `unsupported-template-${region.paragraphIndex}`,
+      kind: "warning" as const,
+      text: "[ATTORNEY REVIEW REQUIRED — no supported replacement was generated for this case-specific template region.]",
+      templateParagraphIndex: region.paragraphIndex,
+      citations: [],
+      verified: false,
+    })),
+  };
+  return GeneratedDraftSchema.parse({
+    ...draft,
+    fields,
+    sections: missing.length ? [...draft.sections, coverageSection] : draft.sections,
+    warnings: [
+      ...draft.warnings,
+      ...(missing.length ? [`${missing.length} case-specific template regions were cleared because no supported replacement was generated.`] : []),
+      ...(missingReplacements.length ? [`${missingReplacements.length} header/footer values were cleared because no supported replacement was generated.`] : []),
+    ],
+  });
 }
 
 async function recordAiRun(args: {
@@ -128,16 +164,17 @@ async function recordAiRun(args: {
 async function generateWithFallback(context: Awaited<ReturnType<typeof loadJobContext>>): Promise<GeneratedDraft> {
   const names = [process.env.AI_PROVIDER ?? "openai"];
   if (names[0] !== "anthropic" && process.env.ANTHROPIC_API_KEY) names.push("anthropic");
-  let lastError: unknown;
+  const failures: string[] = [];
   for (const name of names) {
     const provider = createAiProvider(name);
     const started = performance.now();
     try {
       const result = await provider.generate(context);
       await recordAiRun({ matterId: context.matterId, provider, purpose: "generation", status: "completed", latencyMs: performance.now() - started });
-      return validateGrounding(result, context.evidence);
+      return ensureEditableCoverage(validateGrounding(result, context.evidence), context.template);
     } catch (error) {
-      lastError = error;
+      const code = error instanceof Error ? error.name : "ProviderError";
+      failures.push(`${provider.name}:${code}`);
       await recordAiRun({
         matterId: context.matterId,
         provider,
@@ -148,7 +185,7 @@ async function generateWithFallback(context: Awaited<ReturnType<typeof loadJobCo
       });
     }
   }
-  throw lastError instanceof Error ? lastError : new Error("All AI providers failed.");
+  throw new Error(failures.length ? `All AI providers failed (${failures.join(", ")}).` : "All AI providers failed.");
 }
 
 export async function processGenerationJob(jobId: string): Promise<void> {
@@ -204,6 +241,11 @@ export async function processGenerationJob(jobId: string): Promise<void> {
       UPDATE jobs SET status = 'failed', step = 'Generation failed', error = $2, updated_at = now()
       WHERE id = $1
     `, [jobId, safeMessage]);
+    await pool.query(`
+      INSERT INTO dead_letter_jobs (job_id, job_type, error_code, payload)
+      VALUES ($1, 'generation', $2, $3)
+      ON CONFLICT (job_id) DO NOTHING
+    `, [jobId, error instanceof Error ? error.name : "unknown", JSON.stringify({ retryable: true })]);
     await appendJobEvent(jobId, "failed", { step: "Generation failed", error: safeMessage });
   }
 }

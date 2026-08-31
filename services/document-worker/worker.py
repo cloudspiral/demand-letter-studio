@@ -58,7 +58,17 @@ def _role_for(text: str, style: str | None) -> tuple[str, float]:
     stripped = text.strip()
     if not stripped:
         return "preserve", 1.0
+    if stripped == "///":
+        return "preserve", 1.0
     upper = stripped.upper()
+    case_specific_patterns = (
+        r"\$\s?\d",
+        r"\b(?:19|20)\d{2}\b",
+        r"\b(?:Mr|Ms|Mrs|Dr)\.\s+[A-Z][A-Za-z]+",
+        r"\bClaim\s+(?:Number|No\.)",
+    )
+    if any(re.search(pattern, stripped, re.IGNORECASE) for pattern in case_specific_patterns):
+        return "editable", 0.9
     if (style or "").lower().startswith("heading") or (
         stripped == upper and any(ch.isalpha() for ch in stripped) and len(stripped) < 140
     ):
@@ -71,13 +81,20 @@ def _role_for(text: str, style: str | None) -> tuple[str, float]:
         "COMPLIANT RELEASE",
         "PURSUANT TO CODE",
         "A PURPORTED",
+        "ONLY RELEASES YOUR SETTLING INSURED",
+        "CANNOT CONTAIN ANY TERMS",
+        "DOES NOT REQUIRE OUR FIRM",
+        "A DECLARATION SIGNED BY ALL",
+        "THAT IDENTIFIES ALL APPLICABLE INSURANCE",
+        "THAT STATES THERE IS NO OTHER INSURANCE",
+        "ESQ.",
     )
     if any(marker in upper for marker in preserve_markers):
         return "preserve", 0.88
-    case_markers = ("$", "MR. ", "MS. ", "CLAIM", "ACCIDENT", "COLLISION", "INJUR")
+    case_markers = ("PATIENT", "ACCIDENT", "COLLISION", "INJUR", "TREATMENT", "MEDICAL", "DAMAGES")
     if any(marker in upper for marker in case_markers) and len(stripped) > 30:
         return "editable", 0.78
-    return "preserve", 0.58
+    return "editable", 0.62
 
 
 def analyze_template(path: str) -> dict[str, Any]:
@@ -92,18 +109,24 @@ def analyze_template(path: str) -> dict[str, Any]:
         if has_macros:
             raise DocumentError("Macro-enabled Word templates are not accepted.")
         document_xml = package.read("word/document.xml")
-        has_tracked = b"<w:ins" in document_xml or b"<w:del" in document_xml
+        root = etree.fromstring(document_xml)
+        has_tracked = bool(root.xpath("//w:ins | //w:del | //w:moveFrom | //w:moveTo", namespaces=NS))
         if has_tracked:
             raise DocumentError("Accept or reject existing tracked changes before importing this template.")
         has_complex = any(marker in document_xml for marker in (b"<w:txbxContent", b"<w:object", b"<v:shape"))
-        root = etree.fromstring(document_xml)
         paragraphs = root.xpath("//w:body/w:p", namespaces=NS)
         regions = []
+        boilerplate_tail = False
         for index, paragraph in enumerate(paragraphs):
             text = _paragraph_text(paragraph).strip()
             style_values = paragraph.xpath("./w:pPr/w:pStyle/@w:val", namespaces=NS)
             style = style_values[0] if style_values else None
             role, confidence = _role_for(text, style)
+            upper_text = text.upper()
+            if "THIS OFFER IS SUBJECT TO YOU COMPLYING" in upper_text or "FOLLOWING EXPRESS TERMS AND CONDITIONS" in upper_text:
+                boilerplate_tail = True
+            if boilerplate_tail and role == "editable" and confidence < 0.9:
+                role, confidence = "preserve", 0.9
             if text:
                 regions.append({
                     "paragraphIndex": index,
@@ -114,6 +137,31 @@ def analyze_template(path: str) -> dict[str, Any]:
                 })
         section_count = max(1, len(root.xpath("//w:sectPr", namespaces=NS)))
         warnings = []
+        replacement_candidates: list[dict[str, Any]] = []
+        seen_candidates: set[tuple[str, str]] = set()
+        for part_name in sorted(n for n in names if n.startswith(("word/header", "word/footer")) and n.endswith(".xml")):
+            part_root = etree.fromstring(package.read(part_name))
+            full_text = " ".join(part_root.xpath("//w:t/text()", namespaces=NS))
+            patterns = (
+                ("claim-number", r"(?i)claim\s+(?:number|no\.)\s*:\s*([A-Z0-9-]{5,})"),
+                ("person", r"(?i)\b(?:Mr|Ms|Mrs|Dr)\.\s+([A-Z][A-Za-z' -]{2,50})"),
+                ("amount", r"(\$\s?\d[\d,]*(?:\.\d{2})?)"),
+            )
+            for kind, pattern in patterns:
+                for match in re.finditer(pattern, full_text):
+                    value = match.group(1).strip()
+                    key = (part_name, value)
+                    if key not in seen_candidates:
+                        seen_candidates.add(key)
+                        replacement_candidates.append({"value": value, "location": part_name, "kind": kind})
+            has_dynamic_date = bool(part_root.xpath("//w:instrText[contains(., 'DATE')]", namespaces=NS))
+            if not has_dynamic_date:
+                for match in re.finditer(r"\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}\b", full_text):
+                    value = match.group(0)
+                    key = (part_name, value)
+                    if key not in seen_candidates:
+                        seen_candidates.add(key)
+                        replacement_candidates.append({"value": value, "location": part_name, "kind": "date"})
         if has_complex:
             warnings.append("Complex positioned objects are preserved but cannot be selected as editable regions.")
         return {
@@ -125,6 +173,7 @@ def analyze_template(path: str) -> dict[str, Any]:
             "hasComplexObjects": has_complex,
             "warnings": warnings,
             "regions": regions,
+            "replacementCandidates": replacement_candidates,
             "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
             "packageParts": len(names),
         }
@@ -178,20 +227,30 @@ def export_docx(payload: dict[str, Any]) -> dict[str, Any]:
         with zipfile.ZipFile(source) as zin, zipfile.ZipFile(temp_path, "w") as zout:
             for info in zin.infolist():
                 data = zin.read(info.filename)
-                if info.filename == "word/document.xml":
+                is_text_part = info.filename == "word/document.xml" or (
+                    info.filename.startswith(("word/header", "word/footer")) and info.filename.endswith(".xml")
+                )
+                if is_text_part:
                     root = etree.fromstring(data)
-                    paragraphs = root.xpath("//w:body/w:p", namespaces=NS)
-                    for index, paragraph in enumerate(paragraphs):
-                        original = _paragraph_text(paragraph)
+                    changed = False
+                    for text_node in root.xpath("//w:t", namespaces=NS):
+                        original = text_node.text or ""
                         updated = original
                         for old, new in replacements.items():
                             updated = updated.replace(old, new)
-                        if index in patches:
-                            updated = patches[index]
                         if updated != original:
-                            _replace_paragraph_text(paragraph, updated)
-                    settings = root.xpath("//w:settings", namespaces=NS)
-                    data = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+                            text_node.text = updated
+                            changed = True
+                    if info.filename == "word/document.xml":
+                        paragraphs = root.xpath("//w:body/w:p", namespaces=NS)
+                        for index, paragraph in enumerate(paragraphs):
+                            if index in patches:
+                                replacement = patches[index]
+                                if replacement != _paragraph_text(paragraph):
+                                    _replace_paragraph_text(paragraph, replacement)
+                                    changed = True
+                    if changed:
+                        data = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
                 zout.writestr(info, data)
         shutil.move(temp_path, output)
     finally:

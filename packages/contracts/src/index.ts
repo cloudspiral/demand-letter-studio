@@ -51,6 +51,11 @@ export const TemplateAnalysisSchema = z.object({
   hasComplexObjects: z.boolean(),
   warnings: z.array(z.string()),
   regions: z.array(TemplateRegionSchema),
+  replacementCandidates: z.array(z.object({
+    value: z.string().min(1),
+    location: z.string(),
+    kind: z.enum(["claim-number", "person", "date", "amount"]),
+  })).default([]),
 });
 
 export const RefinementProposalSchema = z.object({

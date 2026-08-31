@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createAiProvider } from "./ai";
+import { createAiProvider, parseModelDraft } from "./ai";
 
 const sourceId = "10000000-0000-4000-8000-000000000001";
 
@@ -11,6 +11,7 @@ describe("AI provider adapter", () => {
       template: {
         filename: "canary.docx", paragraphCount: 1, sectionCount: 1,
         hasMacros: false, hasTrackedChanges: false, hasComplexObjects: false, warnings: [],
+        replacementCandidates: [],
         regions: [{ paragraphIndex: 0, text: "Old case narrative", role: "editable", confidence: 1, style: null }],
       },
       evidence: [{ sourceId, sourceName: "canary.pdf", page: 1, text: "Patient: Jordan Canary\nTotal Charges: $12,345.67" }],
@@ -26,5 +27,27 @@ describe("AI provider adapter", () => {
     });
     expect(proposal.targetText).toBe("This is very concise.");
     expect(proposal.replacementText).toBe("This is concise.");
+  });
+
+  it("accepts only confirmed replacement candidates grounded on the cited page", () => {
+    const template = {
+      filename: "canary.docx", paragraphCount: 0, sectionCount: 1,
+      hasMacros: false, hasTrackedChanges: false, hasComplexObjects: false, warnings: [], regions: [],
+      replacementCandidates: [{ value: "OLD-CLAIM", location: "word/header1.xml", kind: "claim-number" as const }],
+    };
+    const draft = parseModelDraft({
+      title: "Demand", matterName: "Canary", sections: [], warnings: [],
+      replacements: [
+        { oldValue: "not-a-template-value", newValue: "Jordan Canary", sourceId, page: 1 },
+        { oldValue: "OLD-CLAIM", newValue: "invented-value", sourceId, page: 1 },
+      ],
+    }, [{ sourceId, sourceName: "canary.pdf", page: 1, text: "Claim #: NEW-123\nPatient: Jordan Canary" }], template);
+    expect(draft.fields).toEqual({});
+
+    const grounded = parseModelDraft({
+      title: "Demand", matterName: "Canary", sections: [], warnings: [],
+      replacements: [{ oldValue: "OLD-CLAIM", newValue: "NEW-123", sourceId, page: 1 }],
+    }, [{ sourceId, sourceName: "canary.pdf", page: 1, text: "Claim #: NEW-123" }], template);
+    expect(grounded.fields["OLD-CLAIM"]?.value).toBe("NEW-123");
   });
 });
