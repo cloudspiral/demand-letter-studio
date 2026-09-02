@@ -64,7 +64,11 @@ export function normalizeDraftContent(raw: unknown, historicalConfirmedTargetIds
   const outcomes = Array.isArray(input.outcomes) ? input.outcomes.map((outcomeValue) => {
     const outcome = object(outcomeValue);
     const targetId = String(outcome.targetId ?? "");
-    const status = outcome.status === "generated" ? "generated" as const : "omitted" as const;
+    const status = outcome.status === "generated"
+      ? "generated" as const
+      : outcome.status === "attorney-supplied"
+        ? "attorney-supplied" as const
+        : "omitted" as const;
     if (outcome.status === "omitted_no_evidence" && (outcome.resolution === "confirmed" || outcome.resolution === "preapproved")) {
       legacyConfirmed.add(targetId);
     }
@@ -75,7 +79,7 @@ export function normalizeDraftContent(raw: unknown, historicalConfirmedTargetIds
       targetKind: outcome.targetKind,
       status,
       citations: status === "generated" && !grounded.length ? blockCitations.get(targetId) ?? [] : grounded,
-      note: status === "generated" ? null : typeof outcome.note === "string" && outcome.note.trim() ? outcome.note : "The prior draft did not include evidence-backed content for this target.",
+      note: status === "omitted" ? typeof outcome.note === "string" && outcome.note.trim() ? outcome.note : "The prior draft did not include evidence-backed content for this target." : null,
       sourceId: typeof outcome.sourceId === "string" ? outcome.sourceId : null,
       page: typeof outcome.page === "number" ? outcome.page : null,
       sourceName: typeof outcome.sourceName === "string" ? outcome.sourceName : null,

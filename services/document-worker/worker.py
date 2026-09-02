@@ -115,6 +115,12 @@ def _replace_paragraph_text(paragraph: etree._Element, text: str) -> None:
             return
         raise DocumentError("Cannot safely map replacement text into a tab-separated template paragraph.")
 
+    _replace_text_runs(paragraph, text)
+
+
+def _replace_text_runs(paragraph: etree._Element, text: str) -> None:
+    """Replace combined paragraph text even when a value spans styled Word runs."""
+
     text_nodes = paragraph.xpath(".//w:t", namespaces=NS)
     if not text_nodes:
         run = etree.SubElement(paragraph, f"{{{W}}}r")
@@ -831,6 +837,43 @@ def _insert_after(reference: etree._Element, element: etree._Element) -> None:
     parent.insert(parent.index(reference) + 1, element)
 
 
+def _wrap_paragraph_control(paragraph: etree._Element, tag: str) -> None:
+    parent = paragraph.getparent()
+    if parent is None:
+        raise DocumentError(f"Editable control {tag} points to a detached paragraph.")
+    if parent.tag == f"{{{W}}}sdtContent":
+        return
+    position = parent.index(paragraph)
+    sdt = etree.Element(f"{{{W}}}sdt")
+    properties = etree.SubElement(sdt, f"{{{W}}}sdtPr")
+    alias = etree.SubElement(properties, f"{{{W}}}alias")
+    alias.set(f"{{{W}}}val", tag)
+    tag_node = etree.SubElement(properties, f"{{{W}}}tag")
+    tag_node.set(f"{{{W}}}val", tag)
+    lock = etree.SubElement(properties, f"{{{W}}}lock")
+    lock.set(f"{{{W}}}val", "sdtLocked")
+    content = etree.SubElement(sdt, f"{{{W}}}sdtContent")
+    parent.remove(paragraph)
+    content.append(paragraph)
+    parent.insert(position, sdt)
+
+
+def _enable_forms_protection(package_data: dict[str, bytes]) -> None:
+    settings_name = "word/settings.xml"
+    if settings_name not in package_data:
+        raise DocumentError("Editable DOCX is missing word/settings.xml.")
+    settings = etree.fromstring(package_data[settings_name])
+    for existing in settings.xpath("./w:documentProtection", namespaces=NS):
+        settings.remove(existing)
+    protection = etree.Element(f"{{{W}}}documentProtection")
+    protection.set(f"{{{W}}}edit", "forms")
+    protection.set(f"{{{W}}}enforcement", "1")
+    settings.insert(0, protection)
+    package_data[settings_name] = etree.tostring(
+        settings, xml_declaration=True, encoding="UTF-8", standalone=True
+    )
+
+
 def _plain_paragraph(text: str) -> etree._Element:
     paragraph = etree.Element(f"{{{W}}}p")
     run = etree.SubElement(paragraph, f"{{{W}}}r")
@@ -897,14 +940,25 @@ def _apply_narrative_operation(
             raise DocumentError(f"Narrative target anchor is missing: {part_name} paragraph {paragraph_index}")
         nodes.append(part_paragraphs[paragraph_index])
     if operation["status"] != "generated":
-        for node in nodes:
-            _remove_element(node)
+        if operation.get("preserveEmptyAnchors"):
+            _replace_paragraph_text(nodes[0], "")
+            for node in nodes[1:]:
+                _remove_element(node)
+            control_tags = [str(tag) for tag in operation.get("controlTags", [])]
+            if control_tags:
+                if len(control_tags) != 1:
+                    raise DocumentError("An unresolved narrative omission requires exactly one editable control.")
+                _wrap_paragraph_control(nodes[0], control_tags[0])
+        else:
+            for node in nodes:
+                _remove_element(node)
         return
     paragraphs = [str(text) for text in operation.get("paragraphs", [])]
     if not paragraphs:
         raise DocumentError("Generated narrative target has no paragraphs.")
     if len({str(anchor["partName"]) for anchor in anchors}) != 1:
         raise DocumentError("One narrative target cannot span multiple OOXML parts.")
+    rendered_nodes = nodes[:len(paragraphs)]
     for index, text in enumerate(paragraphs[:len(nodes)]):
         _replace_paragraph_text(nodes[index], text)
     previous = nodes[-1]
@@ -913,8 +967,15 @@ def _apply_narrative_operation(
         _replace_paragraph_text(clone, text)
         _insert_after(previous, clone)
         previous = clone
+        rendered_nodes.append(clone)
     for unused in nodes[len(paragraphs):]:
         _remove_element(unused)
+    control_tags = [str(tag) for tag in operation.get("controlTags", [])]
+    if control_tags and len(control_tags) != len(rendered_nodes):
+        raise DocumentError("Generated narrative controls do not match the generated paragraph count.")
+    if control_tags:
+        for node, tag in zip(rendered_nodes, control_tags, strict=True):
+            _wrap_paragraph_control(node, tag)
 
 
 def _apply_paragraph_rows_operation(
@@ -1069,7 +1130,7 @@ def export_docx(payload: dict[str, Any]) -> dict[str, Any]:
         if key in patches:
             raise DocumentError(f"Template patch is duplicated: {part_name} paragraph {key[1]}")
         patches[key] = str(item["text"])
-    replacements = {str(k): str(v) for k, v in payload.get("fieldReplacements", {}).items() if k and v}
+    replacements = {str(k): str(v) for k, v in payload.get("fieldReplacements", {}).items() if k}
     image_replacements = {
         str(item["partName"]): Path(str(item["sourcePath"]))
         for item in payload.get("imageReplacements", [])
@@ -1115,13 +1176,16 @@ def export_docx(payload: dict[str, Any]) -> dict[str, Any]:
             hyperlink_updates: dict[str, dict[str, str]] = {}
             applied_patches: set[tuple[str, int]] = set()
             for part_name, root in roots.items():
-                for text_node in root.xpath("//w:t", namespaces=NS):
-                    original = text_node.text or ""
+                for paragraph in originals[part_name]:
+                    original = _paragraph_text(paragraph)
                     updated = original
                     for old, new in replacements.items():
                         updated = updated.replace(old, new)
                     if updated != original:
-                        _set_text_node(text_node, updated)
+                        part_updates = _hyperlink_replacements(paragraph, updated)
+                        if part_updates:
+                            hyperlink_updates.setdefault(part_name, {}).update(part_updates)
+                        _replace_text_runs(paragraph, updated)
                         changed_parts.add(part_name)
                 for index, paragraph in enumerate(originals[part_name]):
                     patch_key = (part_name, index)
@@ -1162,6 +1226,36 @@ def export_docx(payload: dict[str, Any]) -> dict[str, Any]:
                 else:
                     raise DocumentError(f"Unsupported generation target kind: {kind}")
                 changed_parts.update(str(anchor["partName"]) for anchor in anchors)
+            applied_controls: set[str] = set()
+            for control in payload.get("editableControls", []):
+                part_name = str(control["partName"])
+                paragraph_index = int(control["paragraphIndex"])
+                tag = str(control["tag"])
+                paragraphs = originals.get(part_name, [])
+                if paragraph_index >= len(paragraphs):
+                    raise DocumentError(f"Editable control target is missing: {part_name} paragraph {paragraph_index}")
+                paragraph = paragraphs[paragraph_index]
+                if paragraph.getparent() is None:
+                    continue
+                _wrap_paragraph_control(paragraph, tag)
+                applied_controls.add(tag)
+                changed_parts.add(part_name)
+            expected_controls = {str(control["tag"]) for control in payload.get("editableControls", [])}
+            expected_controls.update(
+                str(tag)
+                for operation in target_operations
+                for tag in operation.get("controlTags", [])
+            )
+            applied_controls.update(
+                str(tag)
+                for operation in target_operations
+                for tag in operation.get("controlTags", [])
+            )
+            missing_controls = sorted(expected_controls.difference(applied_controls))
+            if missing_controls:
+                raise DocumentError(f"Editable control target was removed during generation: {missing_controls[0]}")
+            if payload.get("formsProtection"):
+                _enable_forms_protection(package_data)
             for part_name in changed_parts:
                 package_data[part_name] = etree.tostring(
                     roots[part_name], xml_declaration=True, encoding="UTF-8", standalone=True
@@ -1197,6 +1291,37 @@ def export_docx(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def extract_controls(path: str) -> dict[str, Any]:
+    source = Path(path)
+    controls: list[dict[str, str]] = []
+    with zipfile.ZipFile(source) as package:
+        names = set(package.namelist())
+        required = {"[Content_Types].xml", "word/document.xml", "word/styles.xml"}
+        missing = sorted(required.difference(names))
+        if missing:
+            raise DocumentError(f"Edited DOCX is missing required parts: {', '.join(missing)}")
+        text_parts = [part_name for part_name in names if part_name == "word/document.xml" or (
+            part_name.startswith(("word/header", "word/footer")) and part_name.endswith(".xml")
+        )]
+        for part_name in sorted(text_parts):
+            root = etree.fromstring(package.read(part_name))
+            for control in root.xpath("//w:sdt[w:sdtPr/w:tag]", namespaces=NS):
+                tags = control.xpath("./w:sdtPr/w:tag/@w:val", namespaces=NS)
+                if not tags:
+                    continue
+                controls.append({
+                    "tag": str(tags[0]),
+                    "text": _paragraph_text(control),
+                    "partName": part_name,
+                })
+    return {
+        "path": str(source),
+        "size": source.stat().st_size,
+        "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "controls": controls,
+    }
+
+
 def dispatch(payload: dict[str, Any]) -> dict[str, Any]:
     operation = payload.get("operation")
     if operation == "analyze-template":
@@ -1205,6 +1330,8 @@ def dispatch(payload: dict[str, Any]) -> dict[str, Any]:
         return extract_source(payload["path"], payload.get("mimeType"))
     if operation == "export-docx":
         return export_docx(payload)
+    if operation == "extract-controls":
+        return extract_controls(payload["path"])
     raise DocumentError(f"Unknown document operation: {operation}")
 
 

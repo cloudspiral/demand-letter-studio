@@ -32,7 +32,7 @@ export const GenerationOutcomeSchema = z.object({
   id: z.string().min(1).max(500),
   targetId: z.string().min(1).max(500),
   targetKind: z.enum(["narrative", "structured", "figure"]),
-  status: z.enum(["generated", "omitted"]),
+  status: z.enum(["generated", "omitted", "attorney-supplied"]),
   citations: z.array(CitationSchema).max(100),
   note: z.string().max(2_000).nullable().default(null),
   sourceId: z.string().uuid().nullable().default(null),
@@ -51,6 +51,9 @@ export const GenerationOutcomeSchema = z.object({
   }
   if (outcome.status === "omitted" && !outcome.note?.trim()) {
     context.addIssue({ code: "custom", path: ["note"], message: "Omitted outcomes require a concise review note." });
+  }
+  if (outcome.status === "attorney-supplied" && outcome.note !== null) {
+    context.addIssue({ code: "custom", path: ["note"], message: "Attorney-supplied outcomes must have a null note." });
   }
   if (outcome.targetKind === "figure" && outcome.status === "generated" && (!outcome.sourceId || !outcome.page || !outcome.caption)) {
     context.addIssue({ code: "custom", path: ["sourceId"], message: "Generated figures require a source image, page, and caption." });

@@ -8,7 +8,7 @@ from lxml import etree
 from PIL import Image
 from pypdf import PdfWriter
 
-from worker import DocumentError, analyze_template, export_docx, extract_source
+from worker import DocumentError, analyze_template, export_docx, extract_controls, extract_source
 
 
 DOCUMENT = b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -22,6 +22,7 @@ DOCUMENT = b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 </w:document>'''
 
 STYLES = b'''<?xml version="1.0" encoding="UTF-8"?><w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>'''
+SETTINGS = b'''<?xml version="1.0" encoding="UTF-8"?><w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>'''
 CONTENT_TYPES = b'''<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/></Types>'''
 HEADER = b'''<?xml version="1.0" encoding="UTF-8"?><w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:r><w:t>Claim Number: 999999 - Demand</w:t></w:r><w:fldSimple w:instr=" PAGE "><w:r><w:t>1</w:t></w:r></w:fldSimple></w:p></w:hdr>'''
 COMPLEX_DOCUMENT = b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -45,6 +46,13 @@ DEADLINE_DOCUMENT = b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
     <w:p><w:r><w:t>This offer is subject to you complying with the following express terms and conditions:</w:t></w:r></w:p>
     <w:p><w:r><w:t>This offer expires unless accepted by October 15, 2026, </w:t></w:r></w:p>
     <w:p><w:r><w:t xml:space="preserve">at 12:00 p.m. PST. Acceptance requires complete compliance.</w:t></w:r></w:p>
+    <w:sectPr><w:pgSz w:w="12240" w:h="15840"/></w:sectPr>
+  </w:body>
+</w:document>'''
+SPLIT_FIELD_DOCUMENT = b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:r><w:rPr><w:b/></w:rPr><w:t>$100,</w:t></w:r><w:r><w:rPr><w:i/></w:rPr><w:t>000.00</w:t></w:r></w:p>
     <w:sectPr><w:pgSz w:w="12240" w:h="15840"/></w:sectPr>
   </w:body>
 </w:document>'''
@@ -97,6 +105,7 @@ def make_docx(path: Path, document: bytes = DOCUMENT, document_rels: bytes | Non
             package.writestr("word/_rels/document.xml.rels", document_rels)
         package.writestr("word/document.xml", document)
         package.writestr("word/styles.xml", STYLES)
+        package.writestr("word/settings.xml", SETTINGS)
         package.writestr("word/header1.xml", HEADER)
         package.writestr("word/media/immutable.png", b"preserve-me")
 
@@ -190,6 +199,32 @@ class DocumentWorkerTests(unittest.TestCase):
                 self.assertIn("at 5:00 p.m. Pacific Time. Acceptance requires", text)
                 self.assertNotIn("12:00 p.m. PST", text)
 
+    def test_field_replacement_spans_word_runs_without_restoring_old_template_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "split-field-template.docx"
+            output = Path(directory) / "split-field-output.docx"
+            make_docx(source, SPLIT_FIELD_DOCUMENT)
+            export_docx({
+                "templatePath": str(source),
+                "outputPath": str(output),
+                "patches": [],
+                "fieldReplacements": {"$100,000.00": ""},
+                "editableControls": [{
+                    "tag": "steno-field-split",
+                    "partName": "word/document.xml",
+                    "paragraphIndex": 0,
+                }],
+                "formsProtection": True,
+            })
+            with zipfile.ZipFile(output) as package:
+                root = etree.fromstring(package.read("word/document.xml"))
+                self.assertEqual(root.xpath("normalize-space(string(//w:sdtContent))", namespaces={
+                    "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+                }), "")
+                self.assertEqual(len(root.xpath("//w:sdt", namespaces={
+                    "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+                })), 1)
+
     def test_export_patches_text_and_preserves_opaque_assets(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "template.docx"
@@ -205,6 +240,47 @@ class DocumentWorkerTests(unittest.TestCase):
                 header = package.read("word/header1.xml")
                 self.assertIn(b"Claim Number: 123456", header)
                 self.assertIn(b"fldSimple", header)
+
+    def test_export_wraps_only_mapped_paragraphs_in_locked_editable_controls(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "template.docx"
+            output = Path(directory) / "editable.docx"
+            make_docx(source)
+            export_docx({
+                "templatePath": str(source),
+                "outputPath": str(output),
+                "patches": [{"paragraphIndex": 1, "text": "Attorney-editable narrative."}],
+                "fieldReplacements": {},
+                "editableControls": [{
+                    "tag": "steno-target-1",
+                    "partName": "word/document.xml",
+                    "paragraphIndex": 1,
+                }],
+                "formsProtection": True,
+            })
+            extracted = extract_controls(str(output))
+            self.assertEqual(extracted["controls"], [{
+                "tag": "steno-target-1",
+                "text": "Attorney-editable narrative.",
+                "partName": "word/document.xml",
+            }])
+            with zipfile.ZipFile(output) as package:
+                self.assertEqual(package.read("word/media/immutable.png"), b"preserve-me")
+                self.assertEqual(package.read("word/header1.xml"), HEADER)
+                root = etree.fromstring(package.read("word/document.xml"))
+                self.assertEqual(len(root.xpath("//w:sdt", namespaces={"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"})), 1)
+                self.assertFalse(root.xpath("//w:sdtPr/w:text", namespaces={"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}))
+                settings = etree.fromstring(package.read("word/settings.xml"))
+                protection = settings.xpath("./w:documentProtection", namespaces={"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"})
+                self.assertEqual(protection[0].get("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}edit"), "forms")
+
+    def test_extract_controls_rejects_a_malformed_saved_document(self):
+        with tempfile.TemporaryDirectory() as directory:
+            malformed = Path(directory) / "malformed.docx"
+            with zipfile.ZipFile(malformed, "w") as package:
+                package.writestr("[Content_Types].xml", CONTENT_TYPES)
+            with self.assertRaisesRegex(DocumentError, "missing required parts"):
+                extract_controls(str(malformed))
 
     def test_export_patches_a_confirmed_header_block_by_part_and_anchor(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -284,7 +360,7 @@ class DocumentWorkerTests(unittest.TestCase):
                     "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
                     "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
                 }
-                paragraphs = root.xpath("//w:body/w:p", namespaces=namespaces)
+                paragraphs = root.xpath("//w:body//w:p", namespaces=namespaces)
                 self.assertEqual("".join(paragraphs[0].xpath(".//w:t/text()", namespaces=namespaces)), "May 29, 2026")
                 self.assertTrue(paragraphs[0].xpath(".//w:instrText", namespaces=namespaces))
                 self.assertTrue(paragraphs[1].xpath("./w:bookmarkStart | ./w:bookmarkEnd", namespaces=namespaces))
@@ -383,7 +459,9 @@ class DocumentWorkerTests(unittest.TestCase):
                 "targetOperations": [{
                     "targetId": "narrative-1", "kind": "narrative", "status": "generated", "anchors": anchors,
                     "paragraphs": ["Generated one.", "Generated two.", "Generated three."],
+                    "controlTags": ["target-0", "target-1", "target-2"],
                 }],
+                "formsProtection": True,
             })
             export_docx({
                 "templatePath": str(source), "outputPath": str(contracted), "patches": [], "fieldReplacements": {},
@@ -395,11 +473,14 @@ class DocumentWorkerTests(unittest.TestCase):
             namespaces = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
             with zipfile.ZipFile(expanded) as package:
                 root = etree.fromstring(package.read("word/document.xml"))
-                paragraphs = root.xpath("//w:body/w:p", namespaces=namespaces)
+                paragraphs = root.xpath("//w:body//w:p", namespaces=namespaces)
                 self.assertEqual(["".join(p.xpath(".//w:t/text()", namespaces=namespaces)) for p in paragraphs], [
                     "FACTS", "Generated one.", "Generated two.", "Generated three.", "Reusable tail.",
                 ])
                 self.assertTrue(paragraphs[3].xpath("./w:pPr/w:pStyle[@w:val='BodyText']", namespaces=namespaces))
+                self.assertEqual([control["text"] for control in extract_controls(str(expanded))["controls"]], [
+                    "Generated one.", "Generated two.", "Generated three.",
+                ])
             with zipfile.ZipFile(contracted) as package:
                 root = etree.fromstring(package.read("word/document.xml"))
                 text = ["".join(p.xpath(".//w:t/text()", namespaces=namespaces)) for p in root.xpath("//w:body/w:p", namespaces=namespaces)]

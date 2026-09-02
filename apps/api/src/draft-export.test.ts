@@ -102,6 +102,15 @@ describe("Word export readiness", () => {
     })).toMatchObject({ ready: true, omittedTargetIds: [] });
   });
 
+  it("allows an attorney-supplied target without model citations", () => {
+    const supplied: GeneratedDraft = {
+      ...content,
+      outcomes: [{ ...content.outcomes[0]!, status: "attorney-supplied", citations: [], note: null }],
+      sections: [{ ...content.sections[0]!, blocks: [{ ...content.sections[0]!.blocks[0]!, citations: [], attorneyEdited: true }] }],
+    };
+    expect(draftExportIssues(supplied)).toMatchObject({ ready: true, omittedTargetIds: [] });
+  });
+
   it("detects stale evidence and duplicate template mappings", () => {
     const stale = draftExportIssues(content, {
       draftSourceFingerprint: "a".repeat(64),

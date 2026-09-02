@@ -121,11 +121,19 @@ CREATE TABLE IF NOT EXISTS draft_versions (
   draft_id uuid NOT NULL REFERENCES drafts(id) ON DELETE CASCADE,
   version integer NOT NULL,
   content jsonb NOT NULL,
+  document_storage_key text,
+  document_sha256 text,
+  document_size bigint,
+  editor_controls jsonb NOT NULL DEFAULT '[]'::jsonb,
   actor_id uuid REFERENCES actors(id),
   change_summary text NOT NULL DEFAULT 'Draft updated',
   created_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (draft_id, version)
 );
+ALTER TABLE draft_versions ADD COLUMN IF NOT EXISTS document_storage_key text;
+ALTER TABLE draft_versions ADD COLUMN IF NOT EXISTS document_sha256 text;
+ALTER TABLE draft_versions ADD COLUMN IF NOT EXISTS document_size bigint;
+ALTER TABLE draft_versions ADD COLUMN IF NOT EXISTS editor_controls jsonb NOT NULL DEFAULT '[]'::jsonb;
 CREATE TABLE IF NOT EXISTS citations (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   draft_id uuid NOT NULL REFERENCES drafts(id) ON DELETE CASCADE,

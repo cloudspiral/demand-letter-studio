@@ -15,28 +15,29 @@ Demand Letter Studio turns a reviewed firm Word template and a case evidence pac
 - Start each matter as `New matter`; after the first validated generation, derive `Claimant - claim number` from grounded replacement fields. An inline attorney rename is sticky across regeneration.
 - Generate asynchronously through one whole-document OpenAI Responses request, with Anthropic and Bedrock adapters behind the same strict contracts and a deterministic mock for tests. Application code derives elastic prose runs from the confirmed map; the model returns exactly one `generated` or `omitted` outcome for every narrative, structured, and figure target plus one nullable result for every replaceable inline field.
 - Validate exact target and field coverage, bounds, citations, figure media, source fingerprints, structured rows, and previous-matter leakage before persisting or revealing any draft. A missing, ambiguous, or conflicting fact becomes one omission or null field with a concise note; a grounded negative fact remains cited generated content.
-- Open every completed draft in the editable letter workspace with one compact Review panel. It shows exactly one actionable card per unresolved omission or null field and a single Ready to export state when no blockers remain.
+- Open every completed draft as the real template-backed DOCX in a self-hosted ONLYOFFICE form-filling editor. The original letterhead, headers, footers, tables, images, spacing, and pagination remain visible while mapped/generated controls are editable and the rest of the template stays protected.
 - Add evidence from the source drawer without leaving the matter. The current draft becomes stale immediately and same-draft regeneration appends a new version without carrying forward old omission approvals.
 - Inspect reading-order citations in the drawer, including exact extracted pages and an authorized link to the original PDF at the cited page.
 - Supply any missing merge-field value before export; the saved correction is the attorney's approval and creates an audited version.
-- Annotate up to five exact text ranges and stream one atomic multi-block AI proposal over SSE; accept or reject the entire proposal and retain a semantic activity log.
-- Confirm an unresolved omission after generation. Confirmation is stored inside the new immutable version snapshot; if it leaves an orphan heading, the heading text is blanked while its DOCX paragraph anchor remains intact.
-- Edit any existing generated, Keep, heading, header, or footer text directly. Blur saves a new version; accepting an AI proposal also creates a version, and neither action creates a second confirmation task. Original citations remain visible with an **Attorney edited** label because the changed wording is not revalidated.
+- Select a mapped paragraph and stream one atomic AI proposal over SSE; inspect its before-and-after text, accept or reject it, and retain a semantic activity log.
+- Supply reviewed text for any non-image omission or choose **Leave blank**. Either decision creates an immutable audited version; supplied text is marked attorney-edited rather than source-grounded.
+- Edit mapped/generated content controls directly inside the Word view. ONLYOFFICE force-save callbacks create a new immutable DOCX version, synchronize the edited controls back into structured draft content, and preserve every prior version. Unmapped template content remains protected.
 - Undo the latest persisted operation by restoring its preceding snapshot, or restore any older snapshot from Activity. Restoring always appends a new latest version and never overwrites history.
 - Compute one canonical export-readiness result on the server and return it with every draft. The browser and Word endpoint use that identical result to lock export only for unresolved omissions, null fields, stale evidence, and invalid or duplicate template mappings.
-- Assemble a genuine `.docx` deterministically from a copied template package. Code expands/contracts compatible prose exemplars, rebuilds 0-N table or paragraph-based structured rows, applies inline substitutions without flattening surrounding runs, and replaces or removes mapped figures and captions while preserving unrelated styles, numbering, headers, footers, relationships, and section settings.
+- Materialize each version as a genuine `.docx` from the immutable template plus validated model or attorney values. Code expands/contracts compatible prose exemplars, rebuilds structured rows, patches each repeated inline field independently, and replaces or removes mapped figures while preserving unrelated styles, numbering, headers, footers, relationships, and section settings. Export serves the exact reviewed version artifact.
 - Run locally with PostgreSQL and inspect the undeployed AWS SAM shape for API Gateway, Lambda, SQS/DLQ, and encrypted/versioned S3.
 
 ## Quick start
 
-Prerequisites: Node 22+, pnpm 10+, Python 3.13+, [uv](https://docs.astral.sh/uv/), Docker, and LibreOffice/`soffice` for visual DOCX QA.
+Prerequisites: Node 22+, pnpm 10+, Python 3.13+, [uv](https://docs.astral.sh/uv/), Docker, and LibreOffice/`soffice` for visual DOCX QA. The local Word editor also needs enough memory for the ONLYOFFICE Community container.
 
 ```bash
 cp .env.example .env
 pnpm install
 uv sync --project services/document-worker --locked
 docker compose up -d postgres
-pnpm dev
+pnpm onlyoffice:up
+pnpm dev:onlyoffice
 ```
 
 Open [http://127.0.0.1:5173](http://127.0.0.1:5173). Add the reference DOCX and source ZIP at the repository root if you want the local **Use the supplied Steno sample packet** shortcut; those assignment artifacts are intentionally ignored by Git.
@@ -65,7 +66,7 @@ The e2e test accepts `E2E_BASE_URL`, `E2E_TEMPLATE_PATH`, `E2E_SOURCE_DIR`, `E2E
 ## Repository map
 
 ```text
-apps/web                 React, Vite, Tiptap, browser acceptance test
+apps/web                 React, Vite, embedded ONLYOFFICE, browser acceptance tests
 apps/api                 Fastify API, PostgreSQL workflow, AI adapters
 packages/contracts       Shared Zod schemas and transport/domain types
 services/document-worker Python PDF extraction and bounded OOXML operations
@@ -84,7 +85,8 @@ docs                     Architecture and decision records
 - `GET /api/drafts/:id`, `PUT /api/drafts/:id`, and `GET /api/drafts/:id/versions`
 - `POST /api/drafts/:id/restore`
 - `POST /api/drafts/:id/fields/confirm`
-- `POST /api/drafts/:id/outcomes/:outcomeId/confirm`
+- `POST /api/drafts/:id/outcomes/:outcomeId/supply` or `/confirm` (Leave blank)
+- `GET /api/drafts/:id/editor-config`, signed version-document retrieval, force-save, and callback routes
 - `POST /api/drafts/:id/refinements`
 - `POST /api/proposals/:id/accept` or `/reject`
 - `GET /api/sources/:id/file`

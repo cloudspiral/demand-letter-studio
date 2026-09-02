@@ -31,4 +31,8 @@ export const config = {
   bedrockModel: process.env.BEDROCK_MODEL ?? "us.anthropic.claude-sonnet-4-6",
   openaiModel: process.env.OPENAI_MODEL ?? "gpt-5.6-sol",
   anthropicModel: process.env.ANTHROPIC_MODEL ?? "claude-opus-5",
+  onlyOfficePublicUrl: process.env.ONLYOFFICE_PUBLIC_URL?.replace(/\/$/, "") ?? null,
+  onlyOfficeInternalUrl: process.env.ONLYOFFICE_INTERNAL_URL?.replace(/\/$/, "") ?? null,
+  onlyOfficeAppUrl: process.env.ONLYOFFICE_APP_URL?.replace(/\/$/, "") ?? null,
+  onlyOfficeJwtSecret: process.env.ONLYOFFICE_JWT_SECRET ?? null,
 };

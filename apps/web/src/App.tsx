@@ -1,28 +1,20 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
-import { EditorContent, useEditor } from "@tiptap/react";
-import StarterKit from "@tiptap/starter-kit";
 import {
   ArrowLeft, Check, ChevronRight, CircleAlert, Download, ExternalLink, FileText,
   LoaderCircle, Plus, RotateCcw, Search, Send, Sparkles, Upload, X,
 } from "lucide-react";
 import type {
-  Citation, DraftBlock, GeneratedDraft, RefinementAnnotation, RefinementEdit, TemplateRegion,
+  Citation, DraftBlock, GeneratedDraft, RefinementAnnotation, TemplateRegion,
 } from "@steno/contracts";
 import { api, streamEvent, upload } from "./api";
+import { OnlyOfficeEditor } from "./OnlyOfficeEditor";
 import type {
   ActivityResponse, DraftResponse, JobResponse, MatterResponse, ProposalResponse, TemplateResponse, VersionResponse,
 } from "./types";
 
 type WorkspaceTab = "review" | "refine" | "activity";
 type ChatMessage = { role: "user" | "assistant"; text: string; annotationCount?: number };
-type SelectionPopover = RefinementAnnotation & { x: number; y: number };
 type SelectedSource = { sourceId: string; sourceName: string; page: number; text: string; mimeType?: string; extractionMethod?: string; extractionStatus?: string; confidence?: number | null; visualInput?: boolean };
-
-function blockDoc(text: string) {
-  return text
-    ? { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text }] }] }
-    : { type: "doc", content: [{ type: "paragraph" }] };
-}
 
 function formatBytes(bytes: number) {
   if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
@@ -45,91 +37,6 @@ function templateCreatedLabel(createdAt?: string) {
   }).format(new Date(createdAt));
 }
 
-function renderProposedText(text: string, edits: RefinementEdit[]) {
-  const ordered = [...edits].sort((a, b) => a.start - b.start);
-  const nodes: ReactNode[] = [];
-  let cursor = 0;
-  ordered.forEach((edit, index) => {
-    nodes.push(<span key={`before-${index}`}>{text.slice(cursor, edit.start)}</span>);
-    nodes.push(<del key={`delete-${index}`}>{edit.targetText}</del>);
-    nodes.push(<ins key={`insert-${index}`}>{edit.replacementText}</ins>);
-    cursor = edit.end;
-  });
-  nodes.push(<span key="after">{text.slice(cursor)}</span>);
-  return nodes;
-}
-
-function BlockEditor({
-  block, active, citationNumbers, edits, disabled, onFocus, onChange, onBlur, onCitation, onSelect,
-}: {
-  block: DraftBlock;
-  active: boolean;
-  citationNumbers: number[];
-  edits: RefinementEdit[];
-  disabled: boolean;
-  onFocus: () => void;
-  onChange: (text: string) => void;
-  onBlur: (text: string) => void;
-  onCitation: (index: number) => void;
-  onSelect: (selection: SelectionPopover) => void;
-}) {
-  const editor = useEditor({
-    extensions: [StarterKit.configure({ heading: false, bulletList: false, orderedList: false, blockquote: false, codeBlock: false })],
-    content: blockDoc(block.text),
-    editable: edits.length === 0 && !disabled,
-    editorProps: { attributes: { class: "block-editor", "aria-label": `Editable paragraph ${block.id}` } },
-    onFocus,
-    onUpdate: ({ editor: current }) => onChange(current.getText()),
-    onBlur: ({ editor: current }) => onBlur(current.getText()),
-  }, [block.id]);
-
-  useEffect(() => {
-    if (editor && !editor.isDestroyed) editor.setEditable(edits.length === 0 && !disabled);
-  }, [disabled, editor, edits.length]);
-
-  useEffect(() => {
-    if (editor && !editor.isDestroyed && editor.getText() !== block.text && edits.length === 0) {
-      editor.commands.setContent(blockDoc(block.text), { emitUpdate: false });
-    }
-  }, [block.text, editor, edits.length]);
-
-  const captureSelection = (event: React.MouseEvent<HTMLDivElement>) => {
-    if (edits.length || disabled) return;
-    const selection = window.getSelection();
-    const root = event.currentTarget.querySelector<HTMLElement>(".ProseMirror");
-    if (!selection || selection.rangeCount === 0 || selection.isCollapsed || !root || !root.contains(selection.anchorNode)) return;
-    const quote = selection.toString();
-    if (quote.trim().length < 4) return;
-    const range = selection.getRangeAt(0);
-    const prefix = document.createRange();
-    prefix.selectNodeContents(root);
-    prefix.setEnd(range.startContainer, range.startOffset);
-    const start = prefix.toString().length;
-    const rect = range.getBoundingClientRect();
-    onSelect({ blockId: block.id, quote, start, end: start + quote.length, x: rect.left + rect.width / 2, y: rect.top });
-  };
-
-  return (
-    <div data-draft-block={block.id} className={`draft-block ${active ? "active" : ""}`} onClick={onFocus}>
-      {edits.length
-        ? <div className="block-editor proposal-render" aria-label={`Proposed changes for ${block.id}`}>{renderProposedText(block.text, edits)}</div>
-        : <div onMouseUp={captureSelection}><EditorContent editor={editor} /></div>}
-      <div className="citation-row" contentEditable={false}>
-        {block.citations.map((citation, index) => (
-          <button
-            className="citation-pill"
-            key={`${citation.sourceId}-${citation.page}-${index}`}
-            onClick={(event) => { event.stopPropagation(); onCitation(index); }}
-            title={`${citation.sourceName}, page ${citation.page ?? "unavailable"}`}
-          >
-            {citationNumbers[index]}
-          </button>
-        ))}
-        {block.attorneyEdited && <span className="attorney-confirmed">Attorney edited · citations not revalidated</span>}
-      </div>
-    </div>
-  );
-}
 
 type TemplateReviewUnit = {
   id: string;
@@ -574,7 +481,7 @@ function Setup({ onReady }: { onReady: (matterId: string) => Promise<void> }) {
 
 function RefinePanel({
   tab, setTab, messages, activity, annotations, instruction, proposal, thinking, activeBlock,
-  reviewContent, versions, onInstruction, onRemoveAnnotation, onSend, onResolve, onRestore,
+  availableBlocks, reviewContent, versions, onInstruction, onActiveBlock, onRemoveAnnotation, onSend, onResolve, onRestore,
 }: {
   tab: WorkspaceTab;
   setTab: (tab: WorkspaceTab) => void;
@@ -586,8 +493,10 @@ function RefinePanel({
   proposal: ProposalResponse | null;
   thinking: boolean;
   activeBlock: DraftBlock | null;
+  availableBlocks: DraftBlock[];
   reviewContent: ReactNode;
   onInstruction: (value: string) => void;
+  onActiveBlock: (blockId: string) => void;
   onRemoveAnnotation: (index: number) => void;
   onSend: () => void;
   onResolve: (resolution: "accept" | "reject") => void;
@@ -602,7 +511,7 @@ function RefinePanel({
       </div>
       {tab === "review" ? <div className="unified-review-panel">{reviewContent}</div> : tab === "refine" ? <>
         <div className="chat-scroll">
-          {!messages.length && <div className="chat-intro"><Sparkles size={22} /><strong>Refine without losing control</strong><p>Select passages in the letter, add them to chat, and review every proposed change before it is applied.</p></div>}
+          {!messages.length && <div className="chat-intro"><Sparkles size={22} /><strong>Refine without losing control</strong><p>Choose a mapped paragraph, instruct the AI, and review every proposed change before it is applied.</p></div>}
           {messages.map((message, index) => <div className={`chat-message ${message.role}`} key={`${message.role}-${index}`}>
             {!!message.annotationCount && <small>❝ {message.annotationCount} selected {message.annotationCount === 1 ? "passage" : "passages"}</small>}
             <p>{message.text}</p>
@@ -611,6 +520,7 @@ function RefinePanel({
           {proposal && <div className="proposal-card">
             <p className="eyebrow">Proposed edit · {proposal.proposal.edits.length} {proposal.proposal.edits.length === 1 ? "passage" : "passages"}</p>
             <strong>{proposal.proposal.summary}</strong>
+            <div className="proposal-preview">{proposal.proposal.edits.map((edit, index) => <div key={`${edit.blockId}-${index}`}><del>{edit.targetText}</del><ins>{edit.replacementText}</ins></div>)}</div>
             <div className="proposal-actions"><button className="accept" onClick={() => onResolve("accept")}><Check size={14} /> Accept</button><button className="reject" onClick={() => onResolve("reject")}><X size={14} /> Reject</button></div>
           </div>}
           {!proposal && !thinking && <div className="suggestions">
@@ -618,6 +528,9 @@ function RefinePanel({
           </div>}
         </div>
         <div className="composer">
+          <label className="refine-target"><span>Mapped paragraph</span><select value={activeBlock?.id ?? ""} onChange={(event) => onActiveBlock(event.target.value)}>
+            {availableBlocks.map((block) => <option value={block.id} key={block.id}>{block.text.slice(0, 86) || "Blank mapped paragraph"}</option>)}
+          </select></label>
           {annotations.length > 0 && <div className="annotation-stack">{annotations.map((annotation, index) => <div className="annotation-chip" key={`${annotation.blockId}-${annotation.start}`}>
             <span><strong>Annotation {index + 1}</strong>“{annotation.quote.slice(0, 92)}{annotation.quote.length > 92 ? "…" : ""}”</span>
             <button onClick={() => onRemoveAnnotation(index)} aria-label={`Remove annotation ${index + 1}`}><X size={13} /></button>
@@ -656,7 +569,6 @@ export function App() {
   const [draft, setDraft] = useState<DraftResponse | null>(null);
   const [content, setContent] = useState<GeneratedDraft | null>(null);
   const [job, setJob] = useState<JobResponse | null>(null);
-  const [revealedSections, setRevealedSections] = useState(0);
   const [activeBlockId, setActiveBlockId] = useState<string | null>(null);
   const [activeReviewItemId, setActiveReviewItemId] = useState<string | null>(null);
   const [sourcesOpen, setSourcesOpen] = useState(false);
@@ -666,13 +578,13 @@ export function App() {
   const [activity, setActivity] = useState<ActivityResponse[]>([]);
   const [versions, setVersions] = useState<VersionResponse[]>([]);
   const [annotations, setAnnotations] = useState<RefinementAnnotation[]>([]);
-  const [selection, setSelection] = useState<SelectionPopover | null>(null);
   const [instruction, setInstruction] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [proposal, setProposal] = useState<ProposalResponse | null>(null);
   const [thinking, setThinking] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [fieldValues, setFieldValues] = useState<Record<string, string>>({});
+  const [outcomeValues, setOutcomeValues] = useState<Record<string, string>>({});
   const [addingEvidence, setAddingEvidence] = useState(false);
   const [confirmingOutcomeId, setConfirmingOutcomeId] = useState<string | null>(null);
   const [undoVersion, setUndoVersion] = useState<number | null>(null);
@@ -688,10 +600,11 @@ export function App() {
   const loadVersions = useCallback(async (draftId: string) => setVersions(await api<VersionResponse[]>(`/api/drafts/${draftId}/versions`)), []);
   const loadDraft = useCallback(async (draftId: string) => {
     const loaded = await api<DraftResponse>(`/api/drafts/${draftId}`);
-    setDraft(loaded); setContent(loaded.content); setRevealedSections(0);
+    setDraft(loaded); setContent(loaded.content);
     setTab("review");
     setActiveBlockId(loaded.content.sections.flatMap((section) => section.blocks)[0]?.id ?? null);
     setFieldValues(Object.fromEntries(Object.entries(loaded.content.fields).map(([key, field]) => [key, field.value ?? ""])));
+    setOutcomeValues({});
     await loadVersions(draftId);
   }, [loadVersions]);
 
@@ -728,21 +641,6 @@ export function App() {
     else await generateForMatter(loaded);
     await loadActivity(matterId);
   }, [generateForMatter, loadActivity, loadDraft, refreshMatter]);
-
-  useEffect(() => {
-    if (!draft || !content) return;
-    const timer = window.setInterval(() => setRevealedSections((current) => {
-      if (current >= content.sections.length) { window.clearInterval(timer); return current; }
-      return current + 1;
-    }), 140);
-    return () => window.clearInterval(timer);
-  }, [draft?.id, draft?.version, content?.sections.length]);
-
-  useEffect(() => {
-    const clear = () => setSelection(null);
-    window.addEventListener("keydown", clear);
-    return () => window.removeEventListener("keydown", clear);
-  }, []);
 
   const citationEntries = useMemo(() => {
     if (!content) return [];
@@ -793,45 +691,6 @@ export function App() {
     finally { setAddingEvidence(false); }
   };
 
-  const updateBlock = (blockId: string, text: string) => {
-    const existingText = content?.sections.flatMap((section) => section.blocks).find((block) => block.id === blockId)?.text;
-    if (existingText === text) return;
-    setContent((current) => current ? ({
-      ...current,
-      sections: current.sections.map((section) => ({
-        ...section, blocks: section.blocks.map((block) => block.id === blockId ? { ...block, text } : block),
-      })),
-    }) : current);
-  };
-
-  const saveBlock = async (blockId: string, text: string) => {
-    if (!draft || !content) return;
-    const savedText = draft.content.sections.flatMap((section) => section.blocks).find((block) => block.id === blockId)?.text;
-    if (savedText === text) return;
-    const nextContent: GeneratedDraft = {
-      ...content,
-      sections: content.sections.map((section) => ({
-        ...section, blocks: section.blocks.map((block) => block.id === blockId ? { ...block, text } : block),
-      })),
-    };
-    try {
-      const saved = await api<DraftResponse>(`/api/drafts/${draft.id}`, {
-        method: "PUT", body: JSON.stringify({ version: draft.version, content: nextContent }),
-      });
-      setUndoVersion(draft.version); setDraft(saved); setContent(saved.content); setNotice(`Draft v${saved.version} saved`);
-      await loadVersions(draft.id);
-      if (matter) await loadActivity(matter.id);
-    } catch (caught) { setNotice(caught instanceof Error ? caught.message : "Direct edit could not be saved"); }
-  };
-
-  const addAnnotation = () => {
-    if (!selection) return;
-    setAnnotations((current) => [...current.filter((item) => !(item.blockId === selection.blockId && item.start === selection.start)), {
-      blockId: selection.blockId, quote: selection.quote, start: selection.start, end: selection.end,
-    }].slice(-5));
-    setSelection(null); setTab("refine");
-  };
-
   const sendRefinement = async () => {
     if (!draft || !content || !instruction.trim() || proposal) return;
     const context = annotations.length ? annotations : activeBlock ? [{ blockId: activeBlock.id, quote: activeBlock.text, start: 0, end: activeBlock.text.length }] : [];
@@ -843,9 +702,8 @@ export function App() {
       const result = await streamEvent<ProposalResponse>(`/api/drafts/${draft.id}/refinements`, "proposal", {
         method: "POST", body: JSON.stringify({ instruction: requestText, annotations: context }),
       });
-      setRevealedSections(content.sections.length);
       setProposal(result); setAnnotations([]);
-      setMessages((current) => [...current, { role: "assistant", text: `I prepared ${result.proposal.edits.length === 1 ? "a tracked revision" : `${result.proposal.edits.length} tracked revisions`}. Review the changes in the letter, then accept or reject them together.` }]);
+      setMessages((current) => [...current, { role: "assistant", text: `I prepared ${result.proposal.edits.length === 1 ? "a tracked revision" : `${result.proposal.edits.length} tracked revisions`}. Review the before-and-after text below, then accept or reject it.` }]);
     } catch (caught) { setNotice(caught instanceof Error ? caught.message : "Refinement failed"); }
     finally { setThinking(false); }
   };
@@ -893,6 +751,28 @@ export function App() {
     finally { setConfirmingOutcomeId(null); }
   };
 
+  const supplyOutcome = async (outcomeId: string) => {
+    if (!draft || !matter) return;
+    const outcome = draft.content.outcomes.find((candidate) => candidate.id === outcomeId);
+    if (!outcome) { setNotice("The omitted target is no longer in this draft version."); return; }
+    setConfirmingOutcomeId(outcomeId); setNotice(null);
+    try {
+      const saved = await api<DraftResponse>(`/api/drafts/${draft.id}/outcomes/${encodeURIComponent(outcomeId)}/supply`, {
+        method: "POST", body: JSON.stringify({
+          version: draft.version,
+          values: outcome.targetKind === "structured"
+            ? (outcomeValues[outcomeId] ?? "").split(/\n+/)
+            : [outcomeValues[outcomeId] ?? ""],
+        }),
+      });
+      setUndoVersion(draft.version); setDraft(saved); setContent(saved.content); setOutcomeValues((current) => ({ ...current, [outcomeId]: "" })); setTab("review");
+      setNotice(`Reviewed value saved in draft v${saved.version}.`);
+      await loadVersions(saved.id);
+      await Promise.all([refreshMatter(matter.id), loadActivity(matter.id)]);
+    } catch (caught) { setNotice(caught instanceof Error ? caught.message : "The reviewed value could not be saved"); }
+    finally { setConfirmingOutcomeId(null); }
+  };
+
   const restoreVersion = async (restoreVersionNumber: number) => {
     if (!draft) return;
     try {
@@ -905,6 +785,34 @@ export function App() {
       await loadVersions(saved.id);
       if (matter) await loadActivity(matter.id);
     } catch (caught) { setNotice(caught instanceof Error ? caught.message : "Draft version could not be restored"); }
+  };
+
+  const refreshAfterWordSave = async () => {
+    if (!draft || !matter) return;
+    const baseVersion = draft.version;
+    setNotice("Saving Word edits…");
+    try {
+      await api(`/api/drafts/${draft.id}/versions/${baseVersion}/force-save`, { method: "POST", body: "{}" });
+    } catch (caught) {
+      setNotice(caught instanceof Error ? caught.message : "The Word editor could not start its save callback.");
+      return;
+    }
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      await new Promise((resolve) => window.setTimeout(resolve, 1_000));
+      try {
+        const loaded = await api<DraftResponse>(`/api/drafts/${draft.id}`);
+        if (loaded.version <= baseVersion) continue;
+        setUndoVersion(baseVersion);
+        setDraft(loaded); setContent(loaded.content);
+        setFieldValues(Object.fromEntries(Object.entries(loaded.content.fields).map(([key, field]) => [key, field.value ?? ""])));
+        setNotice(`Word edits saved in draft v${loaded.version}.`);
+        await Promise.all([loadVersions(loaded.id), loadActivity(matter.id), refreshMatter(matter.id)]);
+        return;
+      } catch {
+        // The save callback may still be processing; keep polling briefly.
+      }
+    }
+    setNotice("The Word save callback did not complete. Retry the editor; the prior version remains unchanged.");
   };
 
   const renameMatter = async () => {
@@ -920,19 +828,11 @@ export function App() {
     setTab("review");
     setActiveReviewItemId(outcomeId ?? targetId);
     const block = content?.sections.flatMap((section) => section.blocks).find((candidate) => candidate.targetId === targetId);
-    if (block) {
-      setActiveBlockId(block.id);
-      window.setTimeout(() => document.querySelector(`[data-draft-block="${CSS.escape(block.id)}"]`)?.scrollIntoView({ behavior: "smooth", block: "center" }), 0);
-      return;
-    }
-    if (outcomeId) window.setTimeout(() => document.querySelector(`[data-outcome-marker="${CSS.escape(outcomeId)}"]`)?.scrollIntoView({ behavior: "smooth", block: "center" }), 0);
+    if (block) setActiveBlockId(block.id);
   };
 
   if (!matter) return <Setup onReady={openMatter} />;
 
-  const proposedByBlock = new Map<string, RefinementEdit[]>();
-  proposal?.proposal.edits.forEach((edit) => proposedByBlock.set(edit.blockId, [...(proposedByBlock.get(edit.blockId) ?? []), edit]));
-  const visibleSections = content?.sections.slice(0, revealedSections) ?? [];
   const readiness = draft?.readiness ?? null;
   const exportBlocked = !readiness?.ready;
   const jobActive = job?.status === "queued" || job?.status === "processing";
@@ -978,9 +878,27 @@ export function App() {
           <p>{outcome.note || "Generation found no support for this mapped target, so no template matter content was copied into the draft."}</p>
           {outcome.citations.map((citation, index) => <button className="source-link" key={`${citation.sourceId}-${citation.page}-${index}`} onClick={(event) => { event.stopPropagation(); void showReviewCitation(citation); }}>{citation.sourceName} · p. {citation.page}</button>)}
           <div className="review-card-meta"><span>{outcome.exemplarCount} template {outcome.exemplarCount === 1 ? "block" : "blocks"}</span><span>0 generated</span></div>
+          {outcome.targetKind !== "figure" && <label className="review-field-input">
+            {outcome.targetKind === "structured"
+              ? <textarea
+                  rows={Math.min(4, Math.max(2, target?.exemplarCount ?? 2))}
+                  value={outcomeValues[outcome.id] ?? ""}
+                  placeholder="One row per line; use | between columns"
+                  onClick={(event) => event.stopPropagation()}
+                  onChange={(event) => setOutcomeValues((current) => ({ ...current, [outcome.id]: event.target.value }))}
+                />
+              : <input
+                  value={outcomeValues[outcome.id] ?? ""}
+                  placeholder="Enter the reviewed value"
+                  onClick={(event) => event.stopPropagation()}
+                  onChange={(event) => setOutcomeValues((current) => ({ ...current, [outcome.id]: event.target.value }))}
+                />}
+            <small>{outcome.targetKind === "structured" ? "Use one line per row and | between columns." : "This records an attorney-supplied value without claiming source grounding."}</small>
+          </label>}
           <div className="review-card-actions">
             <label className="secondary file-action"><input type="file" accept=".pdf,image/*" multiple onChange={(event) => { event.stopPropagation(); if (event.target.files) void addEvidence([...event.target.files]); event.currentTarget.value = ""; }} /><Upload size={13} /> Add evidence and regenerate</label>
-            <button className="primary" disabled={confirmingOutcomeId === outcome.id} onClick={(event) => { event.stopPropagation(); void confirmOutcome(outcome.id); }}>{confirmingOutcomeId === outcome.id ? <LoaderCircle className="spin" size={13} /> : <Check size={13} />} Confirm omission</button>
+            {outcome.targetKind !== "figure" && <button className="primary" disabled={confirmingOutcomeId === outcome.id || !(outcomeValues[outcome.id] ?? "").trim()} onClick={(event) => { event.stopPropagation(); void supplyOutcome(outcome.id); }}>{confirmingOutcomeId === outcome.id ? <LoaderCircle className="spin" size={13} /> : <Check size={13} />} Save value</button>}
+            <button className="secondary" disabled={confirmingOutcomeId === outcome.id} onClick={(event) => { event.stopPropagation(); void confirmOutcome(outcome.id); }}>Leave blank</button>
           </div>
         </article>;
       })}
@@ -1030,49 +948,22 @@ export function App() {
             {generationActive && <div className="job-banner"><LoaderCircle className="spin" size={16} /><span>{job?.step ?? "Regenerating draft"} · {job?.progress ?? 0}%</span></div>}
             {readiness && !readiness.ready && <div className="confidence-banner"><CircleAlert size={17} /><span>Word export is locked by {blockingCount} review {blockingCount === 1 ? "item" : "items"}: {blockerDescriptions.join("; ")}.</span></div>}
             {notice && <div className="workspace-notice">{notice}{undoVersion !== null && draft && <button className="notice-undo" onClick={() => { const target = undoVersion; setUndoVersion(null); void restoreVersion(target); }}><RotateCcw size={13} /> Undo</button>}<button onClick={() => { setNotice(null); setUndoVersion(null); }}><X size={13} /></button></div>}
-            <article className="letter-paper">
-              <div className="letterhead"><strong>{content.title}</strong><span>Attorney-review draft · generated from the confirmed template map</span></div>
-              {content.outcomes.filter((outcome) => outcome.status !== "generated").map((outcome) => <button
-                className={`document-outcome-marker ${confirmedOmissions.has(outcome.targetId) ? "resolved" : "blocking"} ${activeReviewItemId === outcome.id ? "selected" : ""}`}
-                data-outcome-marker={outcome.id}
-                key={outcome.id}
-                onClick={() => { focusReviewTarget(outcome.targetId, outcome.id); window.setTimeout(() => document.querySelector(`[data-review-item="${CSS.escape(outcome.id)}"]`)?.scrollIntoView({ behavior: "smooth", block: "center" }), 0); }}
-              ><span>{confirmedOmissions.has(outcome.targetId) ? <Check size={12} /> : <CircleAlert size={12} />}</span>{targetById.get(outcome.targetId)?.label || "Template content"} omitted</button>)}
-              {visibleSections.map((section) => <section className="draft-section fade-up" key={section.id}>
-                {section.heading && <h2>{section.heading}</h2>}
-                {section.blocks.map((block) => {
-                  const numbers = block.citations.map((_citation, index) => citationEntries.find((entry) => entry.blockId === block.id && entry.citationIndex === index)?.number ?? 0);
-                  return <BlockEditor
-                    key={block.id}
-                    block={block}
-                    active={activeBlockId === block.id}
-                    citationNumbers={numbers}
-                    edits={proposedByBlock.get(block.id) ?? []}
-                    disabled={generationActive}
-                    onFocus={() => {
-                      setActiveBlockId(block.id);
-                    }}
-                    onChange={(text) => updateBlock(block.id, text)}
-                    onBlur={(text) => void saveBlock(block.id, text)}
-                    onCitation={(index) => void showCitation(block.id, index)}
-                    onSelect={setSelection}
-                  />;
-                })}
-              </section>)}
-              {revealedSections < content.sections.length && <div className="section-drafting"><LoaderCircle className="spin" size={14} /> Revealing validated section…</div>}
-              {revealedSections >= content.sections.length && citationEntries.length > 0 && <section className="cited-sources">
-                <h2>Sources cited in this draft</h2>
-                <div>{citationEntries.map((citation) => <button key={`${citation.blockId}-${citation.citationIndex}`} onClick={() => void showCitation(citation.blockId, citation.citationIndex)}><sup>{citation.number}</sup><span>{citation.sourceName} · p. {citation.page ?? "—"}</span></button>)}</div>
-              </section>}
-            </article>
+            {draft && <OnlyOfficeEditor
+              draftId={draft.id}
+              version={draft.version}
+              disabled={generationActive}
+              onSaved={refreshAfterWordSave}
+            />}
           </div>}
         </main>
 
         <RefinePanel
           tab={tab} setTab={setTab} messages={messages} activity={activity} annotations={annotations}
           instruction={instruction} proposal={proposal} thinking={thinking} activeBlock={activeBlock}
+          availableBlocks={content?.sections.flatMap((section) => section.blocks).filter((block) => block.kind !== "heading" && block.text.trim()) ?? []}
           reviewContent={reviewContent} versions={versions}
           onInstruction={setInstruction}
+          onActiveBlock={setActiveBlockId}
           onRemoveAnnotation={(index) => setAnnotations((current) => current.filter((_annotation, candidate) => candidate !== index))}
           onSend={() => void sendRefinement()}
           onResolve={(resolution) => void resolveProposal(resolution)}
@@ -1109,7 +1000,6 @@ export function App() {
           </aside>
         </>}
       </div>
-      {selection && <button className="add-to-chat" style={{ left: selection.x, top: selection.y }} onMouseDown={(event) => event.preventDefault()} onClick={addAnnotation}>Add to chat ↗</button>}
     </div>
   );
 }

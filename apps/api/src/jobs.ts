@@ -240,7 +240,7 @@ export function ensureEditableCoverage(draft: GeneratedDraft, template: ReturnTy
     if (!target || emittedTargets.has(target.id)) return [];
     emittedTargets.add(target.id);
     const outcome = outcomeByTarget.get(target.id)!;
-    if (outcome.status !== "generated") return [];
+    if (outcome.status !== "generated" && outcome.status !== "attorney-supplied") return [];
     return blocksByTarget.get(target.id) ?? [];
   });
   return GeneratedDraftSchema.parse({

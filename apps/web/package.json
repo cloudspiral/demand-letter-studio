@@ -12,8 +12,6 @@
   },
   "dependencies": {
     "@steno/contracts": "workspace:*",
-    "@tiptap/react": "^3.4.1",
-    "@tiptap/starter-kit": "^3.4.1",
     "lucide-react": "^0.542.0",
     "react": "^19.1.1",
     "react-dom": "^19.1.1"

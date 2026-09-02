@@ -38,13 +38,14 @@ describe("contracts", () => {
     expect(RefinementAnnotationSchema.safeParse({ blockId: "one", quote: "exact", start: 2, end: 2 }).success).toBe(false);
   });
 
-  it("uses only generated and omitted target outcomes with conditional notes and citations", () => {
+  it("uses generated, omitted, and attorney-supplied target outcomes with conditional notes and citations", () => {
     const base = {
       id: "outcome:target-1", targetId: "target-1", targetKind: "narrative" as const,
       sourceId: null, page: null, sourceName: null, mediaType: null, caption: null, exemplarCount: 2, generatedCount: 1,
     };
     expect(GenerationOutcomeSchema.parse({ ...base, status: "generated", citations: [citation], note: null })).toMatchObject({ status: "generated" });
     expect(GenerationOutcomeSchema.parse({ ...base, status: "omitted", citations: [], note: "The packet contains no support." })).toMatchObject({ status: "omitted" });
+    expect(GenerationOutcomeSchema.parse({ ...base, status: "attorney-supplied", citations: [], note: null })).toMatchObject({ status: "attorney-supplied" });
     expect(GenerationOutcomeSchema.safeParse({ ...base, status: "omitted", citations: [], note: null }).success).toBe(false);
     expect(GenerationOutcomeSchema.safeParse({ ...base, status: "omitted_no_evidence", citations: [], note: "Missing" }).success).toBe(false);
   });

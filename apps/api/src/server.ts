@@ -18,12 +18,21 @@ import {
 import { createAiProvider, type EvidencePage } from "./ai";
 import { config } from "./config";
 import { ACTOR_ID, migrate, persistCitations, pool, sourceFingerprintForMatter, WORKSPACE_ID } from "./db";
-import { analyzeTemplate, exportDocx, extractSource } from "./document-worker";
+import { analyzeTemplate, extractSource } from "./document-worker";
 import { draftExportIssues, isDraftExportReady } from "./draft-export";
-import { confirmDraftField, exportableFieldReplacements } from "./draft-fields";
+import { confirmDraftField } from "./draft-fields";
+import { ingestEditedDraftDocument, materializeDraftDocument } from "./draft-document";
 import { appendJobEvent, ensureEditableCoverage, processGenerationJob, recordAiRun, resumeQueuedJobs } from "./jobs";
 import { normalizeDraftContent } from "./draft-compat";
-import { confirmOmission } from "./draft-omissions";
+import { confirmOmission, supplyOmission } from "./draft-omissions";
+import {
+  allowedOnlyOfficeDownload,
+  onlyOfficeEditorConfig,
+  onlyOfficeEnabled,
+  requestOnlyOfficeForceSave,
+  requireScopedAccess,
+  verifyOnlyOfficeToken,
+} from "./onlyoffice";
 import { applyDirectDraftEdits, applyRefinementProposal, validateProposalTargets } from "./refinement";
 import { pathForKey, putFile } from "./storage";
 import {
@@ -68,6 +77,15 @@ const ConfirmFieldSchema = z.object({
   }),
 });
 const ConfirmOutcomeSchema = z.object({ version: z.number().int().positive() });
+const SupplyOutcomeSchema = z.object({
+  version: z.number().int().positive(),
+  values: z.array(z.string().trim().max(20_000)).min(1).max(100),
+});
+const OnlyOfficeCallbackSchema = z.object({
+  status: z.number().int(),
+  url: z.string().url().optional(),
+  token: z.string().optional(),
+}).passthrough();
 const RestoreDraftSchema = z.object({
   currentVersion: z.number().int().positive(),
   restoreVersion: z.number().int().positive(),
@@ -1296,6 +1314,71 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
     }
   });
 
+  app.post("/api/drafts/:id/outcomes/:outcomeId/supply", async (request, reply) => {
+    const params = z.object({ id: z.string().uuid(), outcomeId: z.string().min(1).max(500) }).parse(request.params);
+    const body = SupplyOutcomeSchema.parse(request.body);
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await client.query<{
+        matter_id: string; current_version: number; content: unknown; source_fingerprint: string | null;
+        template_analysis: unknown; template_map: unknown;
+      }>(`
+        SELECT d.matter_id, d.current_version, dv.content, dv.source_fingerprint,
+               t.analysis AS template_analysis, tmv.map AS template_map
+        FROM drafts d
+        JOIN draft_versions dv ON dv.draft_id = d.id AND dv.version = d.current_version
+        JOIN matters m ON m.id = d.matter_id
+        JOIN templates t ON t.id = m.template_id
+        JOIN template_map_versions tmv ON tmv.template_id = t.id AND tmv.map_version = dv.template_map_version
+        WHERE d.id = $1
+        FOR UPDATE OF d
+      `, [params.id]);
+      if (!result.rowCount) {
+        await client.query("ROLLBACK");
+        return reply.status(404).send({ error: "Draft not found." });
+      }
+      const row = requiredRow(result.rows, "Draft outcome lock failed.");
+      if (row.current_version !== body.version) {
+        await client.query("ROLLBACK");
+        return reply.status(409).send({ error: "Draft changed in another session.", currentVersion: row.current_version });
+      }
+      const content = normalizeDraftContent(row.content);
+      const outcome = content.outcomes.find((candidate) => candidate.id === params.outcomeId);
+      if (!outcome) {
+        await client.query("ROLLBACK");
+        return reply.status(404).send({ error: "Draft outcome not found." });
+      }
+      const template = analysisWithConfirmedMap(TemplateAnalysisSchema.parse(row.template_analysis), TemplateMapSchema.parse(row.template_map));
+      const updated = ensureEditableCoverage(supplyOmission(content, outcome.targetId, body.values, template), template);
+      const nextVersion = body.version + 1;
+      await client.query(
+        `INSERT INTO draft_versions (draft_id, version, content, actor_id, source_fingerprint, template_map_version, change_summary)
+         SELECT $1, $2, $3, $4, $5, template_map_version, $7
+         FROM draft_versions WHERE draft_id = $1 AND version = $6`,
+        [params.id, nextVersion, JSON.stringify(updated), ACTOR_ID, row.source_fingerprint, body.version, "Supplied omitted template content"],
+      );
+      await persistCitations(client, params.id, nextVersion, updated);
+      await client.query("UPDATE drafts SET current_version = $2, updated_at = now() WHERE id = $1", [params.id, nextVersion]);
+      await client.query(`
+        INSERT INTO activity_events (workspace_id, matter_id, actor_id, event_type, summary, metadata)
+        VALUES ($1, $2, $3, 'omission.supplied', 'Supplied an omitted target manually', $4)
+      `, [WORKSPACE_ID, row.matter_id, ACTOR_ID, JSON.stringify({
+        draftId: params.id,
+        outcomeId: params.outcomeId,
+        targetId: outcome.targetId,
+        version: nextVersion,
+      })]);
+      await client.query("COMMIT");
+      return await loadDraft(params.id);
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  });
+
   app.post("/api/proposals/:id/reject", async (request, reply) => {
     const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
     const result = await pool.query(`
@@ -1313,122 +1396,116 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
     return rejected;
   });
 
-  app.get("/api/drafts/:id/export.docx", async (request, reply) => {
+  app.get("/api/drafts/:id/editor-config", async (request, reply) => {
     const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
-    const result = await pool.query<{
-      matter_id: string; matter_name: string; storage_key: string; template_analysis: unknown;
-      content: unknown; current_version: number; source_fingerprint: string | null; template_map: unknown;
-    }>(`
-      SELECT m.id AS matter_id, m.name AS matter_name, t.storage_key,
-             t.analysis AS template_analysis, tmv.map AS template_map,
-             dv.content, dv.source_fingerprint, d.current_version
-      FROM drafts d
-      JOIN matters m ON m.id = d.matter_id
-      JOIN templates t ON t.id = m.template_id
-      JOIN draft_versions dv ON dv.draft_id = d.id AND dv.version = d.current_version
-      JOIN template_map_versions tmv ON tmv.template_id = t.id AND tmv.map_version = dv.template_map_version
-      WHERE d.id = $1
-    `, [id]);
-    if (!result.rowCount) return reply.status(404).send({ error: "Draft not found." });
-    const row = requiredRow(result.rows, "Draft export context was not found.");
-    const legacyResolutions = await pool.query<{ target_id: string }>(`
-      SELECT target_id FROM matter_review_resolutions
-      WHERE matter_id = $1 AND source_fingerprint = $2
-    `, [row.matter_id, row.source_fingerprint]);
-    const content = normalizeDraftContent(row.content, legacyResolutions.rows.map((resolution) => resolution.target_id));
-    const templateMap = TemplateMapSchema.parse(row.template_map);
-    const template = TemplateAnalysisSchema.parse({
-      ...TemplateAnalysisSchema.parse(row.template_analysis),
-      blocks: templateMap.blocks,
-      regions: templateMap.blocks.filter((block) => (block.anchor?.partName ?? "word/document.xml") === "word/document.xml"),
-    });
-    const imageSources = await pool.query<{ id: string; storage_key: string; mime_type: string }>(`
-      SELECT id, storage_key, mime_type FROM source_documents
-      WHERE matter_id = $1 AND status = 'ready' AND mime_type LIKE 'image/%'
-      ORDER BY created_at
-    `, [row.matter_id]);
-    const currentSourceFingerprint = await sourceFingerprintForMatter(row.matter_id);
-    const exportIssues = draftExportIssues(content, {
-      draftSourceFingerprint: row.source_fingerprint,
-      currentSourceFingerprint,
-    });
-    if (!isDraftExportReady(exportIssues)) {
-      return reply.status(409).send({
-        error: "Draft is not ready for Word export.",
-        detail: `Resolve ${exportIssues.omittedTargetIds.length} omitted targets, ${exportIssues.fieldKeys.length} template fields, ${exportIssues.duplicateParagraphIndexes.length} duplicate template mappings${exportIssues.imageIssue ? ", the image mapping" : ""}${exportIssues.staleEvidence ? ", and regenerate from the current evidence" : ""} before export.`,
-        issues: exportIssues,
+    if (!onlyOfficeEnabled()) {
+      return reply.status(503).send({
+        error: "The Word editor is unavailable.",
+        detail: "Start the local ONLYOFFICE service and configure its public, internal, callback, and JWT settings.",
       });
     }
-    const outputName = `${safeDownloadName(row.matter_name)}-v${row.current_version}-${randomUUID()}.docx`;
-    const outputPath = path.join(config.storageDir, "exports", outputName);
-    const mappedBlocks = new Map(templateMap.blocks.map((block) => [
-      block.id ?? `${block.anchor?.partName ?? "word/document.xml"}:p:${block.paragraphIndex}`,
-      block,
-    ]));
-    const targets = deriveGenerationTargets(template);
-    const outcomeByTarget = new Map(content.outcomes.map((outcome) => [outcome.targetId, outcome]));
-    const blocksByTarget = new Map<string, typeof content.sections[number]["blocks"]>();
-    for (const block of content.sections.flatMap((section) => section.blocks)) {
-      if (!block.targetId) continue;
-      blocksByTarget.set(block.targetId, [...(blocksByTarget.get(block.targetId) ?? []), block]);
+    const artifact = await materializeDraftDocument(id);
+    if (!artifact) return reply.status(404).send({ error: "Draft not found." });
+    reply.header("Cache-Control", "no-store");
+    return onlyOfficeEditorConfig({
+      draftId: id,
+      version: artifact.version,
+      sha256: artifact.sha256,
+      title: safeDownloadName(artifact.matterName),
+    });
+  });
+
+  app.get("/api/drafts/:id/versions/:version/document.docx", async (request, reply) => {
+    const { id, version } = z.object({ id: z.string().uuid(), version: z.coerce.number().int().positive() }).parse(request.params);
+    const { access } = z.object({ access: z.string().min(1) }).parse(request.query);
+    try {
+      requireScopedAccess(access, "document", id, version);
+    } catch (error) {
+      return reply.status(401).send({ error: error instanceof Error ? error.message : "Invalid editor access token." });
     }
-    const sourcePathById = new Map(imageSources.rows.map((source) => [source.id, pathForKey(source.storage_key)]));
-    const targetOperations = targets.map((target) => {
-      const outcome = outcomeByTarget.get(target.id);
-      if (!outcome) throw new Error(`Draft is missing generation outcome ${target.id}.`);
-      const targetBlocks = [...(blocksByTarget.get(target.id) ?? [])].sort((left, right) => (left.sequence ?? 0) - (right.sequence ?? 0));
-      return {
-        targetId: target.id,
-        kind: target.kind,
-        status: outcome.status,
-        anchors: target.blockIds.map((blockId) => {
-          const mapped = mappedBlocks.get(blockId);
-          if (!mapped) throw new Error(`Template map is missing target block ${blockId}.`);
-          return {
-            blockId,
-            partName: mapped.anchor?.partName ?? "word/document.xml",
-            paragraphIndex: mapped.paragraphIndex,
-            structuredGroup: mapped.structuredGroup,
-            figure: mapped.figure,
-          };
-        }),
-        ...(target.kind === "narrative" ? { paragraphs: targetBlocks.map((block) => block.text) } : {}),
-        ...(target.kind === "structured" ? { rows: targetBlocks.map((block) => ({
-          role: block.structuredRowRole ?? "body" as const,
-          cells: block.structuredCells ?? [block.text],
-        })) } : {}),
-        ...(target.kind === "figure" ? {
-          caption: targetBlocks[0]?.text ?? outcome.caption,
-          sourcePath: outcome.sourceId ? sourcePathById.get(outcome.sourceId) ?? null : null,
-        } : {}),
-      };
-    });
-    const fieldReplacements = exportableFieldReplacements(content.fields);
-    const patches = content.sections.flatMap((section) => section.blocks).flatMap((block) => {
-      if (block.targetId || !block.attorneyEdited || !block.templateBlockId) return [];
-      const mapped = mappedBlocks.get(block.templateBlockId);
-      if (!mapped) throw new Error(`Template map is missing edited block ${block.templateBlockId}.`);
-      return [{
-        partName: mapped.anchor?.partName ?? "word/document.xml",
-        paragraphIndex: mapped.paragraphIndex,
-        text: block.text,
-      }];
-    });
-    await exportDocx({
-      templatePath: pathForKey(row.storage_key),
-      outputPath,
-      patches,
-      fieldReplacements,
-      targetOperations,
-    });
+    const artifact = await materializeDraftDocument(id, version);
+    if (!artifact) return reply.status(404).send({ error: "Draft version not found." });
+    const buffer = await fs.readFile(artifact.path);
+    return reply
+      .header("Cache-Control", "no-store")
+      .header("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+      .header("Content-Disposition", `inline; filename="${safeDownloadName(artifact.matterName)}-v${version}.docx"`)
+      .send(buffer);
+  });
+
+  app.post("/api/drafts/:id/versions/:version/force-save", async (request, reply) => {
+    const { id, version } = z.object({ id: z.string().uuid(), version: z.coerce.number().int().positive() }).parse(request.params);
+    if (!onlyOfficeEnabled()) return reply.status(503).send({ error: "The Word editor is unavailable." });
+    const artifact = await materializeDraftDocument(id, version);
+    if (!artifact) return reply.status(404).send({ error: "Draft version not found." });
+    if (!artifact.current) return reply.status(409).send({ error: "A newer draft version already exists. Reload the Word editor." });
+    await requestOnlyOfficeForceSave({ draftId: id, version, sha256: artifact.sha256 });
+    return reply.status(202).send({ accepted: true, version });
+  });
+
+  app.post("/api/drafts/:id/versions/:version/onlyoffice-callback", async (request, reply) => {
+    const { id, version } = z.object({ id: z.string().uuid(), version: z.coerce.number().int().positive() }).parse(request.params);
+    const { access } = z.object({ access: z.string().min(1) }).parse(request.query);
+    try {
+      requireScopedAccess(access, "callback", id, version);
+    } catch (error) {
+      return reply.status(401).send({ error: error instanceof Error ? error.message : "Invalid editor callback token." });
+    }
+    const callback = OnlyOfficeCallbackSchema.parse(request.body);
+    request.log.info({ draftId: id, version, status: callback.status }, "ONLYOFFICE callback received");
+    const authorization = request.headers.authorization;
+    const callbackToken = callback.token ?? (authorization?.startsWith("Bearer ") ? authorization.slice(7) : undefined);
+    if (callbackToken) {
+      try {
+        verifyOnlyOfficeToken(callbackToken);
+      } catch (error) {
+        return reply.status(401).send({ error: error instanceof Error ? error.message : "Invalid document-server signature." });
+      }
+    }
+    if (![2, 6].includes(callback.status)) return { error: 0 };
+    if (!callback.url || !allowedOnlyOfficeDownload(callback.url)) {
+      return reply.status(400).send({ error: "The document-server save URL was missing or not trusted." });
+    }
+
+    const response = await fetch(callback.url, { redirect: "error" });
+    if (!response.ok) throw new Error(`ONLYOFFICE returned ${response.status} while Steno downloaded the saved document.`);
+    const declaredSize = Number(response.headers.get("content-length") ?? 0);
+    if (declaredSize > 30 * 1024 * 1024) return reply.status(413).send({ error: "The saved Word document exceeds 30 MB." });
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (buffer.byteLength > 30 * 1024 * 1024) return reply.status(413).send({ error: "The saved Word document exceeds 30 MB." });
+    const tempDirectory = path.join(config.storageDir, "tmp");
+    const tempPath = path.join(tempDirectory, `onlyoffice-${id}-${version}-${randomUUID()}.docx`);
+    await fs.mkdir(tempDirectory, { recursive: true });
+    await fs.writeFile(tempPath, buffer);
+    try {
+      const saved = await ingestEditedDraftDocument(id, version, tempPath);
+      return { error: 0, saved: saved.saved, version: saved.version };
+    } finally {
+      await fs.unlink(tempPath).catch(() => undefined);
+    }
+  });
+
+  app.get("/api/drafts/:id/export.docx", async (request, reply) => {
+    const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+    const artifact = await materializeDraftDocument(id);
+    if (!artifact) return reply.status(404).send({ error: "Draft not found." });
+    if (!isDraftExportReady(artifact.readiness)) {
+      const issues = artifact.readiness;
+      return reply.status(409).send({
+        error: "Draft is not ready for Word export.",
+        detail: `Resolve ${issues.omittedTargetIds.length} omitted targets, ${issues.fieldKeys.length} template fields, ${issues.duplicateParagraphIndexes.length} duplicate template mappings${issues.imageIssue ? ", the image mapping" : ""}${issues.staleEvidence ? ", and regenerate from the current evidence" : ""} before export.`,
+        issues,
+      });
+    }
     await pool.query(`
       INSERT INTO activity_events (workspace_id, matter_id, actor_id, event_type, summary, metadata)
-      SELECT $1, matter_id, $2, 'draft.exported', 'Exported a versioned Word document', $3 FROM drafts WHERE id = $4
-    `, [WORKSPACE_ID, ACTOR_ID, JSON.stringify({ draftId: id, version: row.current_version }), id]);
-    const buffer = await fs.readFile(outputPath);
+      SELECT $1, matter_id, $2, 'draft.exported', 'Exported the exact reviewed Word document', $3 FROM drafts WHERE id = $4
+    `, [WORKSPACE_ID, ACTOR_ID, JSON.stringify({ draftId: id, version: artifact.version, sha256: artifact.sha256 }), id]);
+    const materialized = await fs.readFile(artifact.path);
     return reply.header("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-      .header("Content-Disposition", `attachment; filename="${safeDownloadName(row.matter_name)}-v${row.current_version}.docx"`)
-      .send(buffer);
+      .header("Content-Disposition", `attachment; filename="${safeDownloadName(artifact.matterName)}-v${artifact.version}.docx"`)
+      .send(materialized);
+
   });
 
   app.get("/api/matters/:id/activity", async (request) => {

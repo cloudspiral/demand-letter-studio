@@ -14,7 +14,10 @@
     "verify": "pnpm typecheck && pnpm test && pnpm build",
     "db:up": "docker compose up -d postgres",
     "db:down": "docker compose down",
-    "db:logs": "docker compose logs -f postgres"
+    "db:logs": "docker compose logs -f postgres",
+    "onlyoffice:up": "bash scripts/onlyoffice-up.sh",
+    "onlyoffice:logs": "bash scripts/with-onlyoffice-env.sh docker compose --profile onlyoffice logs -f onlyoffice",
+    "dev:onlyoffice": "bash scripts/with-onlyoffice-env.sh pnpm dev"
   },
   "devDependencies": {
     "concurrently": "^9.2.1",

@@ -15,5 +15,30 @@ services:
       timeout: 3s
       retries: 20
 
+  onlyoffice:
+    profiles: ["onlyoffice"]
+    image: onlyoffice/documentserver:latest-arm64
+    environment:
+      JWT_ENABLED: "true"
+      JWT_SECRET: ${ONLYOFFICE_JWT_SECRET:?Run pnpm onlyoffice:up to create the local runtime environment}
+      JWT_IN_BODY: "true"
+      ALLOW_PRIVATE_IP_ADDRESS: "true"
+    ports:
+      - "127.0.0.1:8088:80"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    shm_size: 512mb
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 90s
+    volumes:
+      - steno-onlyoffice-data:/var/www/onlyoffice/Data
+      - steno-onlyoffice-lib:/var/lib/onlyoffice
+
 volumes:
   steno-postgres:
+  steno-onlyoffice-data:
+  steno-onlyoffice-lib:

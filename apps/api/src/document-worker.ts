@@ -59,6 +59,17 @@ export const ExportResultSchema = z.object({
   imagePatchCount: z.number().int().nonnegative().default(0),
 });
 
+export const ExtractedControlsSchema = z.object({
+  path: z.string(),
+  size: z.number().int().positive(),
+  sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  controls: z.array(z.object({
+    tag: z.string().min(1),
+    text: z.string(),
+    partName: z.string().min(1),
+  })),
+});
+
 export async function analyzeTemplate(path: string) {
   return runDocumentOperation({ operation: "analyze-template", path }, TemplateAnalysisSchema.passthrough());
 }
@@ -77,6 +88,8 @@ export async function exportDocx(payload: {
     targetId: string;
     kind: "narrative" | "structured" | "figure";
     status: "generated" | "omitted";
+    preserveEmptyAnchors?: boolean;
+    controlTags?: string[];
     anchors: Array<{
       blockId: string;
       partName: string;
@@ -98,6 +111,12 @@ export async function exportDocx(payload: {
     caption?: string | null;
     sourcePath?: string | null;
   }>;
+  editableControls?: Array<{ tag: string; partName: string; paragraphIndex: number }>;
+  formsProtection?: boolean;
 }) {
   return runDocumentOperation({ operation: "export-docx", ...payload }, ExportResultSchema);
+}
+
+export async function extractDocxControls(path: string) {
+  return runDocumentOperation({ operation: "extract-controls", path }, ExtractedControlsSchema);
 }
