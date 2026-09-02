@@ -45,6 +45,7 @@ export const ExportResultSchema = z.object({
   size: z.number().int().positive(),
   sha256: z.string(),
   patchCount: z.number().int().nonnegative(),
+  imagePatchCount: z.number().int().nonnegative().default(0),
 });
 
 export async function analyzeTemplate(path: string) {
@@ -60,6 +61,7 @@ export async function exportDocx(payload: {
   outputPath: string;
   patches: Array<{ paragraphIndex: number; text: string }>;
   fieldReplacements: Record<string, string>;
+  imageReplacements?: Array<{ partName: string; sourcePath: string }>;
 }) {
   return runDocumentOperation({ operation: "export-docx", ...payload }, ExportResultSchema);
 }

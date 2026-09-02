@@ -8,23 +8,35 @@ bounded extraction and in-place package patches while retaining opaque parts.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import mimetypes
 import os
+import posixpath
 import re
 import shutil
 import sys
 import tempfile
 import zipfile
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
 from lxml import etree
+from PIL import Image, ImageOps
 from pypdf import PdfReader
 
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-NS = {"w": W}
+R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+PACKAGE_RELATIONSHIPS = "http://schemas.openxmlformats.org/package/2006/relationships"
+NS = {"w": W, "r": R}
 XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
+EMAIL_PATTERN = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
+DEADLINE_TIME_PATTERN = re.compile(
+    r"\b(\d{1,2}:\d{2}\s*(?:a|p)\.?m\.?\s*(?:PST|PDT|Pacific Time))\b",
+    re.IGNORECASE,
+)
+Image.MAX_IMAGE_PIXELS = 50_000_000
 
 
 class DocumentError(ValueError):
@@ -35,23 +47,159 @@ def _paragraph_text(paragraph: etree._Element) -> str:
     return "".join(paragraph.xpath(".//w:t/text()", namespaces=NS))
 
 
-def _replace_paragraph_text(paragraph: etree._Element, text: str) -> None:
-    direct_runs = paragraph.xpath("./w:r", namespaces=NS)
-    first_rpr = None
-    if direct_runs:
-        rpr = direct_runs[0].find(f"{{{W}}}rPr")
-        if rpr is not None:
-            first_rpr = etree.fromstring(etree.tostring(rpr))
-    for child in list(paragraph):
-        if child.tag != f"{{{W}}}pPr":
-            paragraph.remove(child)
-    run = etree.SubElement(paragraph, f"{{{W}}}r")
-    if first_rpr is not None:
-        run.append(first_rpr)
-    text_node = etree.SubElement(run, f"{{{W}}}t")
+def _set_text_node(node: etree._Element, text: str) -> None:
+    node.text = text
     if text.startswith(" ") or text.endswith(" "):
-        text_node.set(XML_SPACE, "preserve")
-    text_node.text = text
+        node.set(XML_SPACE, "preserve")
+    else:
+        node.attrib.pop(XML_SPACE, None)
+
+
+def _replace_tabular_paragraph_text(paragraph: etree._Element, text: str) -> bool:
+    """Map reviewed text into the original tab-separated runs without flattening."""
+
+    text_nodes = paragraph.xpath(".//w:t", namespaces=NS)
+    meaningful_nodes = [
+        node for node in text_nodes
+        if (node.text or "").replace("\u00a0", " ").strip()
+    ]
+    label_matches = list(re.finditer(r"[^:]+:", text))
+    if label_matches:
+        pieces = [match.group(0).strip() for match in label_matches]
+        tail = text[label_matches[-1].end():].strip()
+        if tail:
+            pieces.append(tail)
+        if len(pieces) == len(meaningful_nodes):
+            for node in text_nodes:
+                _set_text_node(node, "")
+            for node, piece in zip(meaningful_nodes, pieces, strict=True):
+                _set_text_node(node, piece)
+            return True
+
+    if not meaningful_nodes:
+        return False
+
+    # Form-style legal templates commonly keep labels and values in separate
+    # styled runs around tab stops. A reviewed value such as a claim number may
+    # intentionally omit the repeated label. Preserve every label node and all
+    # tab/bookmark structure, clear other old-case values, and place the new
+    # value in the final styled text node.
+    target = meaningful_nodes[-1]
+    for node in text_nodes:
+        original = (node.text or "").replace("\u00a0", " ").strip()
+        if node is target:
+            _set_text_node(node, text)
+        elif original.endswith(":"):
+            continue
+        else:
+            _set_text_node(node, "")
+    return True
+
+
+def _replace_paragraph_text(paragraph: etree._Element, text: str) -> None:
+    """Replace visible text without flattening Word's run-level structure.
+
+    The prior implementation deleted every run, hyperlink, bookmark and field
+    child in the paragraph. That made the text deterministic but silently
+    destroyed the formatting contract of production legal templates. This
+    implementation retains every existing OOXML element and uses a character
+    diff to assign changed text to the closest original text node/style.
+    """
+
+    if paragraph.xpath(".//w:drawing | .//w:object | .//w:pict", namespaces=NS):
+        raise DocumentError("Cannot replace a paragraph containing an embedded object.")
+    if paragraph.xpath(".//w:tab", namespaces=NS):
+        if _replace_tabular_paragraph_text(paragraph, text):
+            return
+        raise DocumentError("Cannot safely map replacement text into a tab-separated template paragraph.")
+
+    text_nodes = paragraph.xpath(".//w:t", namespaces=NS)
+    if not text_nodes:
+        run = etree.SubElement(paragraph, f"{{{W}}}r")
+        text_node = etree.SubElement(run, f"{{{W}}}t")
+        if text.startswith(" ") or text.endswith(" "):
+            text_node.set(XML_SPACE, "preserve")
+        text_node.text = text
+        return
+
+    original = "".join(node.text or "" for node in text_nodes)
+    owner_by_character: list[int] = []
+    for node_index, node in enumerate(text_nodes):
+        owner_by_character.extend([node_index] * len(node.text or ""))
+
+    chunks = [""] * len(text_nodes)
+    matcher = SequenceMatcher(None, original, text, autojunk=False)
+    for operation, old_start, old_end, new_start, new_end in matcher.get_opcodes():
+        replacement = text[new_start:new_end]
+        if operation == "equal":
+            for offset, character in enumerate(replacement):
+                chunks[owner_by_character[old_start + offset]] += character
+            continue
+        if operation == "delete":
+            continue
+        if old_start < len(owner_by_character):
+            target_index = owner_by_character[old_start]
+        elif owner_by_character:
+            target_index = owner_by_character[-1]
+        else:
+            target_index = 0
+        chunks[target_index] += replacement
+
+    for node, chunk in zip(text_nodes, chunks, strict=True):
+        _set_text_node(node, chunk)
+
+
+def _hyperlink_replacements(paragraph: etree._Element, replacement: str) -> dict[str, str]:
+    """Return relationship target updates for a changed mailto hyperlink."""
+
+    hyperlinks = paragraph.xpath(".//w:hyperlink[@r:id]", namespaces=NS)
+    replacement_emails = EMAIL_PATTERN.findall(replacement)
+    if len(hyperlinks) != 1 or len(replacement_emails) != 1:
+        return {}
+    hyperlink = hyperlinks[0]
+    original_emails = EMAIL_PATTERN.findall(_paragraph_text(hyperlink))
+    if len(original_emails) != 1:
+        return {}
+    relationship_id = hyperlink.get(f"{{{R}}}id")
+    if not relationship_id:
+        return {}
+    return {relationship_id: f"mailto:{replacement_emails[0]}"}
+
+
+def _patch_relationship_targets(data: bytes, updates: dict[str, str]) -> bytes:
+    if not updates:
+        return data
+    root = etree.fromstring(data)
+    changed = False
+    for relationship in root.findall(f"{{{PACKAGE_RELATIONSHIPS}}}Relationship"):
+        relationship_id = relationship.get("Id")
+        if relationship_id in updates and relationship.get("Target") != updates[relationship_id]:
+            relationship.set("Target", updates[relationship_id])
+            changed = True
+    if not changed:
+        raise DocumentError("A body hyperlink changed, but its DOCX relationship target was not found.")
+    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+
+def _image_for_part(source: Path, part_name: str) -> bytes:
+    """Normalize an uploaded image into the existing OOXML part's format."""
+
+    extension = Path(part_name).suffix.lower()
+    formats = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG"}
+    target_format = formats.get(extension)
+    if not target_format:
+        raise DocumentError(f"Unsupported template image format for {part_name}.")
+    try:
+        with Image.open(source) as opened:
+            image = ImageOps.exif_transpose(opened)
+            if target_format == "JPEG" and image.mode not in ("RGB", "L"):
+                image = image.convert("RGB")
+            output = io.BytesIO()
+            save_options = {"quality": 95, "optimize": True} if target_format == "JPEG" else {"optimize": True}
+            image.save(output, format=target_format, **save_options)
+            return output.getvalue()
+    except (OSError, Image.DecompressionBombError) as error:
+        raise DocumentError(f"Uploaded replacement for {part_name} is not a safe supported image.") from error
 
 
 def _role_for(text: str, style: str | None) -> tuple[str, float]:
@@ -115,13 +263,39 @@ def analyze_template(path: str) -> dict[str, Any]:
             raise DocumentError("Accept or reject existing tracked changes before importing this template.")
         has_complex = any(marker in document_xml for marker in (b"<w:txbxContent", b"<w:object", b"<v:shape"))
         paragraphs = root.xpath("//w:body/w:p", namespaces=NS)
+        relationships: dict[str, str] = {}
+        relationships_name = "word/_rels/document.xml.rels"
+        if relationships_name in names:
+            relationship_root = etree.fromstring(package.read(relationships_name))
+            relationships = {
+                relationship.get("Id", ""): relationship.get("Target", "")
+                for relationship in relationship_root.findall(f"{{{PACKAGE_RELATIONSHIPS}}}Relationship")
+            }
         regions = []
+        image_candidates: list[dict[str, Any]] = []
+        seen_image_relationships: set[str] = set()
         boilerplate_tail = False
         for index, paragraph in enumerate(paragraphs):
+            for relationship_id in paragraph.xpath(".//*[@r:embed]/@r:embed", namespaces=NS):
+                target = relationships.get(relationship_id)
+                if not target or relationship_id in seen_image_relationships:
+                    continue
+                part_name = posixpath.normpath(posixpath.join("word", target))
+                if part_name.startswith("word/media/") and part_name in names:
+                    seen_image_relationships.add(relationship_id)
+                    image_candidates.append({
+                        "paragraphIndex": index,
+                        "relationshipId": relationship_id,
+                        "partName": part_name,
+                        "contentType": mimetypes.guess_type(part_name)[0] or "application/octet-stream",
+                    })
             text = _paragraph_text(paragraph).strip()
             style_values = paragraph.xpath("./w:pPr/w:pStyle/@w:val", namespaces=NS)
             style = style_values[0] if style_values else None
-            role, confidence = _role_for(text, style)
+            if paragraph.xpath(".//w:instrText", namespaces=NS):
+                role, confidence = "preserve", 1.0
+            else:
+                role, confidence = _role_for(text, style)
             upper_text = text.upper()
             if "THIS OFFER IS SUBJECT TO YOU COMPLYING" in upper_text or "FOLLOWING EXPRESS TERMS AND CONDITIONS" in upper_text:
                 boilerplate_tail = True
@@ -139,6 +313,26 @@ def analyze_template(path: str) -> dict[str, Any]:
         warnings = []
         replacement_candidates: list[dict[str, Any]] = []
         seen_candidates: set[tuple[str, str]] = set()
+        # Legal templates often split a time-limited offer sentence across two
+        # Word paragraphs. The first paragraph is case-specific and editable,
+        # while the second starts with the old deadline time before continuing
+        # into immutable settlement boilerplate. Expose only that exact time as
+        # a grounded field replacement so the boilerplate remains untouched.
+        for index, paragraph in enumerate(paragraphs[1:], start=1):
+            previous_text = _paragraph_text(paragraphs[index - 1]).upper()
+            current_text = _paragraph_text(paragraph)
+            if "OFFER EXPIRES" not in previous_text:
+                continue
+            for match in DEADLINE_TIME_PATTERN.finditer(current_text):
+                value = match.group(1)
+                key = ("word/document.xml", value)
+                if key not in seen_candidates:
+                    seen_candidates.add(key)
+                    replacement_candidates.append({
+                        "value": value,
+                        "location": "word/document.xml",
+                        "kind": "date",
+                    })
         for part_name in sorted(n for n in names if n.startswith(("word/header", "word/footer")) and n.endswith(".xml")):
             part_root = etree.fromstring(package.read(part_name))
             full_text = " ".join(part_root.xpath("//w:t/text()", namespaces=NS))
@@ -165,6 +359,7 @@ def analyze_template(path: str) -> dict[str, Any]:
         if has_complex:
             warnings.append("Complex positioned objects are preserved but cannot be selected as editable regions.")
         return {
+            "analysisVersion": 3,
             "filename": source.name,
             "paragraphCount": len(paragraphs),
             "sectionCount": section_count,
@@ -174,6 +369,7 @@ def analyze_template(path: str) -> dict[str, Any]:
             "warnings": warnings,
             "regions": regions,
             "replacementCandidates": replacement_candidates,
+            "imageCandidates": image_candidates,
             "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
             "packageParts": len(names),
         }
@@ -219,16 +415,26 @@ def export_docx(payload: dict[str, Any]) -> dict[str, Any]:
     output = Path(payload["outputPath"])
     patches = {int(item["paragraphIndex"]): str(item["text"]) for item in payload.get("patches", [])}
     replacements = {str(k): str(v) for k, v in payload.get("fieldReplacements", {}).items() if k and v}
+    image_replacements = {
+        str(item["partName"]): Path(str(item["sourcePath"]))
+        for item in payload.get("imageReplacements", [])
+    }
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    with zipfile.ZipFile(source) as zin, tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
         temp_path = Path(tmp.name)
     try:
         with zipfile.ZipFile(source) as zin, zipfile.ZipFile(temp_path, "w") as zout:
-            for info in zin.infolist():
-                data = zin.read(info.filename)
-                is_text_part = info.filename == "word/document.xml" or (
-                    info.filename.startswith(("word/header", "word/footer")) and info.filename.endswith(".xml")
+            infos = zin.infolist()
+            package_data = {info.filename: zin.read(info.filename) for info in infos}
+            for part_name, replacement_path in image_replacements.items():
+                if not part_name.startswith("word/media/") or part_name not in package_data:
+                    raise DocumentError(f"Template image part is missing or invalid: {part_name}")
+                package_data[part_name] = _image_for_part(replacement_path, part_name)
+            hyperlink_updates: dict[str, str] = {}
+            for part_name, data in list(package_data.items()):
+                is_text_part = part_name == "word/document.xml" or (
+                    part_name.startswith(("word/header", "word/footer")) and part_name.endswith(".xml")
                 )
                 if is_text_part:
                     root = etree.fromstring(data)
@@ -241,17 +447,27 @@ def export_docx(payload: dict[str, Any]) -> dict[str, Any]:
                         if updated != original:
                             text_node.text = updated
                             changed = True
-                    if info.filename == "word/document.xml":
+                    if part_name == "word/document.xml":
                         paragraphs = root.xpath("//w:body/w:p", namespaces=NS)
                         for index, paragraph in enumerate(paragraphs):
                             if index in patches:
                                 replacement = patches[index]
                                 if replacement != _paragraph_text(paragraph):
+                                    hyperlink_updates.update(_hyperlink_replacements(paragraph, replacement))
                                     _replace_paragraph_text(paragraph, replacement)
                                     changed = True
                     if changed:
                         data = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
-                zout.writestr(info, data)
+                        package_data[part_name] = data
+            relationships_name = "word/_rels/document.xml.rels"
+            if hyperlink_updates:
+                if relationships_name not in package_data:
+                    raise DocumentError("A body hyperlink changed, but the DOCX relationships part is missing.")
+                package_data[relationships_name] = _patch_relationship_targets(
+                    package_data[relationships_name], hyperlink_updates
+                )
+            for info in infos:
+                zout.writestr(info, package_data[info.filename])
         shutil.move(temp_path, output)
     finally:
         temp_path.unlink(missing_ok=True)
@@ -266,6 +482,7 @@ def export_docx(payload: dict[str, Any]) -> dict[str, Any]:
         "size": output.stat().st_size,
         "sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
         "patchCount": len(patches),
+        "imagePatchCount": len(image_replacements),
     }
 
 

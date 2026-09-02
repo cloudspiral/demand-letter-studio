@@ -1,0 +1,389 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Steno V1 live demo host - runs the current filesystem and PostgreSQL adapters on one encrypted EC2 instance with Caddy HTTPS
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@2
+  com.aws.cloudformation.Context:
+    arch: Caddy HTTPS on EC2 -> private Docker app and PostgreSQL; encrypted retained EBS for app data
+    must:
+      - no public SSH or PostgreSQL ingress
+      - expose only public HTTP and HTTPS for the Caddy edge
+      - source artifact bucket and data volume stay encrypted and retained
+    ref:
+      - at: docs/ARCHITECTURE.md
+        has: app trust boundaries and live demo limitations
+        scope: repository
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC containing the public demo subnet
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Public subnet with an internet gateway route
+  AvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: Availability Zone for the subnet and retained data volume
+  InstanceType:
+    Type: String
+    Default: t4g.small
+    AllowedValues: [t4g.small, t4g.medium]
+    Description: Graviton instance size for the bounded demo workload
+  ArtifactKey:
+    Type: String
+    Default: releases/steno-live-source.tar.gz
+    AllowedPattern: '^[A-Za-z0-9][A-Za-z0-9._/-]+$'
+    Description: Source archive key uploaded after stack creation
+  SourceRevision:
+    Type: String
+    Default: working-tree
+    AllowedPattern: '^[A-Za-z0-9._-]+$'
+    Description: Sanitized revision label used for release directories and tags
+  AiProvider:
+    Type: String
+    Default: openai
+    AllowedValues: [openai, bedrock, mock]
+    Description: Runtime generation provider; direct OpenAI bypasses the pending Bedrock account authorization
+  OpenAiSecretArn:
+    Type: String
+    AllowedPattern: '^arn:[A-Za-z0-9-]+:secretsmanager:[A-Za-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$'
+    Description: ARN of the Secrets Manager secret containing the OpenAI API key under the apiKey JSON field
+  OpenAiModel:
+    Type: String
+    Default: gpt-5.6-sol
+    AllowedPattern: '^[A-Za-z0-9._-]+$'
+    Description: OpenAI Responses API model used for generation and refinement
+  BedrockModelId:
+    Type: String
+    Default: us.anthropic.claude-sonnet-4-6
+    AllowedPattern: '^[A-Za-z0-9._:-]+$'
+    Description: Bedrock cross-region inference profile id used by the deployed app
+  BedrockFoundationModelId:
+    Type: String
+    Default: anthropic.claude-sonnet-4-6
+    AllowedPattern: '^[A-Za-z0-9._:-]+$'
+    Description: Foundation model id routed by the selected inference profile
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    Description: Current Amazon Linux 2023 Arm64 AMI from the AWS public SSM parameter
+
+Resources:
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: stores short-lived source archives used to build the demo host; private bucket avoids registry credentials
+        must:
+          - block all public access and deny non-TLS requests
+          - retain bucket on stack delete so release provenance is not silently lost
+        mutable: change-with-constraints
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-release-versions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 14
+
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: enforces TLS for every artifact bucket operation
+        must:
+          - keep aws:SecureTransport deny on the entire bucket
+        mutable: change-with-constraints
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt ArtifactBucket.Arn
+              - !Sub '${ArtifactBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: exposes only Caddy HTTP and HTTPS; no SSH or database ingress
+        must:
+          - public ingress stays limited to ports 80 and 443
+          - never add public SSH or PostgreSQL ingress
+        mutable: change-with-constraints
+    Properties:
+      GroupDescription: Steno live demo Caddy web access only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: ACME challenge and HTTP redirect traffic
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - Description: HTTPS demo traffic
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-origin'
+
+  AppRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: gives the host SSM management, read-only release access, and runtime access to the one configured AI credential without SSH keys
+        must:
+          - artifact permissions stay read-only and scoped to this bucket
+          - preserve SSM managed-node access
+          - AI secret access stays read-only and scoped to the configured secret ARN
+        mutable: change-with-constraints
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: read-release-artifact
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub '${ArtifactBucket.Arn}/*'
+        - PolicyName: invoke-demand-drafting-model
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockModelId}'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/${BedrockFoundationModelId}'
+        - PolicyName: read-openai-api-secret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref OpenAiSecretArn
+                Condition:
+                  Bool:
+                    aws:SecureTransport: 'true'
+
+  AppInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref AppRole
+
+  DataVolume:
+    Type: AWS::EC2::Volume
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: persists PostgreSQL and uploaded/exported documents across host replacement in the selected Availability Zone
+        must:
+          - keep encryption enabled
+          - retain on stack delete and replacement; cleanup needs explicit ownership confirmation
+        mutable: change-with-constraints
+        mutability:
+          AvailabilityZone: must-never-change
+    Properties:
+      AvailabilityZone: !Ref AvailabilityZone
+      Encrypted: true
+      Size: 30
+      VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-data'
+
+  AppInstance:
+    Type: AWS::EC2::Instance
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: bounded single-host demo preserves the current app adapters; Graviton reduces idle cost and containers keep app and database isolated
+        must:
+          - require IMDSv2 with hop limit 2 for containers
+          - no SSH key and no port 22 ingress; operate through SSM
+          - build only the private source archive fetched with the instance role
+          - runtime provider comes from the AiProvider parameter so account-verification fallback is explicit
+        mutable: review-required
+        mutability:
+          InstanceType: free-to-tune
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref AppInstanceProfile
+      CreditSpecification:
+        CPUCredits: standard
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+        HttpPutResponseHopLimit: 2
+      Monitoring: true
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeleteOnTermination: true
+          DeviceIndex: '0'
+          GroupSet:
+            - !Ref AppSecurityGroup
+          SubnetId: !Ref SubnetId
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            DeleteOnTermination: true
+            Encrypted: true
+            VolumeSize: 20
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-app'
+        - Key: SourceRevision
+          Value: !Ref SourceRevision
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          exec > >(tee /var/log/steno-bootstrap.log | logger -t steno-bootstrap -s 2>/dev/console) 2>&1
+
+          dnf install -y docker xfsprogs
+          systemctl enable --now docker
+
+          asm_exec=/usr/local/bin/asm-exec
+          curl --fail --silent --show-error --location \
+            'https://raw.githubusercontent.com/aws/agent-toolkit-for-aws/88a5fb3c80d1d4bd6888f0bfa9df9c93e30d15d6/plugins/aws-core/skills/aws-secrets-manager/references/asm-exec' \
+            --output "$asm_exec"
+          echo 'd55eb38ad33a5b76f584ca180f633ecc120cf39b8fd29427ffbe11a8fbf19556  /usr/local/bin/asm-exec' | sha256sum --check --strict
+          chmod 0755 "$asm_exec"
+
+          awcp_installer=/opt/steno/bootstrap/awcp-install.sh
+          install -d -m 0755 /opt/steno/bootstrap
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+            'https://raw.githubusercontent.com/aws/aws-workload-credentials-provider/981a4703a6751545784da3d85c11d1644f7f1643/install.sh' \
+            --output "$awcp_installer"
+          echo 'bf4e75b64572eac4bc765690c3a1bb3cc0b6f495f7005dce89f9f88c3bff5ec7  /opt/steno/bootstrap/awcp-install.sh' | sha256sum --check --strict
+          AWCP_VERSION=3.1.1 bash "$awcp_installer"
+          systemctl is-active aws-workload-credentials-provider-sm.service
+          test -s /var/run/awssmatoken
+
+          if [ ! -f /swapfile ]; then
+            fallocate -l 2G /swapfile
+            chmod 600 /swapfile
+            mkswap /swapfile
+          fi
+          swapon --show=NAME --noheadings | grep -qx /swapfile || swapon /swapfile
+          grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+
+          volume_serial=$(echo '${DataVolume}' | tr -d '-')
+          data_device=''
+          for attempt in $(seq 1 120); do
+            data_device=$(lsblk -ndo NAME,SERIAL | awk -v serial="$volume_serial" '$2 == serial { print "/dev/" $1; exit }')
+            if [ -n "$data_device" ]; then break; fi
+            sleep 2
+          done
+          test -n "$data_device"
+          if ! blkid "$data_device" >/dev/null 2>&1; then mkfs.xfs "$data_device"; fi
+          install -d -m 0755 /var/lib/steno
+          mountpoint -q /var/lib/steno || mount "$data_device" /var/lib/steno
+          data_uuid=$(blkid -s UUID -o value "$data_device")
+          grep -q "$data_uuid" /etc/fstab || echo "UUID=$data_uuid /var/lib/steno xfs defaults,nofail 0 2" >> /etc/fstab
+
+          archive=/opt/steno/bootstrap/source.tar.gz
+          for attempt in $(seq 1 180); do
+            if aws s3 cp 's3://${ArtifactBucket}/${ArtifactKey}' "$archive"; then break; fi
+            sleep 10
+          done
+          test -s "$archive"
+          install -d -m 0755 /opt/steno/bootstrap/source
+          tar -xzf "$archive" -C /opt/steno/bootstrap/source
+          STENO_AI_PROVIDER='${AiProvider}' \
+          STENO_OPENAI_SECRET_ARN='${OpenAiSecretArn}' \
+          STENO_OPENAI_MODEL='${OpenAiModel}' \
+          STENO_BEDROCK_MODEL='${BedrockModelId}' \
+          STENO_AWS_REGION='${AWS::Region}' \
+          bash /opt/steno/bootstrap/source/infra/host-deploy.sh "$archive" '${SourceRevision}'
+
+  DataVolumeAttachment:
+    Type: AWS::EC2::VolumeAttachment
+    Properties:
+      Device: /dev/sdf
+      InstanceId: !Ref AppInstance
+      VolumeId: !Ref DataVolume
+
+  InstanceStatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: makes host-level failures visible without opening administrative ingress
+        must:
+          - alarm monitors both system and instance status failures through StatusCheckFailed
+        mutable: free-to-tune
+    Properties:
+      AlarmDescription: Steno live demo EC2 status check failed
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref AppInstance
+      EvaluationPeriods: 2
+      MetricName: StatusCheckFailed
+      Namespace: AWS/EC2
+      Period: 60
+      Statistic: Maximum
+      Threshold: 1
+      TreatMissingData: missing
+
+Outputs:
+  LiveUrl:
+    Description: HTTPS URL for the Steno V1 live demo using IP-derived DNS
+    Value: !Sub 'https://${AppInstance.PublicIp}.sslip.io'
+  ArtifactBucketName:
+    Description: Private bucket that receives the packaged working tree
+    Value: !Ref ArtifactBucket
+  InstanceId:
+    Description: EC2 managed node for SSM diagnostics and redeployment
+    Value: !Ref AppInstance
+  DataVolumeId:
+    Description: Retained encrypted volume containing PostgreSQL and uploaded documents
+    Value: !Ref DataVolume
+  ActiveAiProvider:
+    Description: AI provider selected for the deployed application runtime
+    Value: !Ref AiProvider
+  ActiveOpenAiModel:
+    Description: OpenAI model configured for direct generation and refinement
+    Value: !Ref OpenAiModel

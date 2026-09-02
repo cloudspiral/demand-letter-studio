@@ -1,11 +1,14 @@
-import type { GeneratedDraft, TemplateAnalysis, TemplateRegion } from "@steno/contracts";
+import type { EvidenceReview, ExportReadiness, GeneratedDraft, TemplateAnalysis, TemplateRegion } from "@steno/contracts";
 
 export interface TemplateResponse {
   id: string;
   name: string;
+  displayName: string;
+  isTest: boolean;
   status: "analyzed" | "confirmed";
   analysis: TemplateAnalysis;
   confirmedRegions?: TemplateRegion[];
+  createdAt?: string;
 }
 
 export interface SourceResponse {
@@ -22,16 +25,22 @@ export interface MatterResponse {
   name: string;
   templateId: string;
   sources: SourceResponse[];
+  sourceFingerprint: string;
+  evidenceReview: EvidenceReview | null;
+  evidenceReviewStale: boolean;
+  activeDraft: { id: string; version: number } | null;
 }
 
 export interface JobResponse {
   id?: string;
   jobId?: string;
+  jobType?: "generation" | "evidence_review";
   status: "queued" | "processing" | "completed" | "failed";
   progress?: number;
   step?: string;
   draftId?: string | null;
   error?: string | null;
+  result?: EvidenceReview | { draftId: string; version: number; sourceFingerprint: string } | null;
 }
 
 export interface DraftResponse {
@@ -39,6 +48,8 @@ export interface DraftResponse {
   matterId: string;
   version: number;
   content: GeneratedDraft;
+  readiness: ExportReadiness;
+  sourceFingerprint: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -49,7 +60,11 @@ export interface ProposalResponse {
   baseVersion: number;
   status: "pending" | "accepted" | "rejected";
   instruction: string;
-  proposal: { targetText: string; replacementText: string; summary: string; citedSourceIds: string[] };
+  proposal: {
+    edits: Array<{ blockId: string; targetText: string; replacementText: string; start: number; end: number }>;
+    summary: string;
+    citedSourceIds: string[];
+  };
 }
 
 export interface ActivityResponse {

@@ -10,9 +10,11 @@ describe("completed-letter leakage canary", () => {
     const draft = await createAiProvider("mock").generate({
       matterName: "Jordan Canary matter",
       template: {
+        analysisVersion: 2,
         filename: "completed-old-case.docx", paragraphCount: 1, sectionCount: 1,
         hasMacros: false, hasTrackedChanges: false, hasComplexObjects: false, warnings: [],
         replacementCandidates: [],
+        imageCandidates: [],
         regions: [{ paragraphIndex: 8, text: "Patrick Donahue incurred $3,500.00.", role: "editable", confidence: 1, style: null }],
       },
       evidence: [{ sourceId, sourceName: "canary-evidence.txt", page: 1, text: evidenceText }],
