@@ -55,6 +55,9 @@ export function validateProposalTargets(proposal: RefinementProposal, annotation
     if (seen.has(key) || expected.get(key) !== edit.targetText) {
       throw new Error("The AI proposal did not preserve the selected draft ranges.");
     }
+    if (edit.replacementText === edit.targetText) {
+      throw new Error("The AI proposal did not make a change.");
+    }
     seen.add(key);
   }
 }

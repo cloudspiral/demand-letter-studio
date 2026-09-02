@@ -511,7 +511,7 @@ function RefinePanel({
       </div>
       {tab === "review" ? <div className="unified-review-panel">{reviewContent}</div> : tab === "refine" ? <>
         <div className="chat-scroll">
-          {!messages.length && <div className="chat-intro"><Sparkles size={22} /><strong>Refine without losing control</strong><p>Choose a mapped paragraph, instruct the AI, and review every proposed change before it is applied.</p></div>}
+          {!messages.length && <div className="chat-intro"><Sparkles size={22} /><strong>Refine without losing control</strong><p>Describe the change you want. The AI will find the relevant passage, or you can limit it to one paragraph below.</p></div>}
           {messages.map((message, index) => <div className={`chat-message ${message.role}`} key={`${message.role}-${index}`}>
             {!!message.annotationCount && <small>❝ {message.annotationCount} selected {message.annotationCount === 1 ? "passage" : "passages"}</small>}
             <p>{message.text}</p>
@@ -528,7 +528,8 @@ function RefinePanel({
           </div>}
         </div>
         <div className="composer">
-          <label className="refine-target"><span>Mapped paragraph</span><select value={activeBlock?.id ?? ""} onChange={(event) => onActiveBlock(event.target.value)}>
+          <label className="refine-target"><span>Scope (optional)</span><select value={activeBlock?.id ?? ""} onChange={(event) => onActiveBlock(event.target.value)}>
+            <option value="">Let AI find the relevant passage</option>
             {availableBlocks.map((block) => <option value={block.id} key={block.id}>{block.text.slice(0, 86) || "Blank mapped paragraph"}</option>)}
           </select></label>
           {annotations.length > 0 && <div className="annotation-stack">{annotations.map((annotation, index) => <div className="annotation-chip" key={`${annotation.blockId}-${annotation.start}`}>
@@ -540,10 +541,10 @@ function RefinePanel({
               value={instruction}
               onChange={(event) => onInstruction(event.target.value)}
               onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); onSend(); } }}
-              placeholder={annotations.length ? `Instruct AI about ${annotations.length === 1 ? "the selected passage" : `the ${annotations.length} selected passages`}…` : activeBlock ? "Instruct AI about the active paragraph…" : "Select text in the letter to begin…"}
+              placeholder={annotations.length ? `Instruct AI about ${annotations.length === 1 ? "the selected passage" : `the ${annotations.length} selected passages`}…` : activeBlock ? "Instruct AI about this paragraph…" : "Describe the change—the AI will find the relevant passage…"}
               rows={2}
             />
-            <button onClick={onSend} disabled={!instruction.trim() || (!annotations.length && !activeBlock) || thinking || !!proposal} aria-label="Send refinement"><Send size={16} /></button>
+            <button onClick={onSend} disabled={!instruction.trim() || thinking || !!proposal} aria-label="Send refinement"><Send size={16} /></button>
           </div>
           <small>AI changes remain proposals until you accept them.</small>
         </div>
@@ -602,7 +603,7 @@ export function App() {
     const loaded = await api<DraftResponse>(`/api/drafts/${draftId}`);
     setDraft(loaded); setContent(loaded.content);
     setTab("review");
-    setActiveBlockId(loaded.content.sections.flatMap((section) => section.blocks)[0]?.id ?? null);
+    setActiveBlockId(null);
     setFieldValues(Object.fromEntries(Object.entries(loaded.content.fields).map(([key, field]) => [key, field.value ?? ""])));
     setOutcomeValues({});
     await loadVersions(draftId);
@@ -694,7 +695,6 @@ export function App() {
   const sendRefinement = async () => {
     if (!draft || !content || !instruction.trim() || proposal) return;
     const context = annotations.length ? annotations : activeBlock ? [{ blockId: activeBlock.id, quote: activeBlock.text, start: 0, end: activeBlock.text.length }] : [];
-    if (!context.length) return;
     const requestText = instruction.trim();
     setMessages((current) => [...current, { role: "user", text: requestText, annotationCount: context.length }]);
     setThinking(true); setInstruction(""); setNotice(null);

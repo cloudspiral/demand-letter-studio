@@ -59,7 +59,7 @@ const GenerationRequestSchema = z.object({
 const RefineSchema = z.union([
   z.object({
     instruction: z.string().min(1).max(2_000),
-    annotations: z.array(RefinementAnnotationSchema).min(1).max(5),
+    annotations: z.array(RefinementAnnotationSchema).max(5),
   }),
   z.object({
     instruction: z.string().min(1).max(2_000),
@@ -1024,16 +1024,22 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
     if (!draft) return reply.status(404).send({ error: "Draft not found." });
     const content = normalizeDraftContent(draft.content);
     const blockById = new Map(content.sections.flatMap((section) => section.blocks).map((block) => [block.id, block]));
-    const annotations = body.annotations.map((annotation) => {
+    const requestedAnnotations = body.annotations.map((annotation) => {
       if (annotation.blockId !== "legacy") return annotation;
       const block = content.sections.flatMap((section) => section.blocks).find((candidate) => candidate.text === annotation.quote);
       return block ? { ...annotation, blockId: block.id, end: block.text.length } : annotation;
     });
-    const annotationsValid = annotations.every((annotation) => {
+    const annotationsValid = requestedAnnotations.every((annotation) => {
       const block = blockById.get(annotation.blockId);
       return block?.text.slice(annotation.start, annotation.end) === annotation.quote;
     });
     if (!annotationsValid) return reply.status(409).send({ error: "Selected text is not part of the current draft version." });
+    const annotations = requestedAnnotations.length
+      ? requestedAnnotations
+      : content.sections.flatMap((section) => section.blocks)
+        .filter((block) => block.text.trim())
+        .map((block) => ({ blockId: block.id, quote: block.text, start: 0, end: block.text.length }));
+    if (!annotations.length) return reply.status(409).send({ error: "This draft does not contain any editable text to refine." });
     const wantsStream = request.headers.accept?.includes("text/event-stream") ?? false;
     if (wantsStream) {
       reply.hijack();
@@ -1108,7 +1114,19 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
     const allowedSourceIds = new Set(evidence.map((page) => page.sourceId));
     proposal = { ...proposal, citedSourceIds: proposal.citedSourceIds.filter((sourceId) => allowedSourceIds.has(sourceId)) };
     if (refinementKeepalive) clearInterval(refinementKeepalive);
-    validateProposalTargets(proposal, annotations);
+    try {
+      validateProposalTargets(proposal, annotations);
+    } catch (error) {
+      const message = error instanceof Error && /did not make a change/i.test(error.message)
+        ? "The AI did not produce a real change. Try describing the wording you want more explicitly."
+        : "The AI response did not match the current draft. Please try the refinement again.";
+      if (wantsStream) {
+        reply.raw.write(`event: failed\ndata: ${JSON.stringify({ error: message })}\n\n`);
+        reply.raw.end();
+        return;
+      }
+      return reply.status(422).send({ error: message });
+    }
     const saved = await pool.query(`
       INSERT INTO edit_proposals (draft_id, base_version, status, instruction, proposal, actor_id)
       VALUES ($1, $2, 'pending', $3, $4, $5)

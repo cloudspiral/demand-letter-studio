@@ -44,6 +44,17 @@ describe("attorney-controlled editing", () => {
     expect(() => applyRefinementProposal(content, proposal)).toThrow(/no longer matches/i);
   });
 
+  it("rejects unchanged AI proposals", () => {
+    const proposal = RefinementProposalSchema.parse({
+      edits: [{ blockId: "two", targetText: "This is very concise.", replacementText: "This is very concise.", start: 0, end: 21 }],
+      summary: "No change",
+      citedSourceIds: [],
+    });
+    expect(() => validateProposalTargets(proposal, [
+      { blockId: "two", quote: "This is very concise.", start: 0, end: 21 },
+    ])).toThrow(/did not make a change/i);
+  });
+
   it("saves direct edits to all existing text without a second confirmation", () => {
     const candidate: GeneratedDraft = {
       ...content,

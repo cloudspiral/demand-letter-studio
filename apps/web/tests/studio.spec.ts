@@ -422,12 +422,17 @@ test("complete high-fidelity evidence-grounded schema-v2 workflow", async ({ pag
 
   await page.getByRole("button", { name: "Refine with AI" }).click();
   await expect(page.locator(".refine-target select")).toBeVisible();
+  await expect(page.locator(".refine-target select")).toHaveValue("");
+  await expect(page.locator(".refine-target select").locator("option").first()).toHaveText("Let AI find the relevant passage");
   await page.locator(".composer textarea").fill("Make these passages more concise without changing any facts");
   await page.getByRole("button", { name: "Send refinement" }).click();
   await expect(page.locator(".proposal-card")).toContainText("Proposed edit", { timeout: 90_000 });
   const proposedEdits = await page.locator(".proposal-preview > div").count();
   expect(proposedEdits).toBeGreaterThanOrEqual(1);
-  expect(proposedEdits).toBeLessThanOrEqual(2);
+  expect(proposedEdits).toBeLessThanOrEqual(5);
+  const proposedBefore = await page.locator(".proposal-preview del").allTextContents();
+  const proposedAfter = await page.locator(".proposal-preview ins").allTextContents();
+  expect(proposedAfter).not.toEqual(proposedBefore);
   await page.getByRole("button", { name: "Accept" }).click();
   currentVersion += 1;
   await expect(page.locator(".matter-breadcrumb").getByText(`Draft v${currentVersion}`, { exact: true })).toBeVisible();

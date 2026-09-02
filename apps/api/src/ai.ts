@@ -583,12 +583,12 @@ export function parseModelDraft(
 }
 
 function promptForRefinement(input: RefineInput): string {
-  return `Propose bounded revisions to one or more selected passages in a demand letter.
+  return `Propose bounded revisions to the passages relevant to the attorney's instruction.
 Instruction: ${input.instruction}
 Current immutable draft version: ${input.currentDraftVersion ?? "not supplied"}
-Selections: ${JSON.stringify(input.annotations)}
+Ordered editable passages: ${JSON.stringify(input.annotations)}
 Evidence: ${JSON.stringify(input.evidence.map(({ imageData: _imageData, ...page }) => page))}
-Return one edit per changed selection. Copy blockId, targetText, start, and end exactly from each supplied selection. Do not introduce facts unsupported by the evidence. If the instruction requires unsupported facts, keep the relevant text unchanged and explain why in summary.`;
+Find the passage or passages the instruction refers to and return edits only for those passages, up to five. Do not edit unrelated passages. Copy blockId, targetText, start, and end exactly from each supplied passage; replacementText must contain the complete revised passage and must differ from targetText. Follow ordinary wording, grammar, tone, and pronoun corrections directly. Do not introduce new substantive case facts unsupported by the evidence. If no supplied passage is relevant or no actual change can be made, throw an error instead of returning an unchanged edit.`;
 }
 
 function openAiMultimodalInput(prompt: string, evidence: EvidencePage[]) {
@@ -831,13 +831,22 @@ class MockProvider implements AiProvider {
 
   async refine(input: RefineInput): Promise<RefinementProposal> {
     await this.modelDelay();
-    const edits = input.annotations.map((annotation) => ({
-      blockId: annotation.blockId,
-      targetText: annotation.quote,
-      replacementText: annotation.quote.replace(/\bvery\b/gi, "").replace(/\s{2,}/g, " ").trim(),
-      start: annotation.start,
-      end: annotation.end,
-    }));
+    const edits = input.annotations.flatMap((annotation) => {
+      const replacementText = annotation.quote
+        .replace(/\bvery\s+/gi, "")
+        .replace(/the facts reflected in the cited source materials/gi, "the cited facts")
+        .replace(/any unsupported narrative from the prior completed letter/gi, "unsupported prior-letter narrative")
+        .replace(/\s{2,}/g, " ")
+        .trim();
+      return replacementText === annotation.quote ? [] : [{
+        blockId: annotation.blockId,
+        targetText: annotation.quote,
+        replacementText,
+        start: annotation.start,
+        end: annotation.end,
+      }];
+    }).slice(0, 5);
+    if (!edits.length) throw new Error("The mock provider could not produce a real refinement for the supplied passages.");
     return RefinementProposalSchema.parse({
       edits,
       summary: `Tightened ${edits.length === 1 ? "the selected passage" : `${edits.length} selected passages`} without adding facts.`,
