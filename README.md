@@ -1,6 +1,6 @@
 # Steno Demand Letter Studio
 
-Demand Letter Studio turns a reviewed firm Word template and a case evidence packet into an evidence-linked attorney-review draft. It is a local, end-to-end v1 for the Steno take-home assignment: uploaded state is persisted in PostgreSQL, generation runs as a job with SSE progress, edits are versioned, AI changes remain proposals until accepted, and export modifies the original DOCX package instead of rebuilding it.
+Demand Letter Studio turns a reviewed firm Word template and a case evidence packet into an evidence-linked attorney-review draft. The local checkout uses template-map schema v2: uploaded state is persisted in PostgreSQL, generation runs as a job with SSE progress, edits and omission decisions are versioned, AI changes remain proposals until accepted, and export modifies a copy of the original DOCX package instead of rebuilding it.
 
 > This system produces a draft for attorney review. It does not provide legal advice and must not send a demand without a qualified attorney validating every fact, citation, deadline, term, and amount.
 
@@ -8,18 +8,20 @@ Demand Letter Studio turns a reviewed firm Word template and a case evidence pac
 
 - Start from the handoff2 setup experience: search persisted templates, upload a `.docx` first, stage up to ten PDF/image sources, or use the clearly labeled supplied-sample shortcut.
 - Keep immutable upload filenames and content-addressed storage separate from clean template display names; automation fixtures remain visible but are explicitly labeled **Test template**, and long names stay contained within their cards.
-- Import and analyze a reviewed `.docx`; use the compact post-analysis check to confirm editable, preserved, and heading regions.
+- Import and analyze a reviewed `.docx`; use the full annotated-letter workbench to confirm Keep/Replace blocks, locked headings with replaceable inline fields, structured groups, and evidence-backed figure slots. Queue filters never hide the complete letter, and document/card selection stays synchronized.
 - Reject legacy `.doc`, PDF templates, macros, existing tracked changes, malformed packages, and unsupported source types with specific errors.
-- Upload PDFs and images. PDF text is stored by page; images remain separate visual evidence. When a reviewed template has exactly one body image slot and the matter has exactly one uploaded image, export replaces only that mapped media part while retaining its crop, dimensions, relationship, and surrounding layout.
+- Upload PDFs and images. PDF text is stored by page; standalone uploads remain eligible visual evidence. Every mapped figure keeps its exact media relationship and caption anchor; generation may select an existing uploaded image or explicitly omit the figure, but it may never synthesize one.
 - Review evidence asynchronously before drafting. Category-free review flags provide a short, non-exhaustive explanation, exact source/page excerpts when available, and links to affected template regions or fields without classifying a document or deciding authenticity or legal validity.
-- Generate asynchronously through OpenAI Responses, with Anthropic and Bedrock adapters behind the same strict contracts and a deterministic mock for tests.
-- Validate model JSON, require every citation quote to occur on its uploaded source page, and visibly flag any unfilled case-specific template region. A review flag is advisory; only its concrete blocked draft target affects export.
-- Reveal only a fully validated generated draft, then edit body paragraphs directly in the paper view with optimistic autosave on blur. An edit becomes unverified and requires a separate attorney confirmation with the reviewed text and a resolution note.
+- Generate asynchronously through one whole-document OpenAI Responses request, with Anthropic and Bedrock adapters behind the same strict contracts and a deterministic mock for tests. Application code derives elastic prose runs from the confirmed map; the model returns exactly one explicit outcome for every narrative, structured, and figure target plus every replaceable inline field.
+- Validate exact target coverage, bounds, citations, figure media, source fingerprints, and previous-matter leakage before revealing any draft. `omitted_no_evidence` and cited `omitted_not_applicable` are explicit outcomes, never silent missing output.
+- Review the clean generated letter beside synchronized Blocking, Needs verification, and Informational cards. Sources, refinement, and activity use the same right-side workbench. Direct or AI-applied edits become unverified and require a separate attorney confirmation.
 - Add evidence from the source drawer without leaving the matter. The current draft remains visible but becomes stale immediately; a fresh evidence review and same-draft regeneration append the next immutable version while retaining history.
 - Inspect reading-order citations in the drawer, including exact extracted pages and an authorized link to the original PDF at the cited page.
 - Verify or correct low-confidence merge fields before they can enter export; every confirmation is versioned and recorded in activity.
 - Annotate up to five exact text ranges and stream one atomic multi-block AI proposal over SSE; accept or reject the entire proposal and retain a semantic activity log.
-- Compute one canonical export-readiness result on the server and return it with every draft. The browser and Word endpoint use that identical result to lock export for warning, placeholder, unconfirmed, unresolved-field, duplicate-mapping, ambiguous-image, and stale-evidence conditions. A ready export is a genuine `.docx` copied from the reviewed OOXML package with bounded paragraph, field, hyperlink-target, and explicitly mapped image replacements; run properties, styles, numbering, fields, bookmarks, section settings, logos, and unrelated package parts remain intact.
+- Pre-approve an evidence-review omission for the current matter, or confirm one unresolved no-evidence outcome after generation. Both actions are audited against the stable target and current source fingerprint; evidence changes make the decision stale instead of silently carrying it forward.
+- Compute one canonical export-readiness result on the server and return it with every draft. The browser and Word endpoint use that identical result to lock export for unresolved omissions, warning/placeholder content, unconfirmed edits or fields, cross-target duplicate mappings, stale evidence, and stale resolutions.
+- Assemble a genuine `.docx` deterministically from a copied template package. Code expands/contracts compatible prose exemplars, rebuilds 0-N table or paragraph-based structured rows, applies inline substitutions without flattening surrounding runs, and replaces or removes mapped figures and captions while preserving unrelated styles, numbering, headers, footers, relationships, and section settings.
 - Run locally with PostgreSQL and inspect the undeployed AWS SAM shape for API Gateway, Lambda, SQS/DLQ, and encrypted/versioned S3.
 
 ## Quick start
@@ -48,9 +50,12 @@ Live demo: [https://13.219.250.195.sslip.io](https://13.219.250.195.sslip.io). D
 pnpm verify
 pnpm --filter @steno/web test:e2e
 python scripts/generate-gold-case-fixtures.py --help
+UV_CACHE_DIR=.data/uv-cache uv run --project services/document-worker --with reportlab==4.4.9 python scripts/generate-demo-case-fixtures.py --help
 UV_CACHE_DIR=.data/uv-cache uv run --project services/document-worker python scripts/verify-docx-acceptance.py --help
 node scripts/run-live-ai-acceptance.mjs --help
 ```
+
+`generate-demo-case-fixtures.py` builds three fully fictional, seven-source demo packets under `output/pdf/demo-cases/`: a conservative-care rear-end case, a surgical side-impact case, and a concussion/orthopedic offset-frontal case. Each packet is designed to be uploaded with the supplied Pat Donahue DOCX used only as the reviewed firm template. It includes a manifest of expected facts and forbidden template leakage markers; never mix sources between packets.
 
 The e2e test accepts `E2E_BASE_URL`, `E2E_TEMPLATE_PATH`, `E2E_SOURCE_DIR`, `E2E_CONFIRMED_FIELD_VALUE`, `E2E_DOWNLOAD_PATH`, and async-aware timeout overrides. Without explicit fixture paths it expects the supplied local artifacts and a running deterministic development stack. See [TEST_RESULTS.md](./TEST_RESULTS.md) and [docs/PRD_ACCEPTANCE.md](./docs/PRD_ACCEPTANCE.md) for the latest local/deployed evidence and the native Word boundary.
 
@@ -69,13 +74,15 @@ docs                     Architecture and decision records
 
 ## API
 
-- `POST /api/templates` and `POST /api/templates/:id/confirm`
+- `POST /api/templates` and schema-v2-only `POST /api/templates/:id/confirm`
 - `POST /api/matters`, `GET /api/matters/:id`, and `POST /api/matters/:id/sources`
 - `POST /api/matters/:id/evidence-reviews`
+- `PUT /api/matters/:id/review-resolutions/:targetId` to create or clear a fingerprint-scoped pre-generation omission
 - `POST /api/matters/:id/generations` for initial generation or same-draft regeneration with `draftId` and `baseVersion`
 - `GET /api/jobs/:id` and `GET /api/jobs/:id/events`
 - `GET /api/drafts/:id` and `PUT /api/drafts/:id`
 - `POST /api/drafts/:id/fields/confirm`
+- `POST /api/drafts/:id/outcomes/:outcomeId/confirm`
 - `POST /api/drafts/:id/blocks/:blockId/confirm`
 - `POST /api/drafts/:id/refinements`
 - `POST /api/proposals/:id/accept` or `/reject`

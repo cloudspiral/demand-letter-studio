@@ -81,7 +81,164 @@ test("template picker presents clean provenance and contains long names", async 
   await expectTitleContained(testCard);
 });
 
-test("complete high-fidelity evidence-grounded v1 workflow", async ({ page }) => {
+test("map v2 keeps the full letter visible while its queue filters and synchronizes", async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 720 });
+  const templateId = "10000000-0000-4000-8000-000000000010";
+  const makeBlock = (paragraphIndex: number, text: string, overrides: Record<string, unknown> = {}) => ({
+    id: `word/document.xml:p:${paragraphIndex}`,
+    paragraphIndex,
+    text,
+    role: "preserve",
+    semanticKind: "prose",
+    section: "Damages",
+    aiRecommendation: "keep",
+    confidence: 0.96,
+    style: "BodyText",
+    explanation: "Fixture recommendation.",
+    needsAttention: false,
+    anchor: { partName: "word/document.xml", kind: "paragraph", paragraphIndex, path: `/word/document.xml/paragraph[${paragraphIndex}]` },
+    structuredGroup: null,
+    figure: null,
+    inlineFields: [],
+    ...overrides,
+  });
+  const blocks = [
+    makeBlock(0, "DEMAND FOR JORDAN CANARY", {
+      role: "heading", semanticKind: "heading", section: "DEMAND FOR JORDAN CANARY",
+      inlineFields: [{ key: "heading_client", label: "Client name", start: 11, end: 24, originalText: "JORDAN CANARY", kind: "person", confidence: 1, explanation: "Old matter name.", source: "model", role: "replace" }],
+    }),
+    makeBlock(1, "Old narrative requiring review.", { role: "editable", aiRecommendation: "replace", confidence: 0.72, needsAttention: true }),
+    makeBlock(2, "MEDICAL EXPENSES", { role: "editable", aiRecommendation: "replace", structuredGroup: { id: "expenses", representation: "paragraph-rows", rowRole: "header", tableIndex: null, rowIndex: null, cellIndex: null, columnCount: 2, columnWidths: [] } }),
+    makeBlock(3, "Old Hospital:\t$9,000", { role: "editable", aiRecommendation: "replace", structuredGroup: { id: "expenses", representation: "paragraph-rows", rowRole: "body", tableIndex: null, rowIndex: 0, cellIndex: null, columnCount: 2, columnWidths: [] } }),
+    makeBlock(4, "[figure]", { role: "editable", semanticKind: "figure", aiRecommendation: "replace", figure: { relationshipId: "rId9", partName: "word/media/image1.png", contentType: "image/png", captionBlockId: "word/document.xml:p:5" } }),
+    makeBlock(5, "Photograph 1: old damage."),
+    makeBlock(6, "Reusable settlement boilerplate."),
+  ];
+  const template = {
+    id: templateId, name: "map-v2-fixture.docx", displayName: "Map v2 fixture", isTest: true, status: "analyzed",
+    analysis: {
+      analysisVersion: 5, filename: "map-v2-fixture.docx", paragraphCount: 7, sectionCount: 1,
+      hasMacros: false, hasTrackedChanges: false, hasComplexObjects: false, warnings: [],
+      regions: blocks, blocks, replacementCandidates: [], knownCaseSpecificValues: [],
+      imageCandidates: [{ blockId: "word/document.xml:p:4", paragraphIndex: 4, relationshipId: "rId9", partName: "word/media/image1.png", contentType: "image/png", captionBlockId: "word/document.xml:p:5" }],
+    },
+  };
+  await page.route("**/api/demo/status", (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ available: false }) }));
+  await page.route("**/api/templates", (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify([template]) }));
+  await page.route("**/api/intakes", (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ caseWorkspace: { id: "20000000-0000-4000-8000-000000000020" }, template }) }));
+
+  await page.goto("/");
+  await page.getByTitle("Map v2 fixture").click();
+  await page.locator(".source-drop-zone input").setInputFiles({ name: "case.pdf", mimeType: "application/pdf", buffer: Buffer.from("synthetic") });
+  await page.getByRole("button", { name: "Continue to template map" }).click();
+  await expect(page.getByRole("heading", { name: "Review template structure" })).toBeVisible();
+  await expect(page.locator(".map-document-block")).toHaveCount(7);
+  await expect(page.locator(".map-review-card")).toHaveCount(5);
+  await expect(page.locator(".map-review-card").filter({ hasText: "Structured group" })).toHaveCount(1);
+  await expect(page.locator(".map-review-card").filter({ hasText: "Evidence figure" })).toHaveCount(1);
+  const headingCard = page.locator(".map-review-card").filter({ hasText: "Locked heading" });
+  await expect(headingCard).toContainText("Client name");
+  await expect(headingCard.locator(".map-role-toggle")).toHaveCount(0);
+  await expect(page.getByText("All changes saved locally")).toBeVisible();
+  await expect(page).toHaveScreenshot("map-v2-1280x720.png", { animations: "disabled" });
+
+  await page.locator(".map-filters").getByRole("button", { name: "replace" }).click();
+  await expect(page.locator(".map-review-card")).toHaveCount(3);
+  await expect(page.locator(".map-document-block")).toHaveCount(7);
+  const narrativeDocument = page.locator('[data-review-unit="block:word/document.xml:p:1"]');
+  await narrativeDocument.click();
+  await expect(page.locator('[data-review-card="block:word/document.xml:p:1"]')).toHaveClass(/selected/);
+  await page.locator('[data-review-card="group:expenses"]').click();
+  await expect(page.locator('[data-review-unit="group:expenses"]').first()).toHaveClass(/selected/);
+
+  await page.locator(".map-filters").getByRole("button", { name: "keep" }).click();
+  const reusable = page.locator('[data-review-unit="block:word/document.xml:p:6"] p');
+  await reusable.evaluate((node) => {
+    const text = node.firstChild;
+    if (!text) throw new Error("No text node");
+    const range = document.createRange();
+    range.setStart(text, 0); range.setEnd(text, 8);
+    const selection = window.getSelection(); selection?.removeAllRanges(); selection?.addRange(range);
+    node.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+  });
+  await expect(page.locator(".map-selection-card")).toContainText("Reusable");
+  await page.getByRole("button", { name: "Add replacement field" }).click();
+  await expect(page.locator('[data-review-card="block:word/document.xml:p:6"]')).toContainText("Reusable");
+  await page.setViewportSize({ width: 1100, height: 720 });
+  await expect(page).toHaveScreenshot("map-v2-1100x720.png", { animations: "disabled" });
+});
+
+test("generated workbench defaults to Review and resolves one omission into an exportable version", async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 720 });
+  const matterId = "20000000-0000-4000-8000-000000000020";
+  const draftId = "30000000-0000-4000-8000-000000000030";
+  const outcomeId = "outcome:narrative-fixture";
+  let reviewReady = false;
+  let outcomeConfirmed = false;
+  const outcome = {
+    id: outcomeId, targetId: "narrative-fixture", targetKind: "narrative", status: "omitted_no_evidence",
+    resolution: outcomeConfirmed ? "confirmed" : "unresolved", citations: [], note: "No treatment records support this section.",
+    sourceId: null, page: null, sourceName: null, mediaType: null, caption: null, exemplarCount: 2, generatedCount: 0,
+  };
+  const content = () => ({
+    title: "Time-Limited Policy Limits Demand", matterName: "Synthetic matter", fields: {}, warnings: [], reviewFlags: [], outcomes: [{ ...outcome, resolution: outcomeConfirmed ? "confirmed" : "unresolved" }],
+    sections: [{ id: "letter", heading: null, blocks: [{ id: "keep-1", kind: "paragraph", text: "Reusable verified letter language.", templateParagraphIndex: 0, templateBlockId: "word/document.xml:p:0", citations: [], verified: true, userConfirmed: true, templateRole: "keep", locked: true, targetId: null, outcomeId: null }] }],
+  });
+  const readiness = () => ({
+    ready: outcomeConfirmed, blockIds: [], fieldKeys: [], outcomeIds: outcomeConfirmed ? [] : [outcomeId], duplicateParagraphIndexes: [], imageIssue: null,
+    staleEvidence: false, staleResolutionTargetIds: [], blockingReviewFlagIds: [],
+  });
+  const matter = () => ({
+    id: matterId, name: "Synthetic matter", templateId: "10000000-0000-4000-8000-000000000010", templateMapVersion: 1,
+    sources: [{ id: "40000000-0000-4000-8000-000000000040", matterId, name: "synthetic.pdf", mimeType: "application/pdf", pageCount: 1, status: "ready" }],
+    sourceFingerprint: "a".repeat(64),
+    evidenceReview: reviewReady ? { sourceFingerprint: "a".repeat(64), fieldProposals: [], reviewFlags: [], createdAt: new Date().toISOString() } : null,
+    evidenceReviewStale: false, activeDraft: null, reviewResolutions: [],
+    generationTargets: [{ id: "narrative-fixture", kind: "narrative", section: "Treatment history", blockIds: ["word/document.xml:p:1", "word/document.xml:p:2"], partName: "word/document.xml", exemplarCount: 2, minItems: 1, maxItems: 12, structuredGroupId: null, figure: null }],
+  });
+  await page.route("**/api/**", async (route) => {
+    const url = new URL(route.request().url());
+    const method = route.request().method();
+    if (url.pathname === "/api/templates") return route.fulfill({ contentType: "application/json", body: "[]" });
+    if (url.pathname === "/api/demo/status") return route.fulfill({ contentType: "application/json", body: JSON.stringify({ available: true }) });
+    if (url.pathname === "/api/demo/bootstrap") return route.fulfill({ contentType: "application/json", body: JSON.stringify({ matterId }) });
+    if (url.pathname === `/api/matters/${matterId}`) return route.fulfill({ contentType: "application/json", body: JSON.stringify(matter()) });
+    if (url.pathname === `/api/matters/${matterId}/activity`) return route.fulfill({ contentType: "application/json", body: "[]" });
+    if (url.pathname === `/api/matters/${matterId}/evidence-reviews` && method === "POST") return route.fulfill({ status: 202, contentType: "application/json", body: JSON.stringify({ jobId: "review-job", status: "queued" }) });
+    if (url.pathname === "/api/jobs/review-job/events") {
+      reviewReady = true;
+      return route.fulfill({ contentType: "text/event-stream", body: "event: completed\ndata: {\"progress\":100,\"step\":\"Evidence review ready\"}\n\n" });
+    }
+    if (url.pathname === `/api/matters/${matterId}/generations` && method === "POST") return route.fulfill({ status: 202, contentType: "application/json", body: JSON.stringify({ jobId: "generation-job", status: "queued" }) });
+    if (url.pathname === "/api/jobs/generation-job/events") return route.fulfill({ contentType: "text/event-stream", body: `event: completed\ndata: {\"progress\":100,\"step\":\"Draft ready\",\"draftId\":\"${draftId}\"}\n\n` });
+    if (url.pathname === `/api/drafts/${draftId}`) return route.fulfill({ contentType: "application/json", body: JSON.stringify({ id: draftId, matterId, version: outcomeConfirmed ? 2 : 1, content: content(), readiness: readiness(), sourceFingerprint: "a".repeat(64), createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }) });
+    if (url.pathname === `/api/drafts/${draftId}/outcomes/${encodeURIComponent(outcomeId)}/confirm` && method === "POST") {
+      outcomeConfirmed = true;
+      return route.fulfill({ contentType: "application/json", body: JSON.stringify({ id: draftId, matterId, version: 2, content: content(), readiness: readiness(), sourceFingerprint: "a".repeat(64), createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }) });
+    }
+    return route.fulfill({ status: 404, contentType: "application/json", body: JSON.stringify({ error: `Unhandled ${method} ${url.pathname}` }) });
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: /Use the supplied Steno sample packet/ }).click();
+  await expect(page.getByRole("button", { name: "Generate attorney-review draft" })).toBeVisible();
+  await page.getByRole("button", { name: "Generate attorney-review draft" }).click();
+  await expect(page.locator(".letter-paper")).toBeVisible();
+  await expect(page.locator(".panel-tabs button.active")).toHaveText("Review");
+  await expect(page.getByRole("button", { name: "1 blocking · Review" })).toBeVisible();
+  await expect(page).toHaveScreenshot("generated-review-1280x720.png", { animations: "disabled" });
+  const marker = page.locator(`[data-outcome-marker="${outcomeId}"]`);
+  await marker.click();
+  await expect(page.locator(`[data-review-item="${outcomeId}"]`)).toHaveClass(/selected/);
+  await page.getByRole("button", { name: "Approve omission" }).click();
+  await expect(page.locator(".matter-breadcrumb")).toContainText("Draft v2");
+  await expect(page.getByRole("link", { name: "Export to Word" })).toBeVisible();
+  await expect(page.locator(`[data-review-item="${outcomeId}"]`)).toContainText("Confirmed omission");
+  await page.setViewportSize({ width: 1100, height: 720 });
+  await expect(page).toHaveScreenshot("generated-review-1100x720.png", { animations: "disabled" });
+});
+
+test("complete high-fidelity evidence-grounded schema-v2 workflow", async ({ page }) => {
   const generationTimeout = Number(process.env.E2E_GENERATION_TIMEOUT_MS ?? 180_000);
   let sourcePaths: string[] = [];
   await page.goto("/");
@@ -91,21 +248,29 @@ test("complete high-fidelity evidence-grounded v1 workflow", async ({ page }) =>
   const templatePath = process.env.E2E_TEMPLATE_PATH
     ? path.resolve(process.env.E2E_TEMPLATE_PATH)
     : path.resolve(process.cwd(), "../../AAA Insurance - Time Limited Policy Limits Demand - Pat Donahue.docx");
-  await page.locator(".upload-template-card input").setInputFiles(templatePath);
-  await expect(page.getByRole("heading", { name: "Confirm what AI may replace" })).toBeVisible({ timeout: 30_000 });
-  await expect(page.locator(".region-review-row").first()).toBeVisible();
-  await page.getByRole("button", { name: "Confirm regions" }).click();
-  await expect(page.getByRole("dialog")).toBeHidden();
 
   if (process.env.E2E_SOURCE_DIR) {
     sourcePaths = fs.readdirSync(process.env.E2E_SOURCE_DIR)
       .filter((name) => /\.(pdf|png|jpe?g|webp)$/i.test(name))
       .sort()
       .map((name) => path.join(process.env.E2E_SOURCE_DIR as string, name));
-    expect(sourcePaths).toHaveLength(5);
+    expect(sourcePaths).toHaveLength(7);
+    await page.locator(".upload-template-card input").setInputFiles(templatePath);
     await page.locator(".source-drop-zone input").setInputFiles(sourcePaths);
-    await expect(page.getByText("5 selected", { exact: true })).toBeVisible();
-    await page.getByRole("button", { name: "Review evidence" }).click();
+    await expect(page.getByText(`${sourcePaths.length} selected`, { exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "Continue to template map" }).click();
+    const mapHeading = page.getByRole("heading", { name: "Review template structure" });
+    const evidenceHeading = page.getByRole("heading", { name: /Reviewing source coverage|Review the source packet before drafting/ });
+    await expect(mapHeading.or(evidenceHeading)).toBeVisible({ timeout: generationTimeout });
+    if (await mapHeading.isVisible()) {
+      await expect(page.getByText(/complete original letter stays visible/i)).toBeVisible();
+      await expect(page.locator(".map-document-block").first()).toBeVisible();
+      while (await page.locator(".map-review-card.attention .map-recommendation button").count()) {
+        await page.locator(".map-review-card.attention .map-recommendation button").first().click();
+      }
+      await page.getByRole("button", { name: "Confirm map" }).click();
+      await expect(page.getByRole("dialog")).toBeHidden();
+    }
   } else {
     await page.getByRole("button", { name: /Use the supplied Steno sample packet/ }).click();
   }
@@ -130,26 +295,28 @@ test("complete high-fidelity evidence-grounded v1 workflow", async ({ page }) =>
 
   let currentVersion = 1;
   await page.locator(".source-strip > button").last().click();
-  await expect(page.locator(".drawer-source")).toHaveCount(5);
+  await expect(page.locator(".drawer-source")).toHaveCount(sourcePaths.length || 5);
 
   const supplementalPdf = sourcePaths.find((sourcePath) => /\.pdf$/i.test(sourcePath));
   if (supplementalPdf) {
     await page.locator(".drawer-evidence-actions input").setInputFiles(supplementalPdf);
-    await expect(page.getByText(/predates the current source set/i)).toBeVisible({ timeout: 30_000 });
+    await expect(page.locator(".drawer-stale")).toContainText(/predates the current source set/i, { timeout: 30_000 });
     const staleDraftResponse = await page.request.get(`/api/drafts/${draftId}`);
     const staleExportResponse = await page.request.get(`/api/drafts/${draftId}/export.docx`);
     expect(staleDraftResponse.ok()).toBe(true);
     expect(staleExportResponse.status()).toBe(409);
     expect((await staleExportResponse.json()).issues).toEqual((await staleDraftResponse.json()).readiness);
-    await expect(page.getByRole("button", { name: /Regenerate v2/ })).toBeVisible({ timeout: generationTimeout });
+    await expect(page.locator(".drawer-source")).toHaveCount((sourcePaths.length || 5) + 1);
+    const staleRegeneration = await page.request.post(generationResponse.url(), {
+      data: { draftId, baseVersion: 2 },
+    });
+    expect(staleRegeneration.status()).toBe(409);
+    await page.locator(".source-drawer .icon-button").click();
+    await page.getByRole("button", { name: "Review", exact: true }).click();
     await page.getByRole("button", { name: /Regenerate v2/ }).click();
     currentVersion = 2;
     await expect(page.locator(".matter-breadcrumb").getByText("Draft v2", { exact: true })).toBeVisible({ timeout: generationTimeout });
-    await expect(page.locator(".drawer-source")).toHaveCount(6);
-    const staleRegeneration = await page.request.post(generationResponse.url(), {
-      data: { draftId, baseVersion: 1 },
-    });
-    expect(staleRegeneration.status()).toBe(409);
+    await page.locator(".source-strip > button").last().click();
   }
 
   await page.locator(".source-drawer .icon-button").click();
@@ -165,19 +332,20 @@ test("complete high-fidelity evidence-grounded v1 workflow", async ({ page }) =>
 
   let fieldKey: string | null = null;
   let confirmedFieldCount = 0;
-  while (await page.locator(".merge-field.low-confidence").count() > 0) {
-    const field = page.locator(".merge-field.low-confidence").first();
-    fieldKey ??= await field.locator("label span").textContent();
+  await page.getByRole("button", { name: "Review", exact: true }).click();
+  while (await page.locator(".review-field-input").count() > 0) {
+    const field = page.locator(".review-field-input").first();
+    fieldKey ??= (await field.locator("xpath=ancestor::article[1]").locator("h3").textContent())?.replaceAll(" ", "_") ?? null;
     confirmedFieldCount += 1;
     await field.locator("input").fill(process.env.E2E_CONFIRMED_FIELD_VALUE ?? `REVIEWED-TEST-${String(confirmedFieldCount).padStart(3, "0")}`);
-    await field.getByRole("button", { name: "Confirm" }).click();
+    await field.locator("xpath=ancestor::article[1]").getByRole("button", { name: "Confirm field" }).click();
     currentVersion += 1;
     await expect(page.locator(".matter-breadcrumb").getByText(`Draft v${currentVersion}`, { exact: true })).toBeVisible();
   }
 
   let unresolvedIndex = 0;
   while (await page.locator(".draft-block.unsupported").count() > 0) {
-    await expect(page.getByRole("button", { name: "Export to Word" })).toBeDisabled();
+    await expect(page.getByRole("button", { name: /blocking · Review/ })).toBeVisible();
     const unsupportedEditor = page.locator(".draft-block.unsupported .block-editor").first();
     await unsupportedEditor.fill(`Attorney-reviewed synthetic replacement ${unresolvedIndex + 1}. This text is for automated verification only.`);
     await page.locator(".letterhead").click();
@@ -191,12 +359,12 @@ test("complete high-fidelity evidence-grounded v1 workflow", async ({ page }) =>
     await expect(page.locator(".matter-breadcrumb").getByText(`Draft v${currentVersion}`, { exact: true })).toBeVisible();
   }
 
-  const firstEditor = page.locator(".block-editor").first();
+  const firstEditor = page.locator(".block-editor[contenteditable='true']").first();
   await firstEditor.fill("The enclosed records very clearly document the charges reflected in the source materials.");
   await page.locator(".letterhead").click();
   currentVersion += 1;
   await expect(page.locator(".matter-breadcrumb").getByText(`Draft v${currentVersion}`, { exact: true })).toBeVisible();
-  await page.locator(".draft-block").first().getByRole("button", { name: "Confirm reviewed text" }).click();
+  await firstEditor.locator("xpath=ancestor::div[contains(@class,'draft-block')][1]").getByRole("button", { name: "Confirm reviewed text" }).click();
   await page.locator(".confirmation-note textarea").fill("Reviewed the direct edit against the cited source material.");
   await page.getByRole("dialog").getByRole("button", { name: "Confirm reviewed text" }).click();
   currentVersion += 1;
@@ -209,7 +377,7 @@ test("complete high-fidelity evidence-grounded v1 workflow", async ({ page }) =>
   expect(staleConfirmation.status()).toBe(409);
 
   await selectText(page, firstEditor, 4, 29);
-  const secondEditor = page.locator(".block-editor").nth(1);
+  const secondEditor = page.locator(".block-editor[contenteditable='true']").nth(1);
   await selectText(page, secondEditor, 0, 24);
   await expect(page.locator(".annotation-chip")).toHaveCount(2);
 

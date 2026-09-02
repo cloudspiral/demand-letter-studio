@@ -13,10 +13,10 @@ import type {
   ActivityResponse, DraftResponse, JobResponse, MatterResponse, ProposalResponse, TemplateResponse,
 } from "./types";
 
-type WorkspaceTab = "refine" | "activity";
+type WorkspaceTab = "review" | "refine" | "activity";
 type ChatMessage = { role: "user" | "assistant"; text: string; annotationCount?: number };
 type SelectionPopover = RefinementAnnotation & { x: number; y: number };
-type SelectedSource = { sourceId: string; sourceName: string; page: number; text: string; mimeType?: string };
+type SelectedSource = { sourceId: string; sourceName: string; page: number; text: string; mimeType?: string; extractionMethod?: string; extractionStatus?: string; confidence?: number | null; visualInput?: boolean };
 
 function blockDoc(text: string) {
   return text
@@ -95,7 +95,7 @@ function BlockEditor({
   }, [block.text, editor, edits.length]);
 
   const captureSelection = (event: React.MouseEvent<HTMLDivElement>) => {
-    if (edits.length) return;
+    if (edits.length || disabled || block.templateRole === "keep") return;
     const selection = window.getSelection();
     const root = event.currentTarget.querySelector<HTMLElement>(".ProseMirror");
     if (!selection || selection.rangeCount === 0 || selection.isCollapsed || !root || !root.contains(selection.anchorNode)) return;
@@ -111,7 +111,7 @@ function BlockEditor({
   };
 
   return (
-    <div className={`draft-block ${active ? "active" : ""} ${block.kind === "warning" ? "unsupported" : ""}`} onClick={onFocus}>
+    <div data-draft-block={block.id} className={`draft-block ${active ? "active" : ""} ${block.kind === "warning" ? "unsupported" : ""}`} onClick={onFocus}>
       {block.kind === "warning" && <CircleAlert className="warning-icon" size={15} aria-label="Attorney review required" />}
       {edits.length
         ? <div className="block-editor proposal-render" aria-label={`Proposed changes for ${block.id}`}>{renderProposedText(block.text, edits)}</div>
@@ -128,80 +128,285 @@ function BlockEditor({
           </button>
         ))}
         {!block.verified && !block.userConfirmed && <span className="needs-review">Attorney review required</span>}
-        {block.userConfirmed && <span className="attorney-confirmed">Attorney confirmed</span>}
+        {block.templateRole === "keep" ? <span className="template-kept">Exact template language</span> : block.userConfirmed && <span className="attorney-confirmed">Attorney confirmed</span>}
         {!block.verified && !block.userConfirmed && <button className="confirm-block" onClick={(event) => { event.stopPropagation(); onConfirm(); }}><Check size={12} /> Confirm reviewed text</button>}
       </div>
     </div>
   );
 }
 
+type TemplateReviewUnit = {
+  id: string;
+  kind: "block" | "heading" | "structured" | "figure";
+  blockIds: string[];
+  title: string;
+};
+
 function RegionReviewModal({ template, onCancel, onConfirmed }: {
   template: TemplateResponse;
   onCancel: () => void;
   onConfirmed: (template: TemplateResponse) => void;
 }) {
-  const [regions, setRegions] = useState<TemplateRegion[]>(template.confirmedRegions ?? template.analysis.regions);
+  const storageKey = `steno-template-map-v2:${template.id}`;
+  const sourceBlocks = template.confirmedMap?.blocks
+    ?? (template.analysis.blocks?.length ? template.analysis.blocks : template.confirmedRegions ?? template.analysis.regions);
+  const normalized = sourceBlocks.map((block) => ({
+    ...block,
+    inlineFields: block.inlineFields ?? [],
+    id: block.id ?? `${block.anchor?.partName ?? "word/document.xml"}:p:${block.paragraphIndex}`,
+  }));
+  const [blocks, setBlocks] = useState<TemplateRegion[]>(() => {
+    try {
+      const saved = window.localStorage.getItem(storageKey);
+      return saved ? JSON.parse(saved) as TemplateRegion[] : normalized;
+    } catch {
+      return normalized;
+    }
+  });
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [filter, setFilter] = useState<"all" | "attention" | "replace" | "keep">("all");
+  const [selectedSpan, setSelectedSpan] = useState<{ blockId: string; start: number; end: number; text: string } | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const counts = useMemo(() => ({
-    editable: regions.filter((region) => region.role === "editable").length,
-    preserve: regions.filter((region) => region.role === "preserve").length,
-    heading: regions.filter((region) => region.role === "heading").length,
-  }), [regions]);
+  const [saveState, setSaveState] = useState("All changes saved locally");
+
+  const blockById = useMemo(() => new Map(blocks.map((block) => [block.id!, block])), [blocks]);
+  const captionIds = useMemo(() => new Set(blocks.flatMap((block) => block.figure?.captionBlockId ? [block.figure.captionBlockId] : [])), [blocks]);
+  const units = useMemo<TemplateReviewUnit[]>(() => {
+    const result: TemplateReviewUnit[] = [];
+    const seenGroups = new Set<string>();
+    blocks.forEach((block) => {
+      if (captionIds.has(block.id!)) return;
+      if (block.structuredGroup) {
+        if (seenGroups.has(block.structuredGroup.id)) return;
+        seenGroups.add(block.structuredGroup.id);
+        const members = blocks.filter((candidate) => candidate.structuredGroup?.id === block.structuredGroup?.id);
+        result.push({
+          id: `group:${block.structuredGroup.id}`,
+          kind: "structured",
+          blockIds: members.map((member) => member.id!),
+          title: block.section || "Structured expense section",
+        });
+        return;
+      }
+      if (block.semanticKind === "figure") {
+        result.push({ id: `figure:${block.id}`, kind: "figure", blockIds: [block.id!], title: block.section || "Evidence figure" });
+        return;
+      }
+      if (block.semanticKind === "heading") {
+        if (block.inlineFields?.length) result.push({ id: `heading:${block.id}`, kind: "heading", blockIds: [block.id!], title: block.text });
+        return;
+      }
+      result.push({ id: `block:${block.id}`, kind: "block", blockIds: [block.id!], title: block.section || "Letter content" });
+    });
+    return result;
+  }, [blocks, captionIds]);
+
+  const unitBlocks = (unit: TemplateReviewUnit) => unit.blockIds.map((id) => blockById.get(id)).filter((block): block is TemplateRegion => Boolean(block));
+  const unitRole = (unit: TemplateReviewUnit) => unit.kind === "heading"
+    ? "heading"
+    : unitBlocks(unit).some((block) => block.role === "editable") ? "editable" : "preserve";
+  const unitNeedsAttention = (unit: TemplateReviewUnit) => unitBlocks(unit).some((block) => (
+    block.needsAttention || (block.inlineFields ?? []).some((field) => field.confidence < 0.8)
+  ));
+  const orderedUnits = useMemo(() => [...units].sort((left, right) => {
+    const rank = (unit: TemplateReviewUnit) => unitNeedsAttention(unit) ? 0 : unitRole(unit) === "editable" ? 1 : 2;
+    return rank(left) - rank(right);
+  }), [units, blockById]);
+  const visibleUnits = orderedUnits.filter((unit) => (
+    filter === "all"
+    || (filter === "attention" && unitNeedsAttention(unit))
+    || (filter === "replace" && unitRole(unit) === "editable")
+    || (filter === "keep" && unitRole(unit) === "preserve")
+  ));
+  const countedUnits = units.filter((unit) => unit.kind !== "heading");
+  const replaceCount = countedUnits.filter((unit) => unitRole(unit) === "editable").length;
+  const keepCount = countedUnits.filter((unit) => unitRole(unit) === "preserve").length;
+  const attentionCount = units.filter(unitNeedsAttention).length;
+
+  useEffect(() => {
+    setSaveState("Saving…");
+    const timer = window.setTimeout(() => {
+      window.localStorage.setItem(storageKey, JSON.stringify(blocks));
+      setSaveState("All changes saved locally");
+    }, 350);
+    return () => window.clearTimeout(timer);
+  }, [blocks, storageKey]);
+
+  const updateIds = (ids: string[], update: (block: TemplateRegion) => TemplateRegion) => {
+    const selected = new Set(ids);
+    setBlocks((current) => current.map((block) => selected.has(block.id!) ? update(block) : block));
+  };
+  const selectUnit = (unit: TemplateReviewUnit, origin: "document" | "queue") => {
+    setActiveId(unit.id);
+    const selector = origin === "document" ? `[data-review-card="${CSS.escape(unit.id)}"]` : `[data-review-unit="${CSS.escape(unit.id)}"]`;
+    window.setTimeout(() => document.querySelector(selector)?.scrollIntoView({ behavior: "smooth", block: "center" }), 0);
+  };
+  const unitForBlock = (block: TemplateRegion) => units.find((unit) => unit.blockIds.includes(block.id!));
+  const setUnitRole = (unit: TemplateReviewUnit, role: "preserve" | "editable") => {
+    if (unit.kind === "heading") return;
+    updateIds(unit.blockIds, (block) => ({ ...block, role, aiRecommendation: role === "editable" ? "replace" : "keep", confidence: 1, needsAttention: false }));
+  };
+  const acceptRecommendation = (unit: TemplateReviewUnit) => updateIds(unit.blockIds, (block) => ({ ...block, needsAttention: false, confidence: Math.max(0.8, block.confidence) }));
+
+  const captureTemplateSelection = (event: React.MouseEvent<HTMLElement>, block: TemplateRegion) => {
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || selection.rangeCount !== 1 || !event.currentTarget.contains(selection.anchorNode)) return;
+    const range = selection.getRangeAt(0);
+    const prefix = document.createRange();
+    prefix.selectNodeContents(event.currentTarget);
+    prefix.setEnd(range.startContainer, range.startOffset);
+    const start = prefix.toString().length;
+    const text = selection.toString();
+    if (!text.trim() || block.text.slice(start, start + text.length) !== text) return;
+    const overlaps = (block.inlineFields ?? []).some((field) => start < field.end && start + text.length > field.start);
+    if (overlaps) { setError("That selection overlaps an existing inline field."); return; }
+    setSelectedSpan({ blockId: block.id!, start, end: start + text.length, text });
+    const unit = unitForBlock(block);
+    if (unit) selectUnit(unit, "document");
+  };
+  const addInlineField = () => {
+    if (!selectedSpan) return;
+    const sequence = blocks.flatMap((block) => block.inlineFields ?? []).length + 1;
+    updateIds([selectedSpan.blockId], (block) => ({
+      ...block,
+      inlineFields: [...(block.inlineFields ?? []), {
+        key: `custom_field_${sequence}`,
+        label: selectedSpan.text.trim().slice(0, 80),
+        start: selectedSpan.start,
+        end: selectedSpan.end,
+        originalText: selectedSpan.text,
+        kind: "other",
+        confidence: 1,
+        explanation: "Added during template confirmation.",
+        source: "user",
+        role: "replace",
+      }],
+    }));
+    setSelectedSpan(null);
+    window.getSelection()?.removeAllRanges();
+  };
+  const renderAnnotatedText = (block: TemplateRegion) => {
+    const fields = [...(block.inlineFields ?? [])].sort((left, right) => left.start - right.start);
+    if (!fields.length) return block.text;
+    const nodes: ReactNode[] = [];
+    let cursor = 0;
+    fields.forEach((field) => {
+      nodes.push(<span key={`${field.key}:before`}>{block.text.slice(cursor, field.start)}</span>);
+      nodes.push(<mark className={`template-inline-field ${field.role}`} key={field.key}>{block.text.slice(field.start, field.end)}</mark>);
+      cursor = field.end;
+    });
+    nodes.push(<span key="after">{block.text.slice(cursor)}</span>);
+    return nodes;
+  };
 
   const confirm = async () => {
     setBusy(true); setError(null);
     try {
       const confirmed = await api<TemplateResponse>(`/api/templates/${template.id}/confirm`, {
-        method: "POST", body: JSON.stringify({ regions }),
+        method: "POST", body: JSON.stringify({ schemaVersion: 2, blocks }),
       });
+      window.localStorage.removeItem(storageKey);
       onConfirmed(confirmed);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Template confirmation failed");
     } finally { setBusy(false); }
   };
 
-  return (
-    <div className="modal-backdrop" role="presentation">
-      <section className="region-modal" role="dialog" aria-modal="true" aria-labelledby="region-title">
-        <div className="modal-head">
-          <div><p className="eyebrow">Template safety check</p><h2 id="region-title">Confirm what AI may replace</h2></div>
-          <button className="icon-button" onClick={onCancel} aria-label="Close template review"><X size={18} /></button>
+  return <div className="map-workbench" role="dialog" aria-modal="true" aria-labelledby="map-title">
+    <header className="map-header">
+      <button className="map-back" onClick={onCancel}><ArrowLeft size={16} /> Back</button>
+      <div className="map-title"><p className="eyebrow">Template map</p><h1 id="map-title">Review template structure</h1><span>{templateDisplayName(template)}</span></div>
+      <div className="map-progress" aria-label={`${attentionCount} items need attention`}>
+        <div><strong>{replaceCount + keepCount}</strong><span>mapped</span></div>
+        <div><strong className={attentionCount ? "amber" : "green"}>{attentionCount}</strong><span>attention</span></div>
+        <small>{saveState}</small>
+      </div>
+      <button className="primary map-confirm" onClick={() => void confirm()} disabled={busy || attentionCount > 0}>
+        {busy ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />} Confirm map
+      </button>
+    </header>
+    <div className="map-grid">
+      <main className="map-document-scroll">
+        <div className="map-guidance"><FileText size={15} /><span>The complete original letter stays visible. Select any passage to review it, or highlight exact text to create a replacement field.</span></div>
+        <article className="map-paper">
+          {blocks.map((block) => {
+            if (block.anchor?.partName && block.anchor.partName !== "word/document.xml" && block.anchor.kind !== "header") return null;
+            const unit = unitForBlock(block);
+            const role = block.role === "editable" ? "replace" : block.role === "heading" ? "heading" : "keep";
+            return <section
+              className={`map-document-block ${role} ${unit && activeId === unit.id ? "selected" : ""} ${block.needsAttention ? "attention" : ""}`}
+              data-review-unit={unit?.id}
+              key={block.id}
+              onClick={() => unit && selectUnit(unit, "document")}
+            >
+              {unit && <span className="map-block-pill">{unit.kind === "structured" ? "Group" : unit.kind === "figure" ? "Figure" : role}</span>}
+              {block.semanticKind === "figure"
+                ? <div className="map-figure-placeholder"><FileText size={22} /><strong>Mapped evidence figure</strong><span>{block.figure?.partName}</span></div>
+                : <p
+                    onMouseUp={(event) => captureTemplateSelection(event, block)}
+                    style={{
+                      textAlign: block.formatting?.alignment === "center" ? "center" : block.formatting?.alignment === "right" ? "right" : "left",
+                      fontWeight: block.formatting?.bold || block.semanticKind === "heading" ? 700 : undefined,
+                      fontStyle: block.formatting?.italic ? "italic" : undefined,
+                    }}
+                  >{renderAnnotatedText(block)}</p>}
+            </section>;
+          })}
+        </article>
+      </main>
+      <aside className="map-queue">
+        <div className="map-queue-sticky">
+          <div><p className="eyebrow">Review queue</p><strong>{visibleUnits.length} {visibleUnits.length === 1 ? "item" : "items"}</strong></div>
+          <div className="map-filters">
+            {(["all", "attention", "replace", "keep"] as const).map((value) => <button className={filter === value ? "active" : ""} key={value} onClick={() => setFilter(value)}>{value}</button>)}
+          </div>
         </div>
-        <p className="modal-copy">Case-specific text must be replaceable; reusable legal language should stay preserved. Review the detected regions before this template can be used.</p>
-        <div className="region-summary">
-          <span><strong>{counts.editable}</strong> replaceable</span>
-          <span><strong>{counts.preserve}</strong> preserved</span>
-          <span><strong>{counts.heading}</strong> headings</span>
+        {selectedSpan && <div className="map-selection-card"><small>Selected text</small><q>{selectedSpan.text}</q><button onClick={addInlineField}><Plus size={13} /> Add replacement field</button></div>}
+        <div className="map-card-list">
+          {visibleUnits.map((unit) => {
+            const members = unitBlocks(unit);
+            const first = members[0]!;
+            const role = unitRole(unit);
+            const attention = unitNeedsAttention(unit);
+            const fields = members.flatMap((block) => (block.inlineFields ?? []).map((field) => ({ block, field })));
+            return <article
+              className={`map-review-card ${role} ${attention ? "attention" : ""} ${activeId === unit.id ? "selected" : ""}`}
+              data-review-card={unit.id}
+              key={unit.id}
+              onClick={() => selectUnit(unit, "queue")}
+            >
+              <div className="map-card-heading">
+                <span>{unit.kind === "structured" ? "Structured group" : unit.kind === "figure" ? "Evidence figure" : unit.kind === "heading" ? "Locked heading" : "Content block"}</span>
+                <i>{attention ? "Attention" : role === "editable" ? "Replace" : unit.kind === "heading" ? "Heading" : "Keep"}</i>
+              </div>
+              <h2>{unit.title}</h2>
+              <p>{unit.kind === "structured" ? `${members.length} mapped rows are handled as one 0-N group, including total-row formatting.` : unit.kind === "figure" ? "Replace only with an uploaded evidence image and a source-grounded caption, or omit the figure and caption together." : first.text}</p>
+              {unit.kind !== "heading" && <div className="map-role-toggle">
+                <button className={role === "preserve" ? "active keep" : ""} onClick={(event) => { event.stopPropagation(); setUnitRole(unit, "preserve"); }}><Check size={12} /> Keep</button>
+                <button className={role === "editable" ? "active replace" : ""} onClick={(event) => { event.stopPropagation(); setUnitRole(unit, "editable"); }}><Sparkles size={12} /> Replace</button>
+              </div>}
+              {attention && <div className="map-recommendation"><CircleAlert size={14} /><span><strong>Review recommendation · {Math.round(first.confidence * 100)}%</strong>{first.explanation || "Confirm the appropriate map decision."}</span><button onClick={(event) => { event.stopPropagation(); acceptRecommendation(unit); }}>Accept</button></div>}
+              {fields.length > 0 && <div className={`map-field-list ${role === "preserve" && unit.kind !== "heading" ? "parent-kept" : ""}`}>
+                <strong>Inline fields</strong>
+                {fields.map(({ block, field }) => <div className="map-field-row" key={field.key}>
+                  <span><b>{field.label}</b><code>{field.originalText}</code></span>
+                  <div>
+                    <button disabled={role === "preserve" && unit.kind !== "heading"} className={field.role === "keep" ? "active" : ""} onClick={(event) => { event.stopPropagation(); updateIds([block.id!], (candidate) => ({ ...candidate, inlineFields: candidate.inlineFields?.map((item) => item.key === field.key ? { ...item, role: "keep" } : item) })); }}>Keep</button>
+                    <button disabled={role === "preserve" && unit.kind !== "heading"} className={field.role === "replace" ? "active" : ""} onClick={(event) => { event.stopPropagation(); updateIds([block.id!], (candidate) => ({ ...candidate, inlineFields: candidate.inlineFields?.map((item) => item.key === field.key ? { ...item, role: "replace" } : item) })); }}>Replace</button>
+                    {field.source === "user" && <button aria-label={`Remove ${field.label}`} onClick={(event) => { event.stopPropagation(); updateIds([block.id!], (candidate) => ({ ...candidate, inlineFields: candidate.inlineFields?.filter((item) => item.key !== field.key) })); }}><X size={11} /></button>}
+                  </div>
+                </div>)}
+                {role === "preserve" && unit.kind !== "heading" && <small>Child field choices are saved but inactive while the parent block is Keep.</small>}
+              </div>}
+            </article>;
+          })}
+          {!visibleUnits.length && <div className="map-empty"><Check size={18} /><span>No queue items match this filter. The complete template remains visible.</span></div>}
         </div>
-        <div className="region-review-list">
-          {regions.map((region) => (
-            <div className="region-review-row" key={region.paragraphIndex}>
-              <select
-                aria-label={`Role for paragraph ${region.paragraphIndex + 1}`}
-                value={region.role}
-                onChange={(event) => setRegions((current) => current.map((candidate) => candidate.paragraphIndex === region.paragraphIndex
-                  ? { ...candidate, role: event.target.value as TemplateRegion["role"], confidence: 1 }
-                  : candidate))}
-              >
-                <option value="editable">Replace</option>
-                <option value="preserve">Preserve</option>
-                <option value="heading">Heading</option>
-              </select>
-              <span>{region.text}</span>
-            </div>
-          ))}
-        </div>
-        {error && <div className="error-banner"><CircleAlert size={16} />{error}</div>}
-        <div className="modal-actions">
-          <button className="secondary" onClick={onCancel}>Cancel</button>
-          <button className="primary" onClick={() => void confirm()} disabled={busy || counts.editable === 0}>
-            {busy ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />} Confirm regions
-          </button>
-        </div>
-      </section>
+        {error && <div className="error-banner map-error"><CircleAlert size={15} />{error}</div>}
+      </aside>
     </div>
-  );
+  </div>;
 }
 
 function ReviewFlagList({ flags, blockingIds, onCitation, onTarget }: {
@@ -245,6 +450,8 @@ function ConfirmBlockModal({ block, busy, onCancel, onConfirm }: {
 function Setup({ onReady }: { onReady: (matterId: string, autoReview: boolean) => Promise<void> }) {
   const [templates, setTemplates] = useState<TemplateResponse[]>([]);
   const [selected, setSelected] = useState<TemplateResponse | null>(null);
+  const [pendingTemplate, setPendingTemplate] = useState<File | null>(null);
+  const [pendingCaseWorkspaceId, setPendingCaseWorkspaceId] = useState<string | null>(null);
   const [review, setReview] = useState<TemplateResponse | null>(null);
   const [query, setQuery] = useState("");
   const [files, setFiles] = useState<File[]>([]);
@@ -260,18 +467,14 @@ function Setup({ onReady }: { onReady: (matterId: string, autoReview: boolean) =
 
   const filtered = templates.filter((template) => templateDisplayName(template).toLowerCase().includes(query.toLowerCase()));
   const chooseTemplate = (template: TemplateResponse) => {
-    if (template.status === "analyzed") setReview(template);
-    else setSelected(template);
+    setPendingTemplate(null);
+    setSelected(template);
   };
 
-  const uploadTemplate = async (file: File) => {
-    setBusy(true); setBusyLabel("Analyzing template…"); setError(null);
-    try {
-      const template = await upload<TemplateResponse>("/api/templates", [file]);
-      setTemplates((current) => [template, ...current]);
-      setReview(template);
-    } catch (caught) { setError(caught instanceof Error ? caught.message : "Template analysis failed"); }
-    finally { setBusy(false); }
+  const uploadTemplate = (file: File) => {
+    setSelected(null);
+    setPendingTemplate(file);
+    setError(null);
   };
 
   const addFiles = (incoming: File[]) => setFiles((current) => {
@@ -281,16 +484,33 @@ function Setup({ onReady }: { onReady: (matterId: string, autoReview: boolean) =
   });
 
   const generate = async () => {
-    if (!selected || !files.length) return;
+    if ((!selected && !pendingTemplate) || !files.length) return;
+    if (pendingCaseWorkspaceId && selected?.status === "analyzed") {
+      setReview(selected);
+      return;
+    }
     setBusy(true); setError(null);
     try {
-      setBusyLabel("Creating matter…");
-      const matter = await api<{ id: string }>("/api/matters", {
-        method: "POST", body: JSON.stringify({ name: `${templateLabel(selected.name)} matter`, templateId: selected.id }),
-      });
-      setBusyLabel(`Extracting ${files.length} source ${files.length === 1 ? "document" : "documents"}…`);
-      await upload(`/api/matters/${matter.id}/sources`, files);
-      await onReady(matter.id, true);
+      setBusyLabel("Analyzing the template and extracting the complete case packet…");
+      const form = new FormData();
+      const caseLabel = templateLabel(selected?.name ?? pendingTemplate?.name ?? "New case");
+      form.append("caseName", `${caseLabel} case workspace`);
+      if (selected) form.append("templateId", selected.id);
+      if (pendingTemplate) form.append("template", pendingTemplate);
+      files.forEach((file) => form.append("sources", file));
+      const intake = await api<{
+        caseWorkspace: { id: string };
+        template: TemplateResponse;
+      }>("/api/intakes", { method: "POST", body: form });
+      setTemplates((current) => [intake.template, ...current.filter((template) => template.id !== intake.template.id)]);
+      if (intake.template.status === "confirmed") {
+        await onReady(intake.caseWorkspace.id, true);
+      } else {
+        setSelected(intake.template);
+        setPendingTemplate(null);
+        setPendingCaseWorkspaceId(intake.caseWorkspace.id);
+        setReview(intake.template);
+      }
     } catch (caught) { setError(caught instanceof Error ? caught.message : "Matter setup failed"); }
     finally { setBusy(false); }
   };
@@ -320,20 +540,24 @@ function Setup({ onReady }: { onReady: (matterId: string, autoReview: boolean) =
             <label className="template-search"><Search size={14} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search templates…" /></label>
           </div>
           <div className="template-grid">
-            <label className="template-card upload-template-card">
-              <input type="file" accept=".docx" onChange={(event) => event.target.files?.[0] && void uploadTemplate(event.target.files[0])} />
-              <div className="template-tag"><span>Upload your own</span><Plus size={17} /></div>
-              <strong>Use a firm template or completed letter</strong>
-              <small>Upload a reviewed DOCX. You will confirm which regions AI may replace.</small>
+            <label className={`template-card upload-template-card ${pendingTemplate ? "selected" : ""}`}>
+              <input type="file" accept=".docx" onChange={(event) => event.target.files?.[0] && uploadTemplate(event.target.files[0])} />
+              <div className="template-tag"><span>{pendingTemplate ? "Selected upload" : "Upload your own"}</span><Plus size={17} /></div>
+              <strong>{pendingTemplate?.name ?? "Use a firm template or completed letter"}</strong>
+              <small>{pendingTemplate ? `${formatBytes(pendingTemplate.size)} · analyzed with the case packet in parallel` : "Upload a DOCX. You will confirm Keep, Replace, and inline fields against the exact original letter."}</small>
             </label>
             {filtered.map((template) => {
               const displayName = templateDisplayName(template);
               const createdLabel = template.isTest ? templateCreatedLabel(template.createdAt) : null;
               return (
                 <button className={`template-card ${selected?.id === template.id ? "selected" : ""}`} key={template.id} onClick={() => chooseTemplate(template)}>
-                  <div className="template-tag"><span>{template.isTest ? "Test template" : template.status === "confirmed" ? "Firm template" : "Review needed"}</span><i /></div>
+                  <div className="template-tag"><span>{template.isTest ? "Test template" : template.status === "confirmed" ? "Firm template" : "Review needed"}</span>{template.status === "confirmed" && <span
+                    className="edit-map-link" role="button" tabIndex={0}
+                    onClick={(event) => { event.stopPropagation(); setSelected(template); setReview(template); }}
+                    onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); event.stopPropagation(); setSelected(template); setReview(template); } }}
+                  >Edit map</span>}<i /></div>
                   <strong title={displayName}>{displayName}</strong>
-                  <small>{template.analysis.paragraphCount} paragraphs · {template.analysis.regions.filter((region) => region.role === "editable").length} replaceable regions</small>
+                  <small>{template.analysis.paragraphCount} paragraphs · {template.analysis.regions.filter((region) => region.role === "editable").length} Replace blocks</small>
                   {createdLabel && <small className="template-created">Test run · {createdLabel}</small>}
                 </button>
               );
@@ -365,10 +589,10 @@ function Setup({ onReady }: { onReady: (matterId: string, autoReview: boolean) =
         </section>
 
         <div className="generate-row">
-          <button className="primary generate-button" onClick={() => void generate()} disabled={!selected || !files.length || busy}>
-            {busy ? <LoaderCircle className="spin" size={17} /> : <Sparkles size={17} />} Review evidence
+          <button className="primary generate-button" onClick={() => void generate()} disabled={(!selected && !pendingTemplate) || !files.length || busy}>
+            {busy ? <LoaderCircle className="spin" size={17} /> : <Sparkles size={17} />} Continue to template map
           </button>
-          <p>Steno first checks source coverage, then you decide whether to add evidence or generate an attorney-review draft. Nothing is sent to a carrier.</p>
+          <p>The uploaded DOCX is analyzed while PDF text and OCR are extracted. No hidden case summary is created. Nothing is sent to a carrier.</p>
         </div>
         {error && <div className="error-banner setup-error"><CircleAlert size={17} />{error}</div>}
         {busy && <div className="setup-busy"><LoaderCircle className="spin" size={18} />{busyLabel}</div>}
@@ -379,6 +603,13 @@ function Setup({ onReady }: { onReady: (matterId: string, autoReview: boolean) =
         onConfirmed={(confirmed) => {
           setTemplates((current) => current.map((template) => template.id === confirmed.id ? confirmed : template));
           setSelected(confirmed); setReview(null);
+          if (pendingCaseWorkspaceId) {
+            const caseWorkspaceId = pendingCaseWorkspaceId;
+            setPendingCaseWorkspaceId(null);
+            void api(`/api/matters/${caseWorkspaceId}/template-map`, { method: "POST", body: "{}" })
+              .then(() => onReady(caseWorkspaceId, true))
+              .catch((caught) => setError(caught instanceof Error ? caught.message : "The template map could not be pinned."));
+          }
         }}
       />}
     </div>
@@ -387,7 +618,7 @@ function Setup({ onReady }: { onReady: (matterId: string, autoReview: boolean) =
 
 function RefinePanel({
   tab, setTab, messages, activity, annotations, instruction, proposal, thinking, activeBlock,
-  onInstruction, onRemoveAnnotation, onSend, onResolve,
+  reviewContent, onInstruction, onRemoveAnnotation, onSend, onResolve,
 }: {
   tab: WorkspaceTab;
   setTab: (tab: WorkspaceTab) => void;
@@ -398,6 +629,7 @@ function RefinePanel({
   proposal: ProposalResponse | null;
   thinking: boolean;
   activeBlock: DraftBlock | null;
+  reviewContent: ReactNode;
   onInstruction: (value: string) => void;
   onRemoveAnnotation: (index: number) => void;
   onSend: () => void;
@@ -406,10 +638,11 @@ function RefinePanel({
   return (
     <aside className="right-panel">
       <div className="panel-tabs">
+        <button className={tab === "review" ? "active" : ""} onClick={() => setTab("review")}>Review</button>
         <button className={tab === "refine" ? "active" : ""} onClick={() => setTab("refine")}>Refine with AI</button>
         <button className={tab === "activity" ? "active" : ""} onClick={() => setTab("activity")}>Activity</button>
       </div>
-      {tab === "refine" ? <>
+      {tab === "review" ? <div className="unified-review-panel">{reviewContent}</div> : tab === "refine" ? <>
         <div className="chat-scroll">
           {!messages.length && <div className="chat-intro"><Sparkles size={22} /><strong>Refine without losing control</strong><p>Select passages in the letter, add them to chat, and review every proposed change before it is applied.</p></div>}
           {messages.map((message, index) => <div className={`chat-message ${message.role}`} key={`${message.role}-${index}`}>
@@ -461,10 +694,11 @@ export function App() {
   const [autoReview, setAutoReview] = useState(false);
   const [revealedSections, setRevealedSections] = useState(0);
   const [activeBlockId, setActiveBlockId] = useState<string | null>(null);
+  const [activeReviewItemId, setActiveReviewItemId] = useState<string | null>(null);
   const [sourcesOpen, setSourcesOpen] = useState(false);
   const [selectedSource, setSelectedSource] = useState<SelectedSource | null>(null);
   const [activeCitation, setActiveCitation] = useState<{ sourceId: string; page: number; number: number } | null>(null);
-  const [tab, setTab] = useState<WorkspaceTab>("refine");
+  const [tab, setTab] = useState<WorkspaceTab>("review");
   const [activity, setActivity] = useState<ActivityResponse[]>([]);
   const [annotations, setAnnotations] = useState<RefinementAnnotation[]>([]);
   const [selection, setSelection] = useState<SelectionPopover | null>(null);
@@ -477,6 +711,8 @@ export function App() {
   const [addingEvidence, setAddingEvidence] = useState(false);
   const [confirmingBlock, setConfirmingBlock] = useState<DraftBlock | null>(null);
   const [confirmingBlockBusy, setConfirmingBlockBusy] = useState(false);
+  const [resolvingTargetId, setResolvingTargetId] = useState<string | null>(null);
+  const [confirmingOutcomeId, setConfirmingOutcomeId] = useState<string | null>(null);
 
   const loadActivity = useCallback(async (matterId: string) => setActivity(await api(`/api/matters/${matterId}/activity`)), []);
   const refreshMatter = useCallback(async (matterId: string) => {
@@ -487,6 +723,7 @@ export function App() {
   const loadDraft = useCallback(async (draftId: string) => {
     const loaded = await api<DraftResponse>(`/api/drafts/${draftId}`);
     setDraft(loaded); setContent(loaded.content); setRevealedSections(0);
+    setTab(loaded.readiness.outcomeIds.length || loaded.readiness.blockIds.length || loaded.readiness.fieldKeys.length || loaded.readiness.staleEvidence ? "review" : "refine");
     setActiveBlockId(loaded.content.sections.flatMap((section) => section.blocks)[0]?.id ?? null);
     setFieldValues(Object.fromEntries(Object.entries(loaded.content.fields).map(([key, field]) => [key, field.value])));
   }, []);
@@ -496,20 +733,30 @@ export function App() {
     try {
       const queued = await api<JobResponse>(`/api/matters/${target.id}/evidence-reviews`, { method: "POST", body: "{}" });
       setJob({ ...queued, jobType: "evidence_review", progress: 0, step: "Queued" });
-      const stream = new EventSource(`/api/jobs/${queued.jobId}/events`);
-      const update = (event: MessageEvent<string>) => {
-        const payload = JSON.parse(event.data) as Partial<JobResponse>;
-        const status = event.type === "completed" ? "completed" : event.type === "failed" ? "failed" : event.type === "progress" ? "processing" : "queued";
-        setJob((current) => ({ ...(current ?? queued), ...payload, jobType: "evidence_review", status }) as JobResponse);
-      };
-      stream.addEventListener("queued", update); stream.addEventListener("progress", update);
-      stream.addEventListener("completed", (event) => {
-        update(event as MessageEvent<string>); stream.close();
-        void refreshMatter(target.id).then(() => loadActivity(target.id));
+      return await new Promise<boolean>((resolve) => {
+        const stream = new EventSource(`/api/jobs/${queued.jobId}/events`);
+        let settled = false;
+        const finish = (result: boolean) => { if (settled) return; settled = true; stream.close(); resolve(result); };
+        const update = (event: MessageEvent<string>) => {
+          const payload = JSON.parse(event.data) as Partial<JobResponse>;
+          const status = event.type === "completed" ? "completed" : event.type === "failed" ? "failed" : event.type === "progress" ? "processing" : "queued";
+          setJob((current) => ({ ...(current ?? queued), ...payload, jobType: "evidence_review", status }) as JobResponse);
+        };
+        stream.addEventListener("queued", update); stream.addEventListener("progress", update);
+        stream.addEventListener("completed", (event) => {
+          update(event as MessageEvent<string>);
+          // Settle before the server closes the SSE connection; EventSource may
+          // otherwise fire `error` first and incorrectly report a completed review as failed.
+          finish(true);
+          void refreshMatter(target.id).then(() => loadActivity(target.id));
+        });
+        stream.addEventListener("failed", (event) => { update(event as MessageEvent<string>); finish(false); });
+        stream.onerror = () => finish(false);
       });
-      stream.addEventListener("failed", (event) => { update(event as MessageEvent<string>); stream.close(); });
-      stream.onerror = () => stream.close();
-    } catch (caught) { setNotice(caught instanceof Error ? caught.message : "Evidence review failed"); }
+    } catch (caught) {
+      setNotice(caught instanceof Error ? caught.message : "Evidence review failed");
+      return false;
+    }
   }, [loadActivity, refreshMatter]);
 
   const generateForMatter = useCallback(async (target: MatterResponse, existingDraft: DraftResponse | null = null) => {
@@ -613,7 +860,8 @@ export function App() {
       await upload(`/api/matters/${matter.id}/sources`, files);
       const refreshed = await refreshMatter(matter.id);
       if (draft) await loadDraft(draft.id);
-      setNotice(`Added ${files.length} evidence ${files.length === 1 ? "file" : "files"}. Reviewing the updated source set…`);
+      setTab("review");
+      setNotice(`Added ${files.length} evidence ${files.length === 1 ? "file" : "files"}. This draft is now stale; review the updated sources, then regenerate.`);
       await reviewEvidenceForMatter(refreshed);
       await loadActivity(matter.id);
     } catch (caught) { setNotice(caught instanceof Error ? caught.message : "Evidence could not be added"); }
@@ -621,6 +869,8 @@ export function App() {
   };
 
   const updateBlock = (blockId: string, text: string) => {
+    const existingText = content?.sections.flatMap((section) => section.blocks).find((block) => block.id === blockId)?.text;
+    if (existingText === text) return;
     setContent((current) => current ? ({
       ...current,
       sections: current.sections.map((section) => ({
@@ -666,7 +916,11 @@ export function App() {
 
   const sendRefinement = async () => {
     if (!draft || !content || !instruction.trim() || proposal) return;
-    const context = annotations.length ? annotations : activeBlock ? [{ blockId: activeBlock.id, quote: activeBlock.text, start: 0, end: activeBlock.text.length }] : [];
+    const context = annotations.length ? annotations : activeBlock && activeBlock.templateRole !== "keep" ? [{ blockId: activeBlock.id, quote: activeBlock.text, start: 0, end: activeBlock.text.length }] : [];
+    if (!context.length && activeBlock?.templateRole === "keep") {
+      setNotice("Keep language is locked to the confirmed template map. Select text in a Replace block to refine it.");
+      return;
+    }
     if (!context.length) return;
     const requestText = instruction.trim();
     setMessages((current) => [...current, { role: "user", text: requestText, annotationCount: context.length }]);
@@ -722,6 +976,47 @@ export function App() {
     finally { setConfirmingBlockBusy(false); }
   };
 
+  const setPreGenerationOmission = async (targetId: string, action: "omit" | "clear") => {
+    if (!matter) return;
+    setResolvingTargetId(targetId); setNotice(null);
+    try {
+      await api(`/api/matters/${matter.id}/review-resolutions/${encodeURIComponent(targetId)}`, {
+        method: "PUT",
+        body: JSON.stringify({ action, sourceFingerprint: matter.sourceFingerprint }),
+      });
+      await refreshMatter(matter.id);
+      setNotice(action === "omit" ? "Omission approved for this matter and current evidence set." : "Omission approval cleared.");
+      await loadActivity(matter.id);
+    } catch (caught) { setNotice(caught instanceof Error ? caught.message : "The omission decision could not be saved"); }
+    finally { setResolvingTargetId(null); }
+  };
+
+  const confirmOutcome = async (outcomeId: string) => {
+    if (!draft || !matter) return;
+    setConfirmingOutcomeId(outcomeId); setNotice(null);
+    try {
+      const saved = await api<DraftResponse>(`/api/drafts/${draft.id}/outcomes/${encodeURIComponent(outcomeId)}/confirm`, {
+        method: "POST", body: JSON.stringify({ version: draft.version }),
+      });
+      setDraft(saved); setContent(saved.content); setTab("review");
+      setNotice(`Omission confirmed in audited draft v${saved.version}.`);
+      await Promise.all([refreshMatter(matter.id), loadActivity(matter.id)]);
+    } catch (caught) { setNotice(caught instanceof Error ? caught.message : "The omission could not be confirmed"); }
+    finally { setConfirmingOutcomeId(null); }
+  };
+
+  const focusReviewTarget = (targetId: string, outcomeId?: string) => {
+    setTab("review");
+    setActiveReviewItemId(outcomeId ?? targetId);
+    const block = content?.sections.flatMap((section) => section.blocks).find((candidate) => candidate.targetId === targetId);
+    if (block) {
+      setActiveBlockId(block.id);
+      window.setTimeout(() => document.querySelector(`[data-draft-block="${CSS.escape(block.id)}"]`)?.scrollIntoView({ behavior: "smooth", block: "center" }), 0);
+      return;
+    }
+    if (outcomeId) window.setTimeout(() => document.querySelector(`[data-outcome-marker="${CSS.escape(outcomeId)}"]`)?.scrollIntoView({ behavior: "smooth", block: "center" }), 0);
+  };
+
   if (!matter) return <Setup onReady={openMatter} />;
 
   const proposedByBlock = new Map<string, RefinementEdit[]>();
@@ -735,6 +1030,79 @@ export function App() {
   const jobActive = job?.status === "queued" || job?.status === "processing";
   const generationActive = jobActive && job?.jobType === "generation";
   const reviewActive = jobActive && job?.jobType === "evidence_review";
+  const targetById = new Map(matter.generationTargets.map((target) => [target.id, target]));
+  const resolvedTargetIds = new Set(matter.reviewResolutions.map((resolution) => resolution.targetId));
+  const preflightTargetIds = [...new Set((matter.evidenceReview?.reviewFlags ?? [])
+    .filter((flag) => flag.kind === "missing_evidence" || flag.severity === "blocking")
+    .flatMap((flag) => flag.affectedTargetIds))]
+    .filter((targetId) => targetById.has(targetId));
+  const unresolvedOutcomes = content?.outcomes.filter((outcome) => outcome.status === "omitted_no_evidence" && outcome.resolution === "unresolved") ?? [];
+  const resolvedOutcomes = content?.outcomes.filter((outcome) => outcome.status !== "generated" && outcome.resolution !== "unresolved") ?? [];
+  const verificationFlags = content?.reviewFlags.filter((flag) => flag.severity === "verification") ?? [];
+  const informationalFlags = content?.reviewFlags.filter((flag) => flag.severity === "informational") ?? [];
+  const blockedBlocks = content?.sections.flatMap((section) => section.blocks).filter((block) => readiness?.blockIds.includes(block.id)) ?? [];
+  const blockingCount = (readiness?.blockIds.length ?? 0) + (readiness?.fieldKeys.length ?? 0) + (readiness?.outcomeIds.length ?? 0)
+    + (readiness?.staleEvidence ? 1 : 0) + (readiness?.staleResolutionTargetIds.length ?? 0);
+
+  const reviewContent = content && draft ? <>
+    <div className="review-panel-summary">
+      <div><p className="eyebrow">Draft readiness</p><strong>{readiness?.ready ? "Ready for export" : `${blockingCount} blocking ${blockingCount === 1 ? "item" : "items"}`}</strong></div>
+      <span className={readiness?.ready ? "ready" : "blocked"}>{readiness?.ready ? <Check size={14} /> : <CircleAlert size={14} />}</span>
+    </div>
+    <section className="review-card-group blocking-group">
+      <div className="review-group-title"><span>Blocking</span><b>{blockingCount}</b></div>
+      {readiness?.staleEvidence && <article className="workbench-review-card blocking">
+        <div className="review-card-label"><CircleAlert size={14} /><span>Evidence changed</span></div>
+        <h3>This draft predates the current source set</h3>
+        <p>Review the updated sources and regenerate. Earlier omission approvals are not silently carried forward.</p>
+        <button className="primary" disabled={generationActive || reviewActive} onClick={() => void generateForMatter(matter, draft)}><RotateCcw size={13} /> Regenerate v{draft.version + 1}</button>
+      </article>}
+      {unresolvedOutcomes.map((outcome) => {
+        const target = targetById.get(outcome.targetId);
+        return <article data-review-item={outcome.id} className={`workbench-review-card blocking ${activeReviewItemId === outcome.id ? "selected" : ""}`} key={outcome.id} onClick={() => focusReviewTarget(outcome.targetId, outcome.id)}>
+          <div className="review-card-label"><CircleAlert size={14} /><span>No supporting evidence</span></div>
+          <h3>{target?.section || `${outcome.targetKind[0]!.toUpperCase()}${outcome.targetKind.slice(1)} content was omitted`}</h3>
+          <p>{outcome.note || "Generation found no support for this mapped target, so no template matter content was copied into the draft."}</p>
+          <div className="review-card-meta"><span>{outcome.exemplarCount} template {outcome.exemplarCount === 1 ? "block" : "blocks"}</span><span>0 generated</span></div>
+          <div className="review-card-actions">
+            <label className="secondary file-action"><input type="file" accept=".pdf,image/*" multiple onChange={(event) => { event.stopPropagation(); if (event.target.files) void addEvidence([...event.target.files]); event.currentTarget.value = ""; }} /><Upload size={13} /> Add evidence</label>
+            <button className="primary" disabled={confirmingOutcomeId === outcome.id} onClick={(event) => { event.stopPropagation(); void confirmOutcome(outcome.id); }}>{confirmingOutcomeId === outcome.id ? <LoaderCircle className="spin" size={13} /> : <Check size={13} />} Approve omission</button>
+          </div>
+        </article>;
+      })}
+      {readiness?.fieldKeys.map((key) => {
+        const field = content.fields[key];
+        if (!field) return null;
+        return <article data-review-item={`field:${key}`} className={`workbench-review-card blocking ${activeReviewItemId === `field:${key}` ? "selected" : ""}`} key={key} onClick={() => setActiveReviewItemId(`field:${key}`)}>
+          <div className="review-card-label"><CircleAlert size={14} /><span>Field verification</span></div>
+          <h3>{field.label ?? key.replaceAll("_", " ")}</h3>
+          <label className="review-field-input"><input value={fieldValues[key] ?? field.value} onChange={(event) => setFieldValues((current) => ({ ...current, [key]: event.target.value }))} /><small>{field.sourceLabel ?? "No supporting source was found"}</small></label>
+          <button className="primary" onClick={(event) => { event.stopPropagation(); void confirmField(key); }}><Check size={13} /> Confirm field</button>
+        </article>;
+      })}
+      {blockedBlocks.map((block) => <article data-review-item={block.id} className={`workbench-review-card blocking ${activeReviewItemId === block.id ? "selected" : ""}`} key={block.id} onClick={() => { setActiveReviewItemId(block.id); setActiveBlockId(block.id); window.setTimeout(() => document.querySelector(`[data-draft-block="${CSS.escape(block.id)}"]`)?.scrollIntoView({ behavior: "smooth", block: "center" }), 0); }}>
+        <div className="review-card-label"><CircleAlert size={14} /><span>Unverified draft text</span></div>
+        <h3>Review edited content</h3><p>{block.text}</p>
+        <button className="secondary" onClick={(event) => { event.stopPropagation(); setConfirmingBlock(block); }}><Check size={13} /> Confirm reviewed text</button>
+      </article>)}
+      {!blockingCount && <div className="review-clear"><Check size={16} /><span>No unresolved export blockers.</span></div>}
+    </section>
+    <section className="review-card-group">
+      <div className="review-group-title"><span>Needs verification</span><b>{verificationFlags.length + content.warnings.length}</b></div>
+      {content.warnings.map((warning) => <article className="workbench-review-card verification" key={warning}><div className="review-card-label"><CircleAlert size={14} /><span>Generation warning</span></div><p>{warning}</p></article>)}
+      {verificationFlags.map((flag) => <article className="workbench-review-card verification" key={flag.id}><div className="review-card-label"><CircleAlert size={14} /><span>Source check</span></div><h3>{flag.summary}</h3><p>{flag.explanation}</p>{flag.citations.map((citation, index) => <button className="source-link" key={`${citation.sourceId}-${index}`} onClick={() => void showReviewCitation(citation)}>{citation.sourceName} · p. {citation.page}</button>)}</article>)}
+      {!verificationFlags.length && !content.warnings.length && <p className="review-group-empty">No additional verification items.</p>}
+    </section>
+    <section className="review-card-group informational-group">
+      <div className="review-group-title"><span>Informational</span><b>{resolvedOutcomes.length + informationalFlags.length}</b></div>
+      {resolvedOutcomes.map((outcome) => <article data-review-item={outcome.id} className={`workbench-review-card informational ${activeReviewItemId === outcome.id ? "selected" : ""}`} key={outcome.id} onClick={() => focusReviewTarget(outcome.targetId, outcome.id)}>
+        <div className="review-card-label"><Check size={14} /><span>{outcome.resolution === "preapproved" ? "Pre-approved omission" : outcome.resolution === "confirmed" ? "Confirmed omission" : "Not applicable"}</span></div>
+        <h3>{targetById.get(outcome.targetId)?.section || `${outcome.targetKind} target`}</h3><p>{outcome.note || "This outcome does not block export."}</p>
+      </article>)}
+      {informationalFlags.map((flag) => <article className="workbench-review-card informational" key={flag.id}><div className="review-card-label"><Check size={14} /><span>Information</span></div><h3>{flag.summary}</h3><p>{flag.explanation}</p></article>)}
+      {!resolvedOutcomes.length && !informationalFlags.length && <p className="review-group-empty">No informational outcomes.</p>}
+    </section>
+  </> : <p className="panel-empty">Generate a draft to open the review workbench.</p>;
 
   return (
     <div className="workspace-app">
@@ -742,7 +1110,7 @@ export function App() {
         <div className="wordmark">Steno <span>Demand Letter Studio</span></div>
         <div className="matter-breadcrumb"><span>/</span><strong>{matter.name}</strong>{draft && <i>Draft v{draft.version}</i>}</div>
         <div className="workspace-actions"><span className="single-user"><b>FR</b> Single-user v1</span>{draft && (exportBlocked
-          ? <button className="export-button" disabled title="Resolve all server-reported readiness items before Word export" onClick={() => setNotice(`Word export is blocked by ${readiness?.blockIds.length ?? 0} draft regions, ${readiness?.fieldKeys.length ?? 0} template fields${readiness?.staleEvidence ? ", and a newer source set" : ""}.`)}><Download size={15} /> Export to Word</button>
+          ? <button className="export-button export-blocked" aria-disabled="true" title="Open Review to resolve all server-reported readiness items" onClick={() => { setTab("review"); setNotice(`Word export is blocked by ${blockingCount} review ${blockingCount === 1 ? "item" : "items"}.`); }}><CircleAlert size={15} /> {blockingCount} blocking · Review</button>
           : <a className="export-button" href={`/api/drafts/${draft.id}/export.docx`}><Download size={15} /> Export to Word</a>)}</div>
       </header>
       <div className="workspace-grid">
@@ -766,8 +1134,24 @@ export function App() {
             {reviewActive && <><p>AI is checking the reviewed template against the uploaded source pages. The result is advisory and non-exhaustive.</p><div className="progress-track"><span style={{ width: `${job?.progress ?? 4}%` }} /></div><strong>{job?.progress ?? 4}%</strong></>}
             {!reviewActive && job?.status === "failed" && <div className="error-banner"><CircleAlert size={16} />{job.error ?? "Evidence review failed"}</div>}
             {!reviewActive && matter.evidenceReview && !matter.evidenceReviewStale && <>
-              <div className="review-disclaimer"><CircleAlert size={16} /><span>This AI-assisted review highlights potential source issues. It does not determine completeness, authenticity, admissibility, or legal validity.</span></div>
+              <div className="review-disclaimer"><CircleAlert size={16} /><span>This AI-assisted review proposes grounded fields and highlights potential source issues. Warnings do not block generation, and the review does not determine completeness, authenticity, admissibility, or legal validity.</span></div>
+              {(matter.evidenceReview.fieldProposals?.length ?? 0) > 0 && <div className="field-proposal-list">
+                {matter.evidenceReview.fieldProposals!.map((proposal) => <div key={`${proposal.fieldKey}-${proposal.sourceId}-${proposal.page}`}><span>{proposal.fieldKey.replaceAll("_", " ")}</span><strong>{proposal.value}</strong><small>{proposal.sourceName} · p. {proposal.page} · {Math.round(proposal.confidence * 100)}%</small></div>)}
+              </div>}
               <ReviewFlagList flags={matter.evidenceReview.reviewFlags} onCitation={(citation) => void showReviewCitation(citation)} />
+              {preflightTargetIds.length > 0 && <section className="preflight-targets">
+                <div className="preflight-target-title"><p className="eyebrow">Missing-evidence targets</p><span>Resolve now or continue with export-blocking omissions.</span></div>
+                {preflightTargetIds.map((targetId) => {
+                  const target = targetById.get(targetId)!;
+                  const resolved = resolvedTargetIds.has(targetId);
+                  return <article className={resolved ? "resolved" : ""} key={targetId}>
+                    <div><strong>{target.section || `${target.kind[0]!.toUpperCase()}${target.kind.slice(1)} target`}</strong><small>{target.kind} · {target.exemplarCount} mapped {target.exemplarCount === 1 ? "block" : "blocks"}</small></div>
+                    {resolved
+                      ? <button className="secondary" disabled={resolvingTargetId === targetId} onClick={() => void setPreGenerationOmission(targetId, "clear")}><RotateCcw size={13} /> Undo omission</button>
+                      : <><label className="secondary file-action"><input type="file" accept=".pdf,image/*" multiple onChange={(event) => { if (event.target.files) void addEvidence([...event.target.files]); event.currentTarget.value = ""; }} /><Upload size={13} /> Add evidence</label><button className="secondary" disabled={resolvingTargetId === targetId} onClick={() => void setPreGenerationOmission(targetId, "omit")}>{resolvingTargetId === targetId ? <LoaderCircle className="spin" size={13} /> : <Check size={13} />} Omit for this matter</button><button className="link-action" onClick={() => void generateForMatter(matter)}>Continue unresolved</button></>}
+                  </article>;
+                })}
+              </section>}
             </>}
             {!reviewActive && <div className="preflight-actions">
               <label className="secondary file-action"><input type="file" accept=".pdf,image/*" multiple onChange={(event) => { if (event.target.files) void addEvidence([...event.target.files]); event.currentTarget.value = ""; }} /><Upload size={15} /> Add evidence</label>
@@ -780,24 +1164,16 @@ export function App() {
           {content && <div className="letter-scroll">
             {generationActive && <div className="job-banner"><LoaderCircle className="spin" size={16} /><span>{job?.step ?? "Regenerating draft"} · {job?.progress ?? 0}%</span></div>}
             {reviewActive && <div className="job-banner"><LoaderCircle className="spin" size={16} /><span>{job?.step ?? "Reviewing updated evidence"} · {job?.progress ?? 0}%</span></div>}
-            {readiness && !readiness.ready && <div className="confidence-banner"><CircleAlert size={17} /><span>Word export is locked by the server: {readiness.blockIds.length} draft {readiness.blockIds.length === 1 ? "region" : "regions"}, {readiness.fieldKeys.length} template {readiness.fieldKeys.length === 1 ? "field" : "fields"}{readiness.imageIssue ? ", an unresolved image mapping" : ""}{readiness.staleEvidence ? ", and evidence added after this version" : ""}.</span></div>}
+            {readiness && !readiness.ready && <div className="confidence-banner"><CircleAlert size={17} /><span>Word export is locked by the server: {blockingCount} blocking {blockingCount === 1 ? "item" : "items"} ({readiness.outcomeIds.length} unresolved {readiness.outcomeIds.length === 1 ? "omission" : "omissions"}, {readiness.blockIds.length} draft {readiness.blockIds.length === 1 ? "region" : "regions"}, {readiness.fieldKeys.length} template {readiness.fieldKeys.length === 1 ? "field" : "fields"}){readiness.staleEvidence ? "; evidence was added after this version" : ""}.</span></div>}
             {notice && <div className="workspace-notice">{notice}<button onClick={() => setNotice(null)}><X size={13} /></button></div>}
             <article className="letter-paper">
-              <div className="letterhead"><strong>ATTORNEY REVIEW DRAFT</strong><span>Generated from a reviewed firm template · Not ready to send</span></div>
-              <h1>{content.title}</h1>
-              {fieldEntries.length > 0 && <section className="merge-field-panel">
-                <p className="eyebrow">Extracted template fields</p>
-                {fieldEntries.map(([key, field]) => {
-                  const needsCheck = !field.userConfirmed && (!field.verified || (field.confidence ?? 1) < 0.8);
-                  return <div className={`merge-field ${needsCheck ? "low-confidence" : ""}`} key={key}>
-                    <label><span>{key}</span><input value={fieldValues[key] ?? field.value} onChange={(event) => setFieldValues((current) => ({ ...current, [key]: event.target.value }))} /></label>
-                    <small>{field.sourceLabel ?? "No supporting source was found"}</small>
-                    {needsCheck ? <button onClick={() => void confirmField(key)}><Check size={13} /> Confirm</button> : <i>Verified</i>}
-                  </div>;
-                })}
-              </section>}
-              {content.warnings.map((warning) => <div className="document-warning" key={warning}><CircleAlert size={15} />{warning}</div>)}
-              {content.reviewFlags.length > 0 && <section className="draft-review-flags"><div className="review-flags-title"><p className="eyebrow">Source review</p><span>AI-assisted and non-exhaustive</span></div><ReviewFlagList flags={content.reviewFlags} blockingIds={blockingReviewFlagIds} onCitation={(citation) => void showReviewCitation(citation)} onTarget={focusTemplateParagraph} /></section>}
+              <div className="letterhead"><strong>{content.title}</strong><span>Attorney-review draft · generated from the confirmed template map</span></div>
+              {content.outcomes.filter((outcome) => outcome.status !== "generated").map((outcome) => <button
+                className={`document-outcome-marker ${outcome.resolution === "unresolved" ? "blocking" : "resolved"} ${activeReviewItemId === outcome.id ? "selected" : ""}`}
+                data-outcome-marker={outcome.id}
+                key={outcome.id}
+                onClick={() => { focusReviewTarget(outcome.targetId, outcome.id); window.setTimeout(() => document.querySelector(`[data-review-item="${CSS.escape(outcome.id)}"]`)?.scrollIntoView({ behavior: "smooth", block: "center" }), 0); }}
+              ><span>{outcome.resolution === "unresolved" ? <CircleAlert size={12} /> : <Check size={12} />}</span>{targetById.get(outcome.targetId)?.section || `${outcome.targetKind} content`} omitted</button>)}
               {visibleSections.map((section) => <section className="draft-section fade-up" key={section.id}>
                 {section.heading && <h2>{section.heading}</h2>}
                 {section.blocks.map((block) => {
@@ -808,8 +1184,15 @@ export function App() {
                     active={activeBlockId === block.id}
                     citationNumbers={numbers}
                     edits={proposedByBlock.get(block.id) ?? []}
-                    disabled={generationActive}
-                    onFocus={() => setActiveBlockId(block.id)}
+                    disabled={generationActive || block.locked === true}
+                    onFocus={() => {
+                      setActiveBlockId(block.id);
+                      if (!block.verified || block.outcomeId) {
+                        const reviewId = !block.verified ? block.id : block.outcomeId!;
+                        setActiveReviewItemId(reviewId); setTab("review");
+                        window.setTimeout(() => document.querySelector(`[data-review-item="${CSS.escape(reviewId)}"]`)?.scrollIntoView({ behavior: "smooth", block: "center" }), 0);
+                      }
+                    }}
                     onChange={(text) => updateBlock(block.id, text)}
                     onBlur={(text) => void saveBlock(block.id, text)}
                     onCitation={(index) => void showCitation(block.id, index)}
@@ -830,6 +1213,7 @@ export function App() {
         <RefinePanel
           tab={tab} setTab={setTab} messages={messages} activity={activity} annotations={annotations}
           instruction={instruction} proposal={proposal} thinking={thinking} activeBlock={activeBlock}
+          reviewContent={reviewContent}
           onInstruction={setInstruction}
           onRemoveAnnotation={(index) => setAnnotations((current) => current.filter((_annotation, candidate) => candidate !== index))}
           onSend={() => void sendRefinement()}
@@ -853,12 +1237,13 @@ export function App() {
                 if (first?.page) void showCitation(first.blockId, first.citationIndex);
               }}>
                 <i className={citationCounts[source.id] ? "cited" : ""} />
-                <span><strong>{source.name}</strong><small>{source.pageCount} {source.pageCount === 1 ? "page" : "pages"} · {source.status}</small></span>
+                <span><strong>{source.name}</strong><small>{source.pageCount} {source.pageCount === 1 ? "page" : "pages"} · {source.status}{source.extractionIssueCount ? ` · ${source.extractionIssueCount} OCR ${source.extractionIssueCount === 1 ? "issue" : "issues"}` : ""}</small></span>
                 {!!citationCounts[source.id] && <b>Cited ×{citationCounts[source.id]}</b>}
               </button>;
             })}</div>
             {selectedSource && <div className="source-detail">
               <div><span>{activeCitation?.number ? `Reference ${activeCitation.number}` : "Source review evidence"}</span><strong>{selectedSource.sourceName}</strong><small>Page {selectedSource.page}</small></div>
+              {selectedSource.extractionStatus && selectedSource.extractionStatus !== "ready" && <div className="source-extraction-warning"><CircleAlert size={13} />{selectedSource.extractionStatus === "ocr-required" ? "This page needs OCR and was not treated as authoritative text." : selectedSource.extractionStatus === "ocr-failed" ? "OCR failed for this page; review the original visually." : "This page is visual evidence and is not treated as quoted text."}</div>}
               <p>{selectedSource.text || "This page contains visual evidence and requires direct review."}</p>
               <a href={`/api/sources/${selectedSource.sourceId}/file#page=${selectedSource.page}`} target="_blank" rel="noreferrer"><ExternalLink size={14} /> Open original at page {selectedSource.page}</a>
             </div>}

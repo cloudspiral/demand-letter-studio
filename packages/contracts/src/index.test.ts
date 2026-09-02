@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { EvidenceReviewSchema, ExportReadinessSchema, GeneratedDraftSchema, RefinementAnnotationSchema, RefinementProposalSchema, ReviewFlagSchema } from "./index";
+import { EvidenceReviewSchema, ExportReadinessSchema, GeneratedDraftSchema, GenerationOutcomeSchema, RefinementAnnotationSchema, RefinementProposalSchema, ReviewFlagSchema } from "./index";
 
 describe("contracts", () => {
   it("rejects factual blocks without verification state", () => {
@@ -54,13 +54,32 @@ describe("contracts", () => {
       affectedFieldKeys: [],
     });
     expect(flag).not.toHaveProperty("type");
-    expect(flag).not.toHaveProperty("severity");
+    expect(flag).toMatchObject({ kind: "general", severity: "verification", affectedTargetIds: [] });
     expect(EvidenceReviewSchema.safeParse({
       sourceFingerprint: "a".repeat(64), reviewFlags: [flag], createdAt: new Date().toISOString(),
     }).success).toBe(true);
     expect(ExportReadinessSchema.parse({
       ready: false, blockIds: ["block-1"], fieldKeys: [], duplicateParagraphIndexes: [],
       imageIssue: null, staleEvidence: false, blockingReviewFlagIds: [flag.id],
-    }).blockingReviewFlagIds).toEqual([flag.id]);
+    })).toMatchObject({
+      outcomeIds: [], staleResolutionTargetIds: [], blockingReviewFlagIds: [flag.id],
+    });
+  });
+
+  it("keeps omission outcome and approval state independent", () => {
+    const base = {
+      id: "outcome:target-1", targetId: "target-1", targetKind: "narrative" as const,
+      citations: [], note: null, sourceId: null, page: null, sourceName: null,
+      mediaType: null, caption: null, exemplarCount: 2, generatedCount: 0,
+    };
+    expect(GenerationOutcomeSchema.parse({
+      ...base, status: "omitted_no_evidence", resolution: "unresolved",
+    })).toMatchObject({ status: "omitted_no_evidence", resolution: "unresolved" });
+    expect(GenerationOutcomeSchema.safeParse({
+      ...base, status: "omitted_no_evidence", resolution: "not_required",
+    }).success).toBe(false);
+    expect(GenerationOutcomeSchema.safeParse({
+      ...base, status: "omitted_not_applicable", resolution: "not_required",
+    }).success).toBe(false);
   });
 });

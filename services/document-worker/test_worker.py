@@ -6,8 +6,9 @@ from pathlib import Path
 
 from lxml import etree
 from PIL import Image
+from pypdf import PdfWriter
 
-from worker import DocumentError, _extract_facts, analyze_template, export_docx
+from worker import DocumentError, analyze_template, export_docx, extract_source
 
 
 DOCUMENT = b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -47,6 +48,46 @@ DEADLINE_DOCUMENT = b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
     <w:sectPr><w:pgSz w:w="12240" w:h="15840"/></w:sectPr>
   </w:body>
 </w:document>'''
+TABLE_DOCUMENT = b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:r><w:t>Medical expenses</w:t></w:r></w:p>
+    <w:tbl><w:tr><w:tc><w:p><w:r><w:t>Old provider</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>$9,999.00</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+    <w:sectPr/>
+  </w:body>
+</w:document>'''
+NARRATIVE_DOCUMENT = b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>FACTS</w:t></w:r></w:p>
+    <w:p><w:pPr><w:pStyle w:val="BodyText"/></w:pPr><w:r><w:t>Old narrative one.</w:t></w:r></w:p>
+    <w:p><w:pPr><w:pStyle w:val="BodyText"/></w:pPr><w:r><w:t>Old narrative two.</w:t></w:r></w:p>
+    <w:p><w:r><w:t>Reusable tail.</w:t></w:r></w:p>
+    <w:sectPr/>
+  </w:body>
+</w:document>'''
+PARAGRAPH_EXPENSE_DOCUMENT = b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:r><w:t>MEDICAL EXPENSES</w:t></w:r></w:p>
+    <w:p><w:pPr><w:tabs><w:tab w:val="right" w:pos="9000"/></w:tabs></w:pPr><w:r><w:t>Old Hospital:</w:t></w:r><w:r><w:tab/></w:r><w:r><w:t>$9,000.00</w:t></w:r></w:p>
+    <w:p><w:pPr><w:tabs><w:tab w:val="right" w:pos="9000"/></w:tabs></w:pPr><w:r><w:rPr><w:b/></w:rPr><w:t>Total:</w:t></w:r><w:r><w:tab/></w:r><w:r><w:rPr><w:b/></w:rPr><w:t>$9,000.00</w:t></w:r></w:p>
+    <w:p><w:r><w:t>Reusable tail.</w:t></w:r></w:p>
+    <w:sectPr/>
+  </w:body>
+</w:document>'''
+FULL_TABLE_DOCUMENT = b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:tbl>
+      <w:tblGrid><w:gridCol w:w="6000"/><w:gridCol w:w="3000"/></w:tblGrid>
+      <w:tr><w:tc><w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Provider</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Amount</w:t></w:r></w:p></w:tc></w:tr>
+      <w:tr><w:tc><w:p><w:r><w:t>Old Hospital</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>$9,000</w:t></w:r></w:p></w:tc></w:tr>
+      <w:tr><w:trPr><w:tblHeader/></w:trPr><w:tc><w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Total</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:rPr><w:b/></w:rPr><w:t>$9,000</w:t></w:r></w:p></w:tc></w:tr>
+    </w:tbl>
+    <w:p><w:r><w:t>Reusable tail.</w:t></w:r></w:p><w:sectPr/>
+  </w:body>
+</w:document>'''
 
 
 def make_docx(path: Path, document: bytes = DOCUMENT, document_rels: bytes | None = None) -> None:
@@ -60,16 +101,39 @@ def make_docx(path: Path, document: bytes = DOCUMENT, document_rels: bytes | Non
         package.writestr("word/media/immutable.png", b"preserve-me")
 
 
+class FixtureOcrProvider:
+    def extract(self, _image_bytes: bytes):
+        return {
+            "text": "Patient: Jordan Canary\nTotal Charges: $12,345.67",
+            "confidence": 0.97,
+            "geometry": [{"text": "Total Charges: $12,345.67", "confidence": 0.97, "boundingBox": {"Top": 0.2}}],
+            "structuredData": {"tables": [{"rows": 1, "columns": 2, "cells": [{"row": 1, "column": 2, "text": "$12,345.67"}]}]},
+        }
+
+
 class DocumentWorkerTests(unittest.TestCase):
-    def test_classifies_heading_and_case_specific_regions(self):
+    @staticmethod
+    def operation_anchor(block):
+        return {
+            "blockId": block["id"],
+            "partName": block["anchor"]["partName"],
+            "paragraphIndex": block["paragraphIndex"],
+            "structuredGroup": block.get("structuredGroup"),
+            "figure": block.get("figure"),
+        }
+
+    def test_extracts_exact_structure_without_semantic_regex_classification(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "template.docx"
             make_docx(source)
             analysis = analyze_template(str(source))
             self.assertEqual(analysis["paragraphCount"], 3)
-            self.assertEqual(analysis["regions"][0]["role"], "heading")
-            self.assertEqual(analysis["regions"][1]["role"], "editable")
-            self.assertEqual(analysis["replacementCandidates"][0]["value"], "999999")
+            self.assertTrue(all(region["needsAttention"] for region in analysis["regions"]))
+            self.assertTrue(all(region["confidence"] == 0 for region in analysis["regions"]))
+            self.assertEqual(analysis["regions"][1]["text"], "Mr. Canary has medical expenses of $9,999.00.")
+            self.assertEqual(analysis["regions"][1]["anchor"]["partName"], "word/document.xml")
+            self.assertEqual(analysis["replacementCandidates"], [])
+            self.assertTrue(any(block["anchor"]["kind"] == "header" for block in analysis["blocks"]))
 
     def test_rejects_existing_tracked_changes(self):
         tracked = DOCUMENT.replace(b"<w:r><w:rPr>", b"<w:ins><w:r><w:rPr>").replace(
@@ -81,7 +145,7 @@ class DocumentWorkerTests(unittest.TestCase):
             with self.assertRaisesRegex(DocumentError, "tracked changes"):
                 analyze_template(str(source))
 
-    def test_preserves_split_settlement_boilerplate_after_terms_marker(self):
+    def test_does_not_apply_deterministic_boilerplate_rules(self):
         boilerplate = DOCUMENT.replace(
             b"Mr. Canary has medical expenses of $9,999.00.",
             b"This offer is subject to you complying with the following express terms and conditions:",
@@ -95,20 +159,18 @@ class DocumentWorkerTests(unittest.TestCase):
             analysis = analyze_template(str(source))
             self.assertEqual(analysis["regions"][1]["role"], "preserve")
             self.assertEqual(analysis["regions"][2]["role"], "preserve")
+            self.assertEqual(analysis["regions"][1]["explanation"], "Awaiting model template analysis.")
+            self.assertTrue(analysis["regions"][2]["needsAttention"])
 
-    def test_exposes_only_split_deadline_time_as_a_body_field(self):
+    def test_export_can_patch_a_user_confirmed_inline_deadline_field(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "deadline-template.docx"
             output = Path(directory) / "deadline-output.docx"
             make_docx(source, DEADLINE_DOCUMENT)
 
             analysis = analyze_template(str(source))
-            self.assertEqual(analysis["analysisVersion"], 3)
-            self.assertIn({
-                "value": "12:00 p.m. PST",
-                "location": "word/document.xml",
-                "kind": "date",
-            }, analysis["replacementCandidates"])
+            self.assertEqual(analysis["analysisVersion"], 5)
+            self.assertEqual(analysis["replacementCandidates"], [])
             self.assertEqual(analysis["regions"][2]["role"], "preserve")
 
             export_docx({
@@ -144,6 +206,47 @@ class DocumentWorkerTests(unittest.TestCase):
                 self.assertIn(b"Claim Number: 123456", header)
                 self.assertIn(b"fldSimple", header)
 
+    def test_export_patches_a_confirmed_header_block_by_part_and_anchor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "template.docx"
+            output = Path(directory) / "output.docx"
+            make_docx(source)
+            result = export_docx({
+                "templatePath": str(source),
+                "outputPath": str(output),
+                "patches": [{
+                    "partName": "word/header1.xml",
+                    "paragraphIndex": 0,
+                    "text": "Claim Number: NEW-123 - Demand",
+                }],
+                "fieldReplacements": {},
+            })
+            self.assertEqual(result["patchCount"], 1)
+            with zipfile.ZipFile(output) as package:
+                header = etree.fromstring(package.read("word/header1.xml"))
+                text = "".join(header.xpath("//w:t/text()", namespaces={"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}))
+                self.assertEqual(text, "Claim Number: NEW-123 - Demand")
+                self.assertTrue(header.xpath("//w:fldSimple", namespaces={"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}))
+
+    def test_uses_one_stable_sequence_for_body_and_table_cell_slots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "table-template.docx"
+            output = Path(directory) / "table-output.docx"
+            make_docx(source, TABLE_DOCUMENT)
+            analysis = analyze_template(str(source))
+            self.assertEqual(analysis["paragraphCount"], 3)
+            self.assertEqual([block["anchor"]["kind"] for block in analysis["regions"]], ["paragraph", "table-cell", "table-cell"])
+            export_docx({
+                "templatePath": str(source),
+                "outputPath": str(output),
+                "patches": [{"paragraphIndex": 2, "text": "$12,345.67"}],
+                "fieldReplacements": {},
+            })
+            with zipfile.ZipFile(output) as package:
+                root = etree.fromstring(package.read("word/document.xml"))
+                table_text = "".join(root.xpath("//w:tbl//w:t/text()", namespaces={"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}))
+                self.assertEqual(table_text, "Old provider$12,345.67")
+
     def test_export_keeps_untouched_xml_parts_byte_identical(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "template.docx"
@@ -163,7 +266,7 @@ class DocumentWorkerTests(unittest.TestCase):
 
             analysis = analyze_template(str(source))
             self.assertEqual(analysis["regions"][0]["role"], "preserve")
-            self.assertEqual(analysis["regions"][0]["confidence"], 1.0)
+            self.assertEqual(analysis["regions"][0]["confidence"], 0.0)
 
             export_docx({
                 "templatePath": str(source),
@@ -242,10 +345,12 @@ class DocumentWorkerTests(unittest.TestCase):
 
             analysis = analyze_template(str(source))
             self.assertEqual(analysis["imageCandidates"], [{
+                "blockId": "word/document.xml:figure:rId9",
                 "paragraphIndex": 0,
                 "relationshipId": "rId9",
                 "partName": "word/media/immutable.png",
                 "contentType": "image/png",
+                "captionBlockId": "word/document.xml:p:1",
             }])
             result = export_docx({
                 "templatePath": str(source),
@@ -264,11 +369,169 @@ class DocumentWorkerTests(unittest.TestCase):
                     self.assertEqual(image.size, (32, 20))
                 self.assertEqual(package.read("word/styles.xml"), STYLES)
 
-    def test_extracts_names_amounts_and_dates_with_page_lineage(self):
-        facts = _extract_facts([{"page": 2, "text": "Patient: Jordan Canary\nDate of Service: 08/12/2026\nTotal Charges: $12,345.67"}])
-        self.assertIn(("person", "Jordan Canary", 2), [(fact["kind"], fact["value"], fact["page"]) for fact in facts])
-        self.assertIn(("date", "08/12/2026", 2), [(fact["kind"], fact["value"], fact["page"]) for fact in facts])
-        self.assertIn(("amount", "$12,345.67", 2), [(fact["kind"], fact["value"], fact["page"]) for fact in facts])
+    def test_target_operations_expand_and_contract_narrative_runs_using_exemplar_styles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "narrative-template.docx"
+            expanded = Path(directory) / "narrative-expanded.docx"
+            contracted = Path(directory) / "narrative-contracted.docx"
+            make_docx(source, NARRATIVE_DOCUMENT)
+            analysis = analyze_template(str(source))
+            narrative_blocks = analysis["regions"][1:3]
+            anchors = [self.operation_anchor(block) for block in narrative_blocks]
+            export_docx({
+                "templatePath": str(source), "outputPath": str(expanded), "patches": [], "fieldReplacements": {},
+                "targetOperations": [{
+                    "targetId": "narrative-1", "kind": "narrative", "status": "generated", "anchors": anchors,
+                    "paragraphs": ["Generated one.", "Generated two.", "Generated three."],
+                }],
+            })
+            export_docx({
+                "templatePath": str(source), "outputPath": str(contracted), "patches": [], "fieldReplacements": {},
+                "targetOperations": [{
+                    "targetId": "narrative-1", "kind": "narrative", "status": "generated", "anchors": anchors,
+                    "paragraphs": ["Only supported paragraph."],
+                }],
+            })
+            namespaces = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+            with zipfile.ZipFile(expanded) as package:
+                root = etree.fromstring(package.read("word/document.xml"))
+                paragraphs = root.xpath("//w:body/w:p", namespaces=namespaces)
+                self.assertEqual(["".join(p.xpath(".//w:t/text()", namespaces=namespaces)) for p in paragraphs], [
+                    "FACTS", "Generated one.", "Generated two.", "Generated three.", "Reusable tail.",
+                ])
+                self.assertTrue(paragraphs[3].xpath("./w:pPr/w:pStyle[@w:val='BodyText']", namespaces=namespaces))
+            with zipfile.ZipFile(contracted) as package:
+                root = etree.fromstring(package.read("word/document.xml"))
+                text = ["".join(p.xpath(".//w:t/text()", namespaces=namespaces)) for p in root.xpath("//w:body/w:p", namespaces=namespaces)]
+                self.assertEqual(text, ["FACTS", "Only supported paragraph.", "Reusable tail."])
+
+    def test_target_operations_rebuild_paragraph_expense_rows_and_remove_the_optional_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "paragraph-expenses.docx"
+            generated = Path(directory) / "paragraph-expenses-generated.docx"
+            omitted = Path(directory) / "paragraph-expenses-omitted.docx"
+            make_docx(source, PARAGRAPH_EXPENSE_DOCUMENT)
+            analysis = analyze_template(str(source))
+            group_blocks = [block for block in analysis["regions"] if block.get("structuredGroup")]
+            self.assertEqual(len(group_blocks), 3)
+            anchors = [self.operation_anchor(block) for block in group_blocks]
+            base = {"templatePath": str(source), "patches": [], "fieldReplacements": {}}
+            export_docx({**base, "outputPath": str(generated), "targetOperations": [{
+                "targetId": "structured-1", "kind": "structured", "status": "generated", "anchors": anchors,
+                "rows": [
+                    {"role": "body", "cells": ["Canary Hospital", "$12,000.00"]},
+                    {"role": "body", "cells": ["Canary Imaging", "$345.67"]},
+                    {"role": "total", "cells": ["Total", "$12,345.67"]},
+                ],
+            }]})
+            export_docx({**base, "outputPath": str(omitted), "targetOperations": [{
+                "targetId": "structured-1", "kind": "structured", "status": "omitted_no_evidence", "anchors": anchors,
+            }]})
+            namespaces = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+            with zipfile.ZipFile(generated) as package:
+                root = etree.fromstring(package.read("word/document.xml"))
+                paragraphs = root.xpath("//w:body/w:p", namespaces=namespaces)
+                text = ["".join(p.xpath(".//w:t/text()", namespaces=namespaces)) for p in paragraphs]
+                self.assertEqual(text[1:4], ["Canary Hospital:$12,000.00", "Canary Imaging:$345.67", "Total:$12,345.67"])
+                self.assertTrue(paragraphs[3].xpath(".//w:rPr/w:b", namespaces=namespaces))
+                self.assertTrue(all(p.xpath("./w:pPr/w:tabs/w:tab", namespaces=namespaces) for p in paragraphs[1:4]))
+            with zipfile.ZipFile(omitted) as package:
+                text = package.read("word/document.xml")
+                self.assertNotIn(b"Old Hospital", text)
+                self.assertNotIn(b"$9,000.00", text)
+                self.assertNotIn(b"MEDICAL EXPENSES", text)
+                self.assertIn(b"Reusable tail", text)
+
+    def test_target_operations_preserve_word_table_shell_and_total_style_or_remove_the_table(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "table-template.docx"
+            generated = Path(directory) / "table-generated.docx"
+            omitted = Path(directory) / "table-omitted.docx"
+            make_docx(source, FULL_TABLE_DOCUMENT)
+            analysis = analyze_template(str(source))
+            table_blocks = [block for block in analysis["regions"] if block.get("structuredGroup")]
+            anchors = [self.operation_anchor(block) for block in table_blocks]
+            base = {"templatePath": str(source), "patches": [], "fieldReplacements": {}}
+            export_docx({**base, "outputPath": str(generated), "targetOperations": [{
+                "targetId": "table-1", "kind": "structured", "status": "generated", "anchors": anchors,
+                "rows": [
+                    {"role": "body", "cells": ["Canary Hospital", "$12,000"]},
+                    {"role": "body", "cells": ["Canary Imaging", "$345.67"]},
+                    {"role": "total", "cells": ["Total", "$12,345.67"]},
+                ],
+            }]})
+            export_docx({**base, "outputPath": str(omitted), "targetOperations": [{
+                "targetId": "table-1", "kind": "structured", "status": "omitted_not_applicable", "anchors": anchors,
+            }]})
+            namespaces = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+            with zipfile.ZipFile(generated) as package:
+                root = etree.fromstring(package.read("word/document.xml"))
+                rows = root.xpath("//w:tbl/w:tr", namespaces=namespaces)
+                self.assertEqual(len(rows), 4)
+                self.assertEqual("".join(rows[0].xpath(".//w:t/text()", namespaces=namespaces)), "ProviderAmount")
+                self.assertEqual("".join(rows[-1].xpath(".//w:t/text()", namespaces=namespaces)), "Total$12,345.67")
+                self.assertTrue(rows[-1].xpath(".//w:rPr/w:b", namespaces=namespaces))
+                self.assertTrue(root.xpath("//w:tblGrid/w:gridCol[@w:w='6000']", namespaces=namespaces))
+            with zipfile.ZipFile(omitted) as package:
+                root = etree.fromstring(package.read("word/document.xml"))
+                self.assertFalse(root.xpath("//w:tbl", namespaces=namespaces))
+                self.assertIn(b"Reusable tail", package.read("word/document.xml"))
+
+    def test_target_operations_replace_or_remove_a_figure_and_its_caption(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "figure-template.docx"
+            generated = Path(directory) / "figure-generated.docx"
+            omitted = Path(directory) / "figure-omitted.docx"
+            replacement = Path(directory) / "replacement.jpg"
+            make_docx(source, IMAGE_DOCUMENT, IMAGE_RELS)
+            Image.new("RGB", (40, 24), (31, 122, 72)).save(replacement, format="JPEG")
+            analysis = analyze_template(str(source))
+            figure = next(block for block in analysis["regions"] if block["semanticKind"] == "figure")
+            anchor = self.operation_anchor(figure)
+            base = {"templatePath": str(source), "patches": [], "fieldReplacements": {}}
+            export_docx({**base, "outputPath": str(generated), "targetOperations": [{
+                "targetId": "figure-1", "kind": "figure", "status": "generated", "anchors": [anchor],
+                "sourcePath": str(replacement), "caption": "Photograph: documented rear-impact damage.",
+            }]})
+            export_docx({**base, "outputPath": str(omitted), "targetOperations": [{
+                "targetId": "figure-1", "kind": "figure", "status": "omitted_no_evidence", "anchors": [anchor],
+            }]})
+            with zipfile.ZipFile(generated) as package:
+                with Image.open(io.BytesIO(package.read("word/media/immutable.png"))) as image:
+                    self.assertEqual(image.size, (40, 24))
+                self.assertIn(b"documented rear-impact damage", package.read("word/document.xml"))
+                self.assertEqual(package.read("word/header1.xml"), HEADER)
+            with zipfile.ZipFile(omitted) as package:
+                document = package.read("word/document.xml")
+                root = etree.fromstring(document)
+                self.assertFalse(root.xpath("//w:drawing", namespaces={"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}))
+                self.assertNotIn(b"Photograph 1", document)
+                self.assertEqual(package.read("word/media/immutable.png"), b"preserve-me")
+
+    def test_ocr_preserves_amounts_geometry_tables_and_never_creates_regex_facts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "bill.png"
+            Image.new("RGB", (200, 100), "white").save(source, format="PNG")
+            extraction = extract_source(str(source), "image/png", FixtureOcrProvider())
+            self.assertEqual(extraction["pages"][0]["extractionMethod"], "ocr")
+            self.assertIn("$12,345.67", extraction["pages"][0]["text"])
+            self.assertEqual(extraction["pages"][0]["confidence"], 0.97)
+            self.assertEqual(extraction["pages"][0]["structuredData"]["tables"][0]["cells"][0]["text"], "$12,345.67")
+            self.assertEqual(extraction["facts"], [])
+
+    def test_scanned_page_without_configured_ocr_is_visible_and_not_authoritative(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "scan.pdf"
+            writer = PdfWriter()
+            writer.add_blank_page(width=612, height=792)
+            with source.open("wb") as output:
+                writer.write(output)
+            extraction = extract_source(str(source), "application/pdf")
+            self.assertEqual(extraction["pages"][0]["extractionStatus"], "ocr-required")
+            self.assertEqual(extraction["pages"][0]["text"], "")
+            self.assertTrue(extraction["pages"][0]["visualInput"])
+            self.assertEqual(extraction["pages"][0]["visualMimeType"], "image/png")
+            self.assertTrue(extraction["pages"][0]["visualDataBase64"])
 
 
 if __name__ == "__main__":

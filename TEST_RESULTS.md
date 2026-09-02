@@ -1,13 +1,48 @@
 # Test Results
 
-Last run: 2026-09-01 on macOS with Node 22.23, locked Python 3.13 worker dependencies, Google Chrome, headless LibreOffice, and the live AWS deployment at `https://13.219.250.195.sslip.io` in `us-east-1`.
+Deployment acceptance run: 2026-09-01 on macOS with Node 22.23, locked Python 3.13 worker dependencies, Google Chrome, headless LibreOffice, and the live AWS deployment at `https://13.219.250.195.sslip.io` in `us-east-1`.
+
+Latest schema-v2 local acceptance: 2026-09-02 on macOS against isolated local web/API processes, PostgreSQL, direct OpenAI `gpt-5.6-sol`, the deterministic mock, Google Chrome, and headless LibreOffice. No deployed resource or git remote was changed.
+
+## Schema-v2 redesign acceptance
+
+- `pnpm verify` passed with 5 contract, 59 API, 2 web-client, and 17 Python worker tests (83 total), followed by production API/web builds.
+- The template-confirmation route returned `400` for the former unversioned body and `200` for the identical `{ schemaVersion: 2, blocks }` map, persisting a new immutable map version while existing matters remained pinned to their prior version.
+- Three routed Playwright tests passed for template-card containment, the synchronized annotated-letter map at 1280x720 and 1100x720, and the generated Review workbench including one-click omission approval. A fourth isolated full-stack Playwright workflow passed against PostgreSQL with the deterministic provider, including upload, evidence review, whole-document generation, stale-evidence locking, regeneration, direct/AI edit confirmation, activity, and Word download.
+- OpenAI accepted the strict generation schema after a model-facing optional-citation defect was repaired. The complete synthetic context then validated 9/9 generation targets, 17/17 inline fields, and 17 generated blocks. The queued API path persisted draft v1 with 6 generated and 3 explicit `omitted_no_evidence` outcomes; three audited confirmations advanced it to v4 and canonical readiness became fully ready.
+- The exported deterministic acceptance document at `output/docx/acceptance/naomi-carter-schema-v2.docx` passed ZIP integrity and rendered as five US-letter pages. Every page was visually inspected. Narrative contraction/expansion, the reconstructed expense group, inline field substitution, and the uploaded damage-photo replacement remained inside the original package. The apparent top-edge continuation-header clipping is inherited from the source DOCX and reproduces when the untouched template is rendered.
+- The synthetic Naomi Carter packet contains six one-page PDFs and one standalone image. All seven source visuals were rendered or opened and inspected before acceptance.
+- The one-time scoped local reset removed 46 disposable templates, 71 matters, 132 AI runs, 812 activity records, and 4,054 citations, with dependent maps/jobs/drafts/sources removed by their scoped cascades. The workspace seed and all four actor seeds were preserved. The deleted database rows are not recoverable from PostgreSQL; source fixtures remain on disk.
+
+The strict-contract acceptance deliberately exercised fail-closed behavior. An initial live generation revealed no partial document when OpenAI rejected an invalid nested strict schema and Anthropic returned incomplete JSON. After the schema repair, a second validator rejection showed that exact-string field matching incorrectly rejected a cited deadline reformatted for a heading. Requiring an exact citation from the same source/page while permitting presentation formatting fixed that case; the subsequent full-context and queued OpenAI runs passed. Elastic run paragraphs sharing one target's final exemplar also no longer trigger a false duplicate-anchor blocker; true cross-target collisions remain blocked.
+
+Prior whole-context live-provider smoke: 2026-09-02 on macOS against `http://127.0.0.1:5173`, direct OpenAI `gpt-5.6-sol`, and AWS Textract in `us-east-1`.
+
+## Local whole-context live-provider smoke
+
+This smoke used fictional test data only: one hash-distinct DOCX template, five born-digital one-page PDFs, and one scanned PNG deliberately conflicting with the treatment record. It exercised the visible combined-upload flow and real external providers rather than the deterministic test provider.
+
+| Stage | Live result |
+|---|---|
+| Template analysis | Pass after repair; OpenAI completed in 30.835 seconds and returned 4 Replace blocks, 5 Keep blocks, 5 headings, and 4 inline fields against the original template text |
+| Source extraction and OCR | Pass; five PDF pages used native extraction at confidence 1.0000, while the scanned PNG used Textract OCR at confidence 0.9997 with text and geometry retained |
+| Advisory evidence review | Pass; OpenAI completed in 37.427 seconds, proposed provenance-backed values, cited the OCR page, surfaced the deliberate 8-versus-12-visit conflict, and left Generate available |
+| Whole-document generation | Pass after repair; OpenAI completed in 68.841 seconds, returned exactly 14 mapped regions for 14 template blocks, produced 8 validated citations, emitted no Keep output, and left the conflicting replacement unresolved rather than guessing |
+| Draft review | Pass; a missing header/footer field was explicitly confirmed, the conflicting treatment region was directly edited and confirmed with a review note, and the immutable draft advanced to version 5 |
+| Export readiness | Pass; evidence-review warnings did not block generation, while draft issues blocked export until resolved; canonical readiness then reported no block, field, duplicate, image, stale-evidence, or review-flag blockers |
+| Word export | Pass; export used no model, produced a valid Microsoft OOXML package, retained the same 18 package parts, and changed only `word/document.xml` and `word/header1.xml` |
+| Browser/runtime inspection | Pass; the tested page reported no console errors or warnings, and the live local server remained available for manual testing |
+
+The final export is `/private/tmp/steno-live-whole-context-smoke/whole-context-live-v5.docx`, SHA-256 `f1293d65079f43cb02275e136c1592d051ac57825463b5f09b26ae502660a166`. Archive integrity passed; both previous-case markers were absent; the new claim number, reviewed footer value, reviewed treatment text, medical total, and lost-wage total were present.
+
+The live run exposed and repaired five integration defects: duplicate model-proposed inline keys, unmapped model notes becoming extra document blocks, repeated old literals collapsing distinct semantic fields, confirmed fields not refreshing Keep previews, and export readiness comparing incompatible field-key namespaces. Development retries failed closed while these contracts were repaired. The final successful generation used OpenAI; a real Anthropic fallback was also exercised during an earlier repair attempt. Because this was an iterative debugging run, its raw provider-call count is not the clean-flow acceptance count; the intended clean flow remains three model calls for a new template and two for a confirmed template.
 
 ## Final automated gates
 
 | Gate | Result |
 |---|---|
-| `pnpm verify` | Passed: typecheck; 4 contract, 41 API, 2 web-client, and 10 Python worker tests (57 total); production API/web build |
-| Local Playwright workflows | Passed 2 tests in 11.3 seconds with the deterministic provider, including long-name containment at desktop and narrow widths |
+| `pnpm verify` | Passed on 2026-09-02: typecheck; 5 contract, 59 API, 2 web-client, and 17 Python worker tests (83 total); production API/web build |
+| Local Playwright workflows | Passed 4 schema-v2 tests: 3 routed visual/interaction regressions plus 1 isolated deterministic full-stack workflow |
 | Deployed template-picker Playwright | Passed in 1.6 seconds against the public AWS bundle; live API metadata and a real-record screenshot were independently inspected |
 | Final deployed Playwright workflow | Passed in 8.6 minutes against the public URL and live OpenAI runtime |
 | Complete ten-source live AI workflow | Passed: evidence review, 35/35 editable mappings, 61 independently refetched citation quotes, explicit post-refinement confirmation, canonical readiness, and Word export |

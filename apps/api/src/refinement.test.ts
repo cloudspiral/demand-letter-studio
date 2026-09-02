@@ -3,7 +3,7 @@ import { RefinementProposalSchema, type GeneratedDraft } from "@steno/contracts"
 import { applyDirectDraftEdits, applyRefinementProposal, confirmDraftBlock, validateProposalTargets } from "./refinement";
 
 const content: GeneratedDraft = {
-  title: "Demand", matterName: "Canary", fields: {}, warnings: [], reviewFlags: [],
+  title: "Demand", matterName: "Canary", fields: {}, warnings: [], reviewFlags: [], outcomes: [],
   sections: [{ id: "facts", heading: null, blocks: [
     { id: "one", kind: "paragraph", text: "This is very clear.", templateParagraphIndex: 1, citations: [], verified: true },
     { id: "two", kind: "paragraph", text: "This is very concise.", templateParagraphIndex: 2, citations: [], verified: true },
@@ -54,6 +54,26 @@ describe("atomic refinement proposals", () => {
 
   it("rejects structural changes submitted through the direct edit endpoint", () => {
     expect(() => applyDirectDraftEdits(content, { ...content, sections: [] })).toThrow(/template structure/i);
+  });
+
+  it("never permits direct or AI edits to confirmed Keep language", () => {
+    const locked: GeneratedDraft = {
+      ...content,
+      sections: [{ ...content.sections[0]!, blocks: content.sections[0]!.blocks.map((block, index) => index === 0
+        ? { ...block, templateParagraphIndex: null, templateRole: "keep" as const, locked: true }
+        : block) }],
+    };
+    const directCandidate: GeneratedDraft = {
+      ...locked,
+      sections: [{ ...locked.sections[0]!, blocks: locked.sections[0]!.blocks.map((block, index) => index === 0 ? { ...block, text: "Changed keep text." } : block) }],
+    };
+    expect(() => applyDirectDraftEdits(locked, directCandidate)).toThrow(/Keep language/i);
+    const proposal = RefinementProposalSchema.parse({
+      edits: [{ blockId: "one", targetText: "This", replacementText: "That", start: 0, end: 4 }],
+      summary: "Attempted Keep edit", citedSourceIds: [],
+    });
+    expect(() => applyRefinementProposal(locked, proposal)).toThrow(/Keep language/i);
+    expect(() => confirmDraftBlock(locked, "one", "Changed keep text.")).toThrow(/Keep language/i);
   });
 
   it("never resolves a warning merely because its text was edited", () => {

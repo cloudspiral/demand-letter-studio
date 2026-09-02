@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS matters (
   workspace_id uuid NOT NULL REFERENCES workspaces(id),
   name text NOT NULL,
   template_id uuid REFERENCES templates(id),
+  template_map_version integer,
   created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS source_documents (
@@ -57,6 +58,14 @@ CREATE TABLE IF NOT EXISTS source_pages (
   source_id uuid NOT NULL REFERENCES source_documents(id) ON DELETE CASCADE,
   page_number integer NOT NULL,
   extracted_text text NOT NULL,
+  extraction_method text NOT NULL DEFAULT 'native',
+  extraction_status text NOT NULL DEFAULT 'ready',
+  extraction_confidence numeric(5,4),
+  geometry jsonb NOT NULL DEFAULT '[]'::jsonb,
+  structured_data jsonb NOT NULL DEFAULT '{}'::jsonb,
+  visual_input boolean NOT NULL DEFAULT false,
+  visual_data bytea,
+  visual_mime_type text,
   UNIQUE(source_id, page_number)
 );
 CREATE TABLE IF NOT EXISTS facts (
@@ -122,6 +131,8 @@ CREATE TABLE IF NOT EXISTS citations (
   source_id uuid NOT NULL REFERENCES source_documents(id),
   page_number integer NOT NULL,
   quote text NOT NULL,
+  evidence_type text NOT NULL DEFAULT 'text',
+  visual_description text,
   created_at timestamptz NOT NULL DEFAULT now(),
   FOREIGN KEY (draft_id, draft_version) REFERENCES draft_versions(draft_id, version) ON DELETE CASCADE
 );
@@ -161,6 +172,32 @@ CREATE TABLE IF NOT EXISTS ai_runs (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS template_map_versions (
+  template_id uuid NOT NULL REFERENCES templates(id) ON DELETE CASCADE,
+  map_version integer NOT NULL,
+  analysis_version integer NOT NULL,
+  template_hash text NOT NULL,
+  map jsonb NOT NULL,
+  actor_id uuid REFERENCES actors(id),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (template_id, map_version)
+);
+CREATE TABLE IF NOT EXISTS matter_review_resolutions (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  matter_id uuid NOT NULL REFERENCES matters(id) ON DELETE CASCADE,
+  target_id text NOT NULL,
+  source_fingerprint text NOT NULL CHECK (source_fingerprint ~ '^[a-f0-9]{64}$'),
+  action text NOT NULL CHECK (action IN ('omit')),
+  actor_id uuid NOT NULL REFERENCES actors(id),
+  draft_id uuid REFERENCES drafts(id) ON DELETE CASCADE,
+  draft_version integer,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CHECK ((draft_id IS NULL AND draft_version IS NULL) OR (draft_id IS NOT NULL AND draft_version IS NOT NULL)),
+  UNIQUE (matter_id, target_id, source_fingerprint)
+);
+CREATE INDEX IF NOT EXISTS matter_review_resolutions_current
+  ON matter_review_resolutions (matter_id, source_fingerprint, target_id);
+
 ALTER TABLE jobs ALTER COLUMN status SET DEFAULT 'queued';
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS result jsonb;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS base_version integer;
@@ -168,6 +205,19 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS source_fingerprint text;
 ALTER TABLE draft_versions ADD COLUMN IF NOT EXISTS source_fingerprint text;
 ALTER TABLE templates ADD COLUMN IF NOT EXISTS display_name text;
 ALTER TABLE templates ADD COLUMN IF NOT EXISTS is_test boolean NOT NULL DEFAULT false;
+ALTER TABLE templates ADD COLUMN IF NOT EXISTS current_map_version integer;
+ALTER TABLE matters ADD COLUMN IF NOT EXISTS template_map_version integer;
+ALTER TABLE draft_versions ADD COLUMN IF NOT EXISTS template_map_version integer;
+ALTER TABLE source_pages ADD COLUMN IF NOT EXISTS extraction_method text NOT NULL DEFAULT 'native';
+ALTER TABLE source_pages ADD COLUMN IF NOT EXISTS extraction_status text NOT NULL DEFAULT 'ready';
+ALTER TABLE source_pages ADD COLUMN IF NOT EXISTS extraction_confidence numeric(5,4);
+ALTER TABLE source_pages ADD COLUMN IF NOT EXISTS geometry jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE source_pages ADD COLUMN IF NOT EXISTS structured_data jsonb NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE source_pages ADD COLUMN IF NOT EXISTS visual_input boolean NOT NULL DEFAULT false;
+ALTER TABLE source_pages ADD COLUMN IF NOT EXISTS visual_data bytea;
+ALTER TABLE source_pages ADD COLUMN IF NOT EXISTS visual_mime_type text;
+ALTER TABLE citations ADD COLUMN IF NOT EXISTS evidence_type text NOT NULL DEFAULT 'text';
+ALTER TABLE citations ADD COLUMN IF NOT EXISTS visual_description text;
 DROP INDEX IF EXISTS jobs_one_active_type_per_matter;
 CREATE UNIQUE INDEX IF NOT EXISTS jobs_one_active_generation_per_matter
   ON jobs (matter_id)
@@ -209,18 +259,6 @@ export async function migrate(): Promise<void> {
     ]);
   }
   await pool.query("ALTER TABLE templates ALTER COLUMN display_name SET NOT NULL");
-  const missingFingerprints = await pool.query<{ draft_id: string; matter_id: string }>(`
-    SELECT DISTINCT dv.draft_id, d.matter_id
-    FROM draft_versions dv
-    JOIN drafts d ON d.id = dv.draft_id
-    WHERE dv.source_fingerprint IS NULL
-  `);
-  for (const row of missingFingerprints.rows) {
-    await pool.query(
-      "UPDATE draft_versions SET source_fingerprint = $2 WHERE draft_id = $1 AND source_fingerprint IS NULL",
-      [row.draft_id, await sourceFingerprintForMatter(row.matter_id)],
-    );
-  }
 }
 
 export const WORKSPACE_ID = "00000000-0000-4000-8000-000000000001";
@@ -252,15 +290,18 @@ export async function persistCitations(
   client: pg.PoolClient,
   draftId: string,
   version: number,
-  content: { sections: Array<{ blocks: Array<{ id: string; citations: Array<{ sourceId: string; page: number | null; quote: string }> }> }> },
+  content: {
+    sections: Array<{ blocks: Array<{ id: string; citations: Array<{ sourceId: string; page: number | null; quote: string; evidenceType?: "text" | "visual" | undefined; visualDescription?: string | null | undefined }> }> }>;
+    outcomes?: Array<{ id: string; citations: Array<{ sourceId: string; page: number | null; quote: string; evidenceType?: "text" | "visual" | undefined; visualDescription?: string | null | undefined }> }>;
+  },
 ): Promise<void> {
-  for (const block of content.sections.flatMap((section) => section.blocks)) {
+  for (const block of [...content.sections.flatMap((section) => section.blocks), ...(content.outcomes ?? [])]) {
     for (const citation of block.citations) {
       if (citation.page !== null) {
         await client.query(`
-          INSERT INTO citations (draft_id, draft_version, block_id, source_id, page_number, quote)
-          VALUES ($1, $2, $3, $4, $5, $6)
-        `, [draftId, version, block.id, citation.sourceId, citation.page, citation.quote]);
+          INSERT INTO citations (draft_id, draft_version, block_id, source_id, page_number, quote, evidence_type, visual_description)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        `, [draftId, version, block.id, citation.sourceId, citation.page, citation.quote, citation.evidenceType ?? "text", citation.visualDescription ?? null]);
       }
     }
   }

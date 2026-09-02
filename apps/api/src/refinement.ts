@@ -14,6 +14,9 @@ export function applyDirectDraftEdits(current: GeneratedDraft, candidate: Genera
       blocks: section.blocks.map((block) => {
         const nextText = candidateBlocks.get(block.id)?.text ?? block.text;
         if (nextText === block.text) return block;
+        if (block.locked || block.templateRole === "keep") {
+          throw new Error("Direct edits cannot change exact Keep language from the confirmed template map.");
+        }
         return {
           ...block,
           text: nextText,
@@ -59,6 +62,9 @@ export function applyRefinementProposal(content: GeneratedDraft, proposal: Refin
       blocks: section.blocks.map((block) => {
         const edits = grouped.get(block.id);
         if (!edits?.length) return block;
+        if (block.locked || block.templateRole === "keep") {
+          throw new Error("AI refinements cannot change exact Keep language from the confirmed template map.");
+        }
         const ordered = [...edits].sort((a, b) => a.start - b.start);
         for (let index = 0; index < ordered.length; index += 1) {
           const edit = ordered[index];
@@ -98,6 +104,9 @@ export function confirmDraftBlock(
       blocks: section.blocks.map((block) => {
         if (block.id !== blockId) return block;
         found = true;
+        if (block.locked || block.templateRole === "keep") {
+          throw new Error("Attorney confirmation cannot change exact Keep language from the confirmed template map.");
+        }
         return {
           ...block,
           kind: block.kind === "warning" ? "paragraph" as const : block.kind,

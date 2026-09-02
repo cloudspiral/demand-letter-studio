@@ -1,12 +1,13 @@
 import { describe, expect, it } from "vitest";
 import type { GeneratedDraft } from "@steno/contracts";
-import { confirmDraftField, exportableFieldReplacements } from "./draft-fields";
+import { confirmDraftField, exportableFieldKeys, exportableFieldReplacements } from "./draft-fields";
 
 const draft: GeneratedDraft = {
   title: "Demand",
   matterName: "Example",
   warnings: [],
   reviewFlags: [],
+  outcomes: [],
   sections: [],
   fields: {
     legacy: { value: "LEGACY", verified: true, confidence: null, userConfirmed: false, sourceId: null, page: null, sourceLabel: null },
@@ -33,5 +34,11 @@ describe("draft field safety", () => {
       strong: "STRONG",
       weak: "CORRECTED",
     });
+    expect(exportableFieldKeys({
+      semantic_claim_number: {
+        value: "NEW-123", templateValue: "OLD-999", verified: true, confidence: 1,
+        userConfirmed: false, sourceId: null, page: null, sourceLabel: null,
+      },
+    })).toEqual(["semantic_claim_number"]);
   });
 });

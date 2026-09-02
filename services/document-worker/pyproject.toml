@@ -4,9 +4,12 @@ version = "0.1.0"
 description = "Page-aware evidence extraction and structure-preserving DOCX operations for Demand Letter Studio."
 requires-python = ">=3.12,<3.14"
 dependencies = [
+  "boto3[crt]==1.43.83",
+  "botocore==1.43.83",
   "lxml==6.0.1",
   "pillow==11.3.0",
   "pypdf==6.0.0",
+  "pypdfium2==4.30.0",
   "python-docx==1.2.0",
 ]
 

@@ -35,7 +35,18 @@ export const SourceExtractionSchema = z.object({
   filename: z.string(),
   mimeType: z.string(),
   pageCount: z.number().int().nonnegative(),
-  pages: z.array(z.object({ page: z.number().int().positive(), text: z.string() })),
+  pages: z.array(z.object({
+    page: z.number().int().positive(),
+    text: z.string(),
+    extractionMethod: z.enum(["native", "ocr", "visual", "none"]),
+    extractionStatus: z.enum(["ready", "ocr-required", "ocr-failed", "visual-only"]),
+    confidence: z.number().min(0).max(1).nullable(),
+    geometry: z.array(z.unknown()),
+    structuredData: z.unknown(),
+    visualInput: z.boolean(),
+    visualDataBase64: z.string().nullable(),
+    visualMimeType: z.enum(["image/png", "image/jpeg", "image/webp", "image/gif"]).nullable(),
+  })),
   facts: z.array(ExtractedFactSchema),
   sha256: z.string(),
 });
@@ -59,9 +70,34 @@ export async function extractSource(path: string, mimeType: string) {
 export async function exportDocx(payload: {
   templatePath: string;
   outputPath: string;
-  patches: Array<{ paragraphIndex: number; text: string }>;
+  patches: Array<{ partName: string; paragraphIndex: number; text: string }>;
   fieldReplacements: Record<string, string>;
   imageReplacements?: Array<{ partName: string; sourcePath: string }>;
+  targetOperations?: Array<{
+    targetId: string;
+    kind: "narrative" | "structured" | "figure";
+    status: "generated" | "omitted_no_evidence" | "omitted_not_applicable";
+    anchors: Array<{
+      blockId: string;
+      partName: string;
+      paragraphIndex: number;
+      structuredGroup?: {
+        id: string;
+        representation: "word-table" | "paragraph-rows";
+        rowRole: "header" | "body" | "total";
+        tableIndex: number | null;
+        rowIndex: number | null;
+        cellIndex: number | null;
+        columnCount: number;
+        columnWidths: number[];
+      } | null;
+      figure?: { relationshipId: string; partName: string; contentType: string; captionBlockId: string | null } | null;
+    }>;
+    paragraphs?: string[];
+    rows?: Array<{ role: "body" | "total"; cells: string[] }>;
+    caption?: string | null;
+    sourcePath?: string | null;
+  }>;
 }) {
   return runDocumentOperation({ operation: "export-docx", ...payload }, ExportResultSchema);
 }

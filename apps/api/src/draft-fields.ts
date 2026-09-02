@@ -1,5 +1,9 @@
 import type { GeneratedDraft } from "@steno/contracts";
 
+const isExportableField = (field: GeneratedDraft["fields"][string]): boolean => (
+  field.userConfirmed || (field.verified && (field.confidence ?? 1) >= 0.8)
+) && field.value !== "[ATTORNEY REVIEW REQUIRED]";
+
 export function confirmDraftField(content: GeneratedDraft, key: string, value: string) {
   const field = content.fields[key];
   if (!field) throw new Error("Draft field not found.");
@@ -17,8 +21,12 @@ export function confirmDraftField(content: GeneratedDraft, key: string, value: s
 
 export function exportableFieldReplacements(fields: GeneratedDraft["fields"]): Record<string, string> {
   return Object.fromEntries(Object.entries(fields)
-    .filter(([, field]) => (
-      field.userConfirmed || (field.verified && (field.confidence ?? 1) >= 0.8)
-    ) && field.value !== "[ATTORNEY REVIEW REQUIRED]")
-    .map(([key, field]) => [key, field.value]));
+    .filter(([, field]) => isExportableField(field))
+    .map(([key, field]) => [field.templateValue ?? key, field.value]));
+}
+
+export function exportableFieldKeys(fields: GeneratedDraft["fields"]): string[] {
+  return Object.entries(fields)
+    .filter(([, field]) => isExportableField(field))
+    .map(([key]) => key);
 }

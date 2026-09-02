@@ -1,6 +1,15 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: Demand Letter Studio local-first AWS deployment shape
+Description: Demand Letter Studio document pipeline - preserves original files and grounds generated drafts in page-level evidence
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@2
+  com.aws.cloudformation.Context:
+    arch: API + S3 originals + SQS document worker; worker uses Textract only when native PDF text is insufficient
+    must:
+      - original DOCX and case files remain immutable
+      - model input retains source id + filename + page; no hidden case summary
 
 Globals:
   Function:
@@ -17,6 +26,13 @@ Globals:
 Resources:
   ApiFunction:
     Type: AWS::Serverless::Function
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: serves intake, versioned review, generation jobs, and deterministic DOCX export
+        must:
+          - database credential stays a deployment-time Secrets Manager reference
+          - generation never writes model-produced OOXML
+        mutable: change-with-constraints
     Properties:
       CodeUri: ../apps/api
       Handler: dist/lambda.handler
@@ -34,12 +50,22 @@ Resources:
 
   DocumentWorker:
     Type: AWS::Serverless::Function
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: extracts exact DOCX structure + page text; Textract handles scanned pages/forms/tables behind the same local provider interface
+        must:
+          - Textract output keeps source/page + confidence + geometry; failed OCR is explicit
+          - IAM permits AnalyzeDocument only; no secret-value reads
+        mutable: change-with-constraints
     Properties:
       Runtime: python3.13
       CodeUri: ../services/document-worker
       Handler: lambda_handler.handler
       Timeout: 900
       MemorySize: 2048
+      Environment:
+        Variables:
+          OCR_PROVIDER: textract
       Events:
         Generation:
           Type: SQS
@@ -49,9 +75,21 @@ Resources:
       Policies:
         - S3CrudPolicy:
             BucketName: !Ref DocumentBucket
+        - Statement:
+            - Sid: AnalyzeScannedCasePages
+              Effect: Allow
+              Action: textract:AnalyzeDocument
+              Resource: '*'
 
   GenerationQueue:
     Type: AWS::SQS::Queue
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: isolates long document work from HTTP request lifetime; DLQ retains poison jobs for diagnosis
+        must:
+          - VisibilityTimeout > DocumentWorker timeout
+          - redrive after 3 receives; do not silently discard failed document jobs
+        mutable: change-with-constraints
     Properties:
       VisibilityTimeout: 960
       RedrivePolicy:
@@ -60,9 +98,26 @@ Resources:
 
   GenerationDeadLetterQueue:
     Type: AWS::SQS::Queue
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: retains failed document jobs for diagnosis and controlled replay
+        must:
+          - keep compatible with GenerationQueue redrive
+        mutable: change-with-constraints
 
   DocumentBucket:
     Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: immutable originals + versioned generated artifacts; S3 versioning protects deterministic export lineage
+        must:
+          - block all public access + encrypt at rest + keep versioning enabled
+          - retain on stack deletion or replacement; files are case evidence
+        mutable: change-with-constraints
+        mutability:
+          VersioningConfiguration: must-never-change
     Properties:
       BucketEncryption:
         ServerSideEncryptionConfiguration:
@@ -78,4 +133,5 @@ Resources:
 
 Outputs:
   ApiUrl:
+    Description: HTTPS endpoint for the Demand Letter Studio API
     Value: !Sub https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com

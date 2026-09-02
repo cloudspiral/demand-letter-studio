@@ -10,9 +10,11 @@ import { z } from "zod";
 import {
   EvidenceReviewSchema,
   GeneratedDraftSchema,
+  ReviewResolutionSchema,
   RefinementAnnotationSchema,
   RefinementProposalSchema,
   TemplateAnalysisSchema,
+  TemplateMapSchema,
   TemplateRegionSchema,
   type GeneratedDraft,
 } from "@steno/contracts";
@@ -22,7 +24,7 @@ import { ACTOR_ID, migrate, persistCitations, pool, sourceFingerprintForMatter, 
 import { analyzeTemplate, exportDocx, extractSource } from "./document-worker";
 import { draftExportIssues, isDraftExportReady } from "./draft-export";
 import { confirmDraftField, exportableFieldReplacements } from "./draft-fields";
-import { appendJobEvent, processEvidenceReviewJob, processGenerationJob, recordAiRun, resumeQueuedJobs } from "./jobs";
+import { appendJobEvent, ensureEditableCoverage, processEvidenceReviewJob, processGenerationJob, recordAiRun, resumeQueuedJobs } from "./jobs";
 import { applyDirectDraftEdits, applyRefinementProposal, confirmDraftBlock, validateProposalTargets } from "./refinement";
 import { pathForKey, putFile } from "./storage";
 import {
@@ -31,9 +33,13 @@ import {
   templateDisplayName,
   testTemplateFromHeader,
 } from "./template-metadata";
+import { analysisWithConfirmedMap, deriveGenerationTargets, validateConfirmedBlocks } from "./template-map";
 
 const CreateMatterSchema = z.object({ name: z.string().min(1).max(200), templateId: z.string().uuid() });
-const ConfirmTemplateSchema = z.object({ regions: z.array(TemplateRegionSchema).min(1) });
+const ConfirmTemplateSchema = z.object({
+  schemaVersion: z.literal(2),
+  blocks: z.array(TemplateRegionSchema).min(1),
+});
 const SaveDraftSchema = z.object({ version: z.number().int().positive(), content: GeneratedDraftSchema });
 const GenerationRequestSchema = z.object({
   draftId: z.string().uuid().optional(),
@@ -68,11 +74,19 @@ const ConfirmBlockSchema = z.object({
   }),
   note: z.string().trim().min(3).max(1_000),
 });
+const ReviewResolutionRequestSchema = z.object({
+  sourceFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+  action: z.enum(["omit", "clear"]),
+});
+const ConfirmOutcomeSchema = z.object({ version: z.number().int().positive() });
 
 const mimeFor = (filename: string): string => {
   const extension = path.extname(filename).toLowerCase();
   if (extension === ".pdf") return "application/pdf";
-  if ([".png", ".jpg", ".jpeg", ".webp"].includes(extension)) return extension === ".png" ? "image/png" : "image/jpeg";
+  if (extension === ".png") return "image/png";
+  if ([".jpg", ".jpeg"].includes(extension)) return "image/jpeg";
+  if (extension === ".webp") return "image/webp";
+  if (extension === ".gif") return "image/gif";
   return "application/octet-stream";
 };
 
@@ -99,6 +113,34 @@ function requiredRow<T>(rows: T[], message: string): T {
   return row;
 }
 
+async function startScopedJob(matterId: string, jobType: "template_analysis" | "source_extraction", step: string): Promise<string> {
+  const result = await pool.query<{ id: string }>(`
+    INSERT INTO jobs (matter_id, job_type, status, progress, step, attempts)
+    VALUES ($1, $2, 'processing', 5, $3, 1)
+    RETURNING id
+  `, [matterId, jobType, step]);
+  const jobId = requiredRow(result.rows, `${jobType} job insert did not return an id.`).id;
+  await appendJobEvent(jobId, "progress", { progress: 5, step });
+  return jobId;
+}
+
+async function completeScopedJob(jobId: string, step: string, result: Record<string, unknown>): Promise<void> {
+  await pool.query(`
+    UPDATE jobs SET status = 'completed', progress = 100, step = $2, result = $3, updated_at = now()
+    WHERE id = $1
+  `, [jobId, step, JSON.stringify(result)]);
+  await appendJobEvent(jobId, "completed", { progress: 100, step, result });
+}
+
+async function failScopedJob(jobId: string, step: string, error: unknown): Promise<void> {
+  const message = error instanceof Error ? error.message.slice(0, 500) : step;
+  await pool.query(`
+    UPDATE jobs SET status = 'failed', step = $2, error = $3, updated_at = now()
+    WHERE id = $1
+  `, [jobId, step, message]);
+  await appendJobEvent(jobId, "failed", { step, error: message });
+}
+
 type TemplateRecord = {
   id: string;
   name: string;
@@ -107,6 +149,9 @@ type TemplateRecord = {
   status: "analyzed" | "confirmed";
   analysis: unknown;
   confirmedRegions: unknown;
+  currentMapVersion: number | null;
+  confirmedMap?: unknown;
+  storageKey?: string;
   createdAt: Date;
 };
 
@@ -121,40 +166,108 @@ async function insertTemplate(buffer: Buffer, filename: string, options: { isTes
     isTest: options.isTest ?? false,
   };
   const stored = await putFile(buffer, originalName);
-  const rawAnalysis = await analyzeTemplate(stored.path);
   const existing = await pool.query<TemplateRecord>(`
     SELECT id, name, display_name AS "displayName", is_test AS "isTest", status, analysis,
-           confirmed_regions AS "confirmedRegions", created_at AS "createdAt"
+           confirmed_regions AS "confirmedRegions", current_map_version AS "currentMapVersion",
+           (SELECT map FROM template_map_versions WHERE template_id = templates.id AND map_version = templates.current_map_version) AS "confirmedMap",
+           created_at AS "createdAt"
     FROM templates WHERE workspace_id = $1 AND sha256 = $2 ORDER BY created_at DESC LIMIT 1
   `, [WORKSPACE_ID, stored.sha256]);
   if (existing.rowCount) {
     const current = requiredRow(existing.rows, "Existing template lookup failed.");
     const provenance = mergedTemplateProvenance(current, uploadMetadata);
-    const currentVersion = TemplateAnalysisSchema.parse(current.analysis).analysisVersion;
-    const analysis = currentVersion >= rawAnalysis.analysisVersion
-      ? current.analysis
-      : { ...rawAnalysis, filename: templateAnalysisFilename(provenance.displayName) };
+    const currentAnalysis = TemplateAnalysisSchema.parse(current.analysis);
+    const analyzedBlocks = currentAnalysis.blocks?.length ? currentAnalysis.blocks : [];
+    const parsedMap = TemplateMapSchema.safeParse(current.confirmedMap);
+    const analyzedBlockIds = new Set(analyzedBlocks.map((block) => block.id ?? `word/document.xml:p:${block.paragraphIndex}`));
+    const confirmedMapIsComplete = current.status === "confirmed"
+      && current.currentMapVersion
+      && currentAnalysis.analysisVersion >= 5
+      && analyzedBlocks.length > 0
+      && parsedMap.success
+      && parsedMap.data.templateHash === stored.sha256
+      && parsedMap.data.blocks.length === analyzedBlocks.length
+      && parsedMap.data.blocks.every((block) => analyzedBlockIds.has(block.id ?? `word/document.xml:p:${block.paragraphIndex}`));
+    if (confirmedMapIsComplete) {
+      return current;
+    }
+    if (current.status === "analyzed" && currentAnalysis.analysisVersion >= 5 && analyzedBlocks.length) {
+      return current;
+    }
+    const structuralAnalysis = TemplateAnalysisSchema.parse({
+      ...await analyzeTemplate(stored.path),
+      filename: templateAnalysisFilename(provenance.displayName),
+    });
+    const provider = createAiProvider();
+    const started = performance.now();
+    let analysis;
+    try {
+      analysis = await provider.analyzeTemplate({
+        filename: originalName,
+        templateHash: stored.sha256,
+        structuralAnalysis,
+      });
+      await recordAiRun({ matterId: null, provider, purpose: "template_analysis", status: "completed", latencyMs: performance.now() - started });
+    } catch (error) {
+      await recordAiRun({ matterId: null, provider, purpose: "template_analysis", status: "failed", latencyMs: performance.now() - started, errorCode: error instanceof Error ? error.name : "unknown" });
+      throw error;
+    }
+    if (current.status === "confirmed") {
+      const replacement = await pool.query<TemplateRecord>(`
+        INSERT INTO templates (workspace_id, name, display_name, is_test, status, storage_key, sha256, analysis)
+        VALUES ($1, $2, $3, $4, 'analyzed', $5, $6, $7)
+        RETURNING id, name, display_name AS "displayName", is_test AS "isTest", status, analysis,
+                  confirmed_regions AS "confirmedRegions", current_map_version AS "currentMapVersion", created_at AS "createdAt"
+      `, [
+        WORKSPACE_ID,
+        provenance.name,
+        provenance.displayName,
+        provenance.isTest,
+        stored.key,
+        stored.sha256,
+        JSON.stringify(analysis),
+      ]);
+      return requiredRow(replacement.rows, "Replacement template analysis did not return a record.");
+    }
     if (
       provenance.name === current.name
       && provenance.displayName === current.displayName
       && provenance.isTest === current.isTest
-      && analysis === current.analysis
+      && JSON.stringify(analysis) === JSON.stringify(current.analysis)
     ) return current;
     const updated = await pool.query<TemplateRecord>(`
       UPDATE templates
-      SET name = $2, display_name = $3, is_test = $4, analysis = $5
+      SET name = $2, display_name = $3, is_test = $4, analysis = $5,
+          status = 'analyzed', confirmed_regions = NULL, current_map_version = NULL
       WHERE id = $1
       RETURNING id, name, display_name AS "displayName", is_test AS "isTest", status, analysis,
-                confirmed_regions AS "confirmedRegions", created_at AS "createdAt"
+                confirmed_regions AS "confirmedRegions", current_map_version AS "currentMapVersion", created_at AS "createdAt"
     `, [current.id, provenance.name, provenance.displayName, provenance.isTest, JSON.stringify(analysis)]);
     return requiredRow(updated.rows, "Template update did not return a record.");
   }
-  const analysis = { ...rawAnalysis, filename: templateAnalysisFilename(uploadMetadata.displayName) };
+  const structuralAnalysis = TemplateAnalysisSchema.parse({
+    ...await analyzeTemplate(stored.path),
+    filename: templateAnalysisFilename(uploadMetadata.displayName),
+  });
+  const provider = createAiProvider();
+  const started = performance.now();
+  let analysis;
+  try {
+    analysis = await provider.analyzeTemplate({
+      filename: originalName,
+      templateHash: stored.sha256,
+      structuralAnalysis,
+    });
+    await recordAiRun({ matterId: null, provider, purpose: "template_analysis", status: "completed", latencyMs: performance.now() - started });
+  } catch (error) {
+    await recordAiRun({ matterId: null, provider, purpose: "template_analysis", status: "failed", latencyMs: performance.now() - started, errorCode: error instanceof Error ? error.name : "unknown" });
+    throw error;
+  }
   const result = await pool.query<TemplateRecord>(`
     INSERT INTO templates (workspace_id, name, display_name, is_test, status, storage_key, sha256, analysis)
     VALUES ($1, $2, $3, $4, 'analyzed', $5, $6, $7)
     RETURNING id, name, display_name AS "displayName", is_test AS "isTest", status, analysis,
-              confirmed_regions AS "confirmedRegions", created_at AS "createdAt"
+              confirmed_regions AS "confirmedRegions", current_map_version AS "currentMapVersion", created_at AS "createdAt"
   `, [
     WORKSPACE_ID,
     uploadMetadata.name,
@@ -185,14 +298,23 @@ async function insertSource(matterId: string, buffer: Buffer, filename: string, 
       await client.query("BEGIN");
       for (const page of extraction.pages) {
         await client.query(`
-          INSERT INTO source_pages (source_id, page_number, extracted_text) VALUES ($1, $2, $3)
-        `, [sourceId, page.page, page.text]);
-      }
-      for (const fact of extraction.facts) {
-        await client.query(`
-          INSERT INTO facts (matter_id, source_id, page_number, kind, label, value, confidence)
-          VALUES ($1, $2, $3, $4, $5, $6, $7)
-        `, [matterId, sourceId, fact.page, fact.kind, fact.label, fact.value, fact.confidence]);
+          INSERT INTO source_pages (
+            source_id, page_number, extracted_text, extraction_method, extraction_status,
+            extraction_confidence, geometry, structured_data, visual_input, visual_data, visual_mime_type
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        `, [
+          sourceId,
+          page.page,
+          page.text,
+          page.extractionMethod,
+          page.extractionStatus,
+          page.confidence,
+          JSON.stringify(page.geometry),
+          JSON.stringify(page.structuredData),
+          page.visualInput,
+          page.visualDataBase64 ? Buffer.from(page.visualDataBase64, "base64") : null,
+          page.visualMimeType,
+        ]);
       }
       await client.query(
         "UPDATE source_documents SET page_count = $2, status = 'ready' WHERE id = $1",
@@ -210,8 +332,10 @@ async function insertSource(matterId: string, buffer: Buffer, filename: string, 
     throw error;
   }
   const result = await pool.query(`
-    SELECT id, matter_id AS "matterId", name, mime_type AS "mimeType", page_count AS "pageCount", status
-    FROM source_documents WHERE id = $1
+    SELECT s.id, s.matter_id AS "matterId", s.name, s.mime_type AS "mimeType", s.page_count AS "pageCount", s.status,
+           count(*) FILTER (WHERE p.extraction_status IN ('ocr-required', 'ocr-failed'))::int AS "extractionIssueCount"
+    FROM source_documents s LEFT JOIN source_pages p ON p.source_id = s.id
+    WHERE s.id = $1 GROUP BY s.id
   `, [sourceId]);
   return result.rows[0];
 }
@@ -224,37 +348,44 @@ async function loadDraft(draftId: string) {
     content: unknown;
     sourceFingerprint: string | null;
     templateAnalysis: unknown;
+    templateMap: unknown;
     createdAt: string;
     updatedAt: string;
   }>(`
     SELECT d.id, d.matter_id AS "matterId", d.current_version AS version,
            dv.content, dv.source_fingerprint AS "sourceFingerprint",
-           t.analysis AS "templateAnalysis",
+           t.analysis AS "templateAnalysis", tmv.map AS "templateMap",
            d.created_at AS "createdAt", d.updated_at AS "updatedAt"
     FROM drafts d
     JOIN draft_versions dv ON dv.draft_id = d.id AND dv.version = d.current_version
     JOIN matters m ON m.id = d.matter_id
     JOIN templates t ON t.id = m.template_id
+    JOIN template_map_versions tmv ON tmv.template_id = t.id AND tmv.map_version = dv.template_map_version
     WHERE d.id = $1
   `, [draftId]);
   const row = result.rows[0];
   if (!row) return null;
   const content = GeneratedDraftSchema.parse(row.content);
   const currentSourceFingerprint = await sourceFingerprintForMatter(row.matterId);
-  const imageSources = await pool.query<{ count: string }>(`
-    SELECT count(*)::text AS count
-    FROM source_documents
-    WHERE matter_id = $1 AND status = 'ready' AND mime_type LIKE 'image/%'
-  `, [row.matterId]);
-  const template = TemplateAnalysisSchema.parse(row.templateAnalysis);
+  const template = analysisWithConfirmedMap(
+    TemplateAnalysisSchema.parse(row.templateAnalysis),
+    TemplateMapSchema.parse(row.templateMap),
+  );
+  const activeResolutions = await pool.query<{ target_id: string }>(`
+    SELECT target_id FROM matter_review_resolutions
+    WHERE matter_id = $1 AND source_fingerprint = $2
+  `, [row.matterId, currentSourceFingerprint]);
+  const activeResolutionTargets = new Set(activeResolutions.rows.map((resolution) => resolution.target_id));
+  const staleResolutionTargetIds = content.outcomes
+    .filter((outcome) => ["preapproved", "confirmed"].includes(outcome.resolution) && !activeResolutionTargets.has(outcome.targetId))
+    .map((outcome) => outcome.targetId);
   const readiness = draftExportIssues(content, {
     draftSourceFingerprint: row.sourceFingerprint,
     currentSourceFingerprint,
-    imageCandidates: template.imageCandidates.length,
-    imageSources: Number(imageSources.rows[0]?.count ?? 0),
+    staleResolutionTargetIds,
   });
-  const { templateAnalysis: _templateAnalysis, ...publicRow } = row;
-  return { ...publicRow, content, readiness };
+  const { templateAnalysis: _templateAnalysis, templateMap: _templateMap, ...publicRow } = row;
+  return { ...publicRow, content, readiness, targets: deriveGenerationTargets(template) };
 }
 
 async function evidenceForDraft(draftId: string): Promise<EvidencePage[]> {
@@ -280,7 +411,8 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
   if (options.runMigrations !== false) await migrate();
   const app = Fastify({ logger: { redact: ["req.headers.authorization", "req.headers.cookie", "req.body"] } });
   await app.register(cors, { origin: config.webOrigin });
-  await app.register(multipart, { limits: { fileSize: 30 * 1024 * 1024, files: 10 } });
+  // A new-template intake may contain one DOCX plus the full ten-file case packet.
+  await app.register(multipart, { limits: { fileSize: 30 * 1024 * 1024, files: 11 } });
 
   app.setErrorHandler((error, _request, reply) => {
     const details = error instanceof Error ? error : new Error("Unknown request error");
@@ -301,7 +433,9 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
   app.get("/api/templates", async () => {
     const result = await pool.query(`
       SELECT DISTINCT ON (sha256) id, name, display_name AS "displayName", is_test AS "isTest", status, analysis,
-             confirmed_regions AS "confirmedRegions", created_at AS "createdAt", sha256
+             confirmed_regions AS "confirmedRegions", current_map_version AS "currentMapVersion",
+             (SELECT map FROM template_map_versions WHERE template_id = templates.id AND map_version = templates.current_map_version) AS "confirmedMap",
+             created_at AS "createdAt", sha256
       FROM templates WHERE workspace_id = $1 ORDER BY sha256, created_at DESC
     `, [WORKSPACE_ID]);
     return result.rows.sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime());
@@ -324,38 +458,208 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
 
   app.post("/api/templates/:id/confirm", async (request, reply) => {
     const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
-    const body = ConfirmTemplateSchema.parse(request.body);
+    const parsedBody = ConfirmTemplateSchema.safeParse(request.body);
+    if (!parsedBody.success) {
+      return reply.status(400).send({ error: "A complete schema-v2 template map is required." });
+    }
+    const body = parsedBody.data;
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const source = await client.query<{ analysis: unknown; sha256: string; current_map_version: number | null }>(`
+        SELECT analysis, sha256, current_map_version
+        FROM templates
+        WHERE id = $1 AND workspace_id = $2
+        FOR UPDATE
+      `, [id, WORKSPACE_ID]);
+      if (!source.rowCount) {
+        await client.query("ROLLBACK");
+        return reply.status(404).send({ error: "Template not found." });
+      }
+      const template = requiredRow(source.rows, "Template confirmation lookup failed.");
+      const analysis = TemplateAnalysisSchema.parse(template.analysis);
+      const blocks = validateConfirmedBlocks(analysis, body.blocks);
+      const mapVersion = (template.current_map_version ?? 0) + 1;
+      const confirmedMap = TemplateMapSchema.parse({
+        schemaVersion: 2,
+        mapVersion,
+        templateHash: template.sha256,
+        analysisVersion: analysis.analysisVersion,
+        blocks,
+        confirmedBy: ACTOR_ID,
+        confirmedAt: new Date().toISOString(),
+      });
+      await client.query(`
+        INSERT INTO template_map_versions (template_id, map_version, analysis_version, template_hash, map, actor_id)
+        VALUES ($1, $2, $3, $4, $5, $6)
+      `, [id, mapVersion, analysis.analysisVersion, template.sha256, JSON.stringify(confirmedMap), ACTOR_ID]);
+      const bodyBlocks = blocks.filter((block) => (block.anchor?.partName ?? "word/document.xml") === "word/document.xml");
+      const result = await client.query(`
+        UPDATE templates
+        SET status = 'confirmed', confirmed_regions = $2, current_map_version = $3
+        WHERE id = $1
+        RETURNING id, name, display_name AS "displayName", is_test AS "isTest", status, analysis,
+                  confirmed_regions AS "confirmedRegions", current_map_version AS "currentMapVersion", created_at AS "createdAt"
+      `, [id, JSON.stringify(bodyBlocks), mapVersion]);
+      await client.query("COMMIT");
+      return { ...result.rows[0], confirmedMap };
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  });
+
+  app.get("/api/templates/:id/maps", async (request, reply) => {
+    const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
     const result = await pool.query(`
-      UPDATE templates SET status = 'confirmed', confirmed_regions = $2
-      WHERE id = $1 AND workspace_id = $3
-      RETURNING id, name, display_name AS "displayName", is_test AS "isTest", status, analysis,
-                confirmed_regions AS "confirmedRegions", created_at AS "createdAt"
-    `, [id, JSON.stringify(body.regions), WORKSPACE_ID]);
-    if (!result.rowCount) return reply.status(404).send({ error: "Template not found." });
-    return result.rows[0];
+      SELECT map_version AS "mapVersion", analysis_version AS "analysisVersion", template_hash AS "templateHash",
+             map, actor_id AS "actorId", created_at AS "createdAt"
+      FROM template_map_versions
+      WHERE template_id = $1
+      ORDER BY map_version DESC
+    `, [id]);
+    return reply.send(result.rows);
+  });
+
+  app.post("/api/intakes", async (request, reply) => {
+    let templateId: string | null = null;
+    let templateUpload: { buffer: Buffer; filename: string } | null = null;
+    let caseName = "New demand letter case";
+    const sourceUploads: Array<{ buffer: Buffer; filename: string; mimeType: string }> = [];
+    for await (const part of request.parts()) {
+      if (part.type === "field") {
+        if (part.fieldname === "templateId") templateId = z.string().uuid().parse(part.value);
+        if (part.fieldname === "caseName") caseName = z.string().trim().min(1).max(200).parse(part.value);
+        continue;
+      }
+      const uploaded = { buffer: await part.toBuffer(), filename: part.filename, mimeType: part.mimetype };
+      if (part.fieldname === "template") {
+        if (templateUpload) throw new Error("Upload one DOCX template at a time.");
+        templateUpload = uploaded;
+      } else {
+        sourceUploads.push(uploaded);
+      }
+    }
+    if (Boolean(templateId) === Boolean(templateUpload)) {
+      return reply.status(400).send({ error: "Select one existing template or upload one DOCX template." });
+    }
+    if (!sourceUploads.length) return reply.status(400).send({ error: "At least one PDF or image is required." });
+
+    const workspace = await pool.query<{ id: string }>(`
+      INSERT INTO matters (workspace_id, name, template_id, template_map_version)
+      VALUES ($1, $2, NULL, NULL)
+      RETURNING id
+    `, [WORKSPACE_ID, caseName]);
+    const caseWorkspaceId = requiredRow(workspace.rows, "Case workspace insert did not return an id.").id;
+
+    const sourceExtractionJobId = await startScopedJob(caseWorkspaceId, "source_extraction", "Extracting complete source packet");
+    const templateAnalysisJobId = templateUpload
+      ? await startScopedJob(caseWorkspaceId, "template_analysis", "Analyzing complete parsed template")
+      : null;
+
+    const templateOperation = templateUpload
+      ? insertTemplate(templateUpload.buffer, templateUpload.filename, {
+          isTest: testTemplateFromHeader(request.headers["x-steno-test-template"]),
+        })
+      : pool.query<TemplateRecord>(`
+          SELECT id, name, display_name AS "displayName", is_test AS "isTest", status, analysis,
+                 confirmed_regions AS "confirmedRegions", current_map_version AS "currentMapVersion",
+                 (SELECT map FROM template_map_versions WHERE template_id = templates.id AND map_version = templates.current_map_version) AS "confirmedMap",
+                 storage_key AS "storageKey",
+                 created_at AS "createdAt"
+          FROM templates WHERE id = $1 AND workspace_id = $2
+        `, [templateId, WORKSPACE_ID]).then(async (result) => {
+          const existingTemplate = requiredRow(result.rows, "Template not found.");
+          if (!existingTemplate.storageKey) throw new Error("Stored template original is unavailable.");
+          return insertTemplate(
+            await fs.readFile(pathForKey(existingTemplate.storageKey)),
+            existingTemplate.name,
+            { isTest: existingTemplate.isTest },
+          );
+        });
+
+    const templateTask = templateOperation.then(async (template) => {
+      if (templateAnalysisJobId) await completeScopedJob(templateAnalysisJobId, "Template analysis ready", { templateId: template.id });
+      return template;
+    }).catch(async (error) => {
+      if (templateAnalysisJobId) await failScopedJob(templateAnalysisJobId, "Template analysis failed", error);
+      throw error;
+    });
+    const sourceTask = Promise.all(sourceUploads.map((source) => insertSource(caseWorkspaceId, source.buffer, source.filename, source.mimeType)))
+      .then(async (sources) => {
+        await completeScopedJob(sourceExtractionJobId, "Source extraction ready", { sourceIds: sources.map((source) => (source as { id?: string }).id).filter(Boolean) });
+        return sources;
+      }).catch(async (error) => {
+        await failScopedJob(sourceExtractionJobId, "Source extraction failed", error);
+        throw error;
+      });
+
+    const [template, sources] = await Promise.all([
+      templateTask,
+      sourceTask,
+    ]);
+    await pool.query(`
+      UPDATE matters
+      SET template_id = $2, template_map_version = $3
+      WHERE id = $1
+    `, [caseWorkspaceId, template.id, template.currentMapVersion ?? null]);
+    return reply.status(201).send({
+      caseWorkspace: {
+        id: caseWorkspaceId,
+        name: caseName,
+        templateId: template.id,
+        templateMapVersion: template.currentMapVersion ?? null,
+      },
+      template,
+      sources,
+      jobs: {
+        templateAnalysisJobId,
+        sourceExtractionJobId,
+      },
+    });
+  });
+
+  app.post("/api/matters/:id/template-map", async (request, reply) => {
+    const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+    const result = await pool.query(`
+      UPDATE matters m
+      SET template_map_version = t.current_map_version
+      FROM templates t
+      WHERE m.id = $1 AND m.workspace_id = $2 AND t.id = m.template_id
+        AND t.status = 'confirmed' AND t.current_map_version IS NOT NULL
+      RETURNING m.id, m.template_id AS "templateId", m.template_map_version AS "templateMapVersion"
+    `, [id, WORKSPACE_ID]);
+    if (!result.rowCount) return reply.status(409).send({ error: "Confirm the template map before continuing." });
+    return reply.send(result.rows[0]);
   });
 
   app.post("/api/matters", async (request, reply) => {
     const body = CreateMatterSchema.parse(request.body);
-    const confirmed = await pool.query("SELECT 1 FROM templates WHERE id = $1 AND status = 'confirmed'", [body.templateId]);
-    if (!confirmed.rowCount) return reply.status(409).send({ error: "Confirm the template regions before creating a matter." });
+    const confirmed = await pool.query<{ current_map_version: number | null }>("SELECT current_map_version FROM templates WHERE id = $1 AND status = 'confirmed'", [body.templateId]);
+    if (!confirmed.rowCount) return reply.status(409).send({ error: "Confirm the template map before creating a case workspace." });
+    const mapVersion = confirmed.rows[0]?.current_map_version;
+    if (!mapVersion) return reply.status(409).send({ error: "Confirm the versioned template map before creating a case workspace." });
     const result = await pool.query(`
-      INSERT INTO matters (workspace_id, name, template_id) VALUES ($1, $2, $3)
-      RETURNING id, name, template_id AS "templateId", created_at AS "createdAt"
-    `, [WORKSPACE_ID, body.name, body.templateId]);
+      INSERT INTO matters (workspace_id, name, template_id, template_map_version) VALUES ($1, $2, $3, $4)
+      RETURNING id, name, template_id AS "templateId", template_map_version AS "templateMapVersion", created_at AS "createdAt"
+    `, [WORKSPACE_ID, body.name, body.templateId, mapVersion]);
     return reply.status(201).send(result.rows[0]);
   });
 
   app.get("/api/matters/:id", async (request, reply) => {
     const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
     const matter = await pool.query(`
-      SELECT id, name, template_id AS "templateId", created_at AS "createdAt"
+      SELECT id, name, template_id AS "templateId", template_map_version AS "templateMapVersion", created_at AS "createdAt"
       FROM matters WHERE id = $1 AND workspace_id = $2
     `, [id, WORKSPACE_ID]);
-    if (!matter.rowCount) return reply.status(404).send({ error: "Matter not found." });
+    if (!matter.rowCount) return reply.status(404).send({ error: "Case workspace not found." });
     const sources = await pool.query(`
-      SELECT id, matter_id AS "matterId", name, mime_type AS "mimeType", page_count AS "pageCount", status
-      FROM source_documents WHERE matter_id = $1 ORDER BY created_at
+      SELECT s.id, s.matter_id AS "matterId", s.name, s.mime_type AS "mimeType", s.page_count AS "pageCount", s.status,
+             count(*) FILTER (WHERE p.extraction_status IN ('ocr-required', 'ocr-failed'))::int AS "extractionIssueCount"
+      FROM source_documents s LEFT JOIN source_pages p ON p.source_id = s.id
+      WHERE s.matter_id = $1 GROUP BY s.id ORDER BY s.created_at
     `, [id]);
     const sourceFingerprint = await sourceFingerprintForMatter(id);
     const evidenceReview = await pool.query<{ result: unknown; source_fingerprint: string | null }>(`
@@ -374,6 +678,26 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
     `, [id]);
     const reviewRow = evidenceReview.rows[0];
     const parsedReview = reviewRow ? EvidenceReviewSchema.parse(reviewRow.result) : null;
+    const map = await pool.query<{ analysis: unknown; map: unknown }>(`
+      SELECT t.analysis, tmv.map
+      FROM matters m
+      JOIN templates t ON t.id = m.template_id
+      JOIN template_map_versions tmv ON tmv.template_id = t.id AND tmv.map_version = m.template_map_version
+      WHERE m.id = $1
+    `, [id]);
+    const mappedTemplate = map.rows[0]
+      ? analysisWithConfirmedMap(TemplateAnalysisSchema.parse(map.rows[0].analysis), TemplateMapSchema.parse(map.rows[0].map))
+      : null;
+    const resolutions = await pool.query(`
+      SELECT r.id, r.matter_id AS "matterId", r.target_id AS "targetId",
+             r.source_fingerprint AS "sourceFingerprint", r.action,
+             r.actor_id AS "actorId", a.display_name AS "actorName",
+             r.draft_id AS "draftId", r.draft_version AS "draftVersion", r.created_at AS "createdAt"
+      FROM matter_review_resolutions r
+      JOIN actors a ON a.id = r.actor_id
+      WHERE r.matter_id = $1 AND r.source_fingerprint = $2
+      ORDER BY r.created_at
+    `, [id, sourceFingerprint]);
     return {
       ...matter.rows[0],
       sources: sources.rows,
@@ -381,14 +705,72 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
       evidenceReview: parsedReview,
       evidenceReviewStale: parsedReview ? parsedReview.sourceFingerprint !== sourceFingerprint : false,
       activeDraft: activeDraft.rows[0] ?? null,
+      reviewResolutions: resolutions.rows.map((resolution) => ReviewResolutionSchema.parse({
+        ...resolution,
+        createdAt: new Date(resolution.createdAt as string | Date).toISOString(),
+      })),
+      generationTargets: mappedTemplate ? deriveGenerationTargets(mappedTemplate) : [],
     };
+  });
+
+  app.put("/api/matters/:id/review-resolutions/:targetId", async (request, reply) => {
+    const params = z.object({ id: z.string().uuid(), targetId: z.string().min(1).max(500) }).parse(request.params);
+    const body = ReviewResolutionRequestSchema.parse(request.body);
+    const currentFingerprint = await sourceFingerprintForMatter(params.id);
+    if (body.sourceFingerprint !== currentFingerprint) {
+      return reply.status(409).send({ error: "The evidence set changed. Review the current sources before resolving this target." });
+    }
+    const context = await pool.query<{ analysis: unknown; map: unknown }>(`
+      SELECT t.analysis, tmv.map
+      FROM matters m
+      JOIN templates t ON t.id = m.template_id
+      JOIN template_map_versions tmv ON tmv.template_id = t.id AND tmv.map_version = m.template_map_version
+      WHERE m.id = $1 AND m.workspace_id = $2
+    `, [params.id, WORKSPACE_ID]);
+    if (!context.rowCount) return reply.status(404).send({ error: "Case workspace or confirmed template map not found." });
+    const row = requiredRow(context.rows, "Review-resolution context was not found.");
+    const template = analysisWithConfirmedMap(TemplateAnalysisSchema.parse(row.analysis), TemplateMapSchema.parse(row.map));
+    if (!deriveGenerationTargets(template).some((target) => target.id === params.targetId)) {
+      return reply.status(404).send({ error: "Generation target not found in the pinned template map." });
+    }
+    if (body.action === "clear") {
+      await pool.query(`
+        DELETE FROM matter_review_resolutions
+        WHERE matter_id = $1 AND target_id = $2 AND source_fingerprint = $3
+      `, [params.id, params.targetId, currentFingerprint]);
+      await pool.query(`
+        INSERT INTO activity_events (workspace_id, matter_id, actor_id, event_type, summary, metadata)
+        VALUES ($1, $2, $3, 'omission.cleared', 'Cleared a pre-generation omission decision', $4)
+      `, [WORKSPACE_ID, params.id, ACTOR_ID, JSON.stringify({ targetId: params.targetId, sourceFingerprint: currentFingerprint })]);
+      return reply.send({ targetId: params.targetId, cleared: true });
+    }
+    const result = await pool.query(`
+      INSERT INTO matter_review_resolutions (matter_id, target_id, source_fingerprint, action, actor_id)
+      VALUES ($1, $2, $3, 'omit', $4)
+      ON CONFLICT (matter_id, target_id, source_fingerprint)
+      DO UPDATE SET action = 'omit', actor_id = EXCLUDED.actor_id, draft_id = NULL, draft_version = NULL, created_at = now()
+      RETURNING id, matter_id AS "matterId", target_id AS "targetId",
+                source_fingerprint AS "sourceFingerprint", action, actor_id AS "actorId",
+                draft_id AS "draftId", draft_version AS "draftVersion", created_at AS "createdAt"
+    `, [params.id, params.targetId, currentFingerprint, ACTOR_ID]);
+    await pool.query(`
+      INSERT INTO activity_events (workspace_id, matter_id, actor_id, event_type, summary, metadata)
+      VALUES ($1, $2, $3, 'omission.preapproved', 'Approved a target omission for this matter', $4)
+    `, [WORKSPACE_ID, params.id, ACTOR_ID, JSON.stringify({ targetId: params.targetId, sourceFingerprint: currentFingerprint })]);
+    return reply.send(ReviewResolutionSchema.parse({
+      ...requiredRow(result.rows, "Review resolution insert failed."),
+      actorName: "Faby Rivera",
+      createdAt: new Date(requiredRow(result.rows, "Review resolution insert failed.").createdAt as string | Date).toISOString(),
+    }));
   });
 
   app.get("/api/matters/:id/sources", async (request, reply) => {
     const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
     const result = await pool.query(`
-      SELECT id, matter_id AS "matterId", name, mime_type AS "mimeType", page_count AS "pageCount", status
-      FROM source_documents WHERE matter_id = $1 ORDER BY created_at
+      SELECT s.id, s.matter_id AS "matterId", s.name, s.mime_type AS "mimeType", s.page_count AS "pageCount", s.status,
+             count(*) FILTER (WHERE p.extraction_status IN ('ocr-required', 'ocr-failed'))::int AS "extractionIssueCount"
+      FROM source_documents s LEFT JOIN source_pages p ON p.source_id = s.id
+      WHERE s.matter_id = $1 GROUP BY s.id ORDER BY s.created_at
     `, [id]);
     return reply.send(result.rows);
   });
@@ -397,7 +779,10 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
     const params = z.object({ id: z.string().uuid(), page: z.coerce.number().int().positive() }).parse(request.params);
     const result = await pool.query(`
       SELECT s.id AS "sourceId", s.name AS "sourceName", s.mime_type AS "mimeType",
-             p.page_number AS page, p.extracted_text AS text
+             p.page_number AS page, p.extracted_text AS text,
+             p.extraction_method AS "extractionMethod", p.extraction_status AS "extractionStatus",
+             p.extraction_confidence AS confidence, p.geometry, p.structured_data AS "structuredData",
+             p.visual_input AS "visualInput"
       FROM source_documents s
       JOIN matters m ON m.id = s.matter_id
       JOIN source_pages p ON p.source_id = s.id
@@ -425,12 +810,21 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
   app.post("/api/matters/:id/sources", async (request, reply) => {
     const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
     const matter = await pool.query("SELECT 1 FROM matters WHERE id = $1 AND workspace_id = $2", [id, WORKSPACE_ID]);
-    if (!matter.rowCount) return reply.status(404).send({ error: "Matter not found." });
-    const results = [];
+    if (!matter.rowCount) return reply.status(404).send({ error: "Case workspace not found." });
+    const uploads: Array<{ buffer: Buffer; filename: string; mimeType: string }> = [];
     for await (const part of request.parts()) {
-      if (part.type === "file") results.push(await insertSource(id, await part.toBuffer(), part.filename, part.mimetype));
+      if (part.type === "file") uploads.push({ buffer: await part.toBuffer(), filename: part.filename, mimeType: part.mimetype });
     }
-    if (!results.length) return reply.status(400).send({ error: "At least one PDF or image is required." });
+    if (!uploads.length) return reply.status(400).send({ error: "At least one PDF or image is required." });
+    const extractionJobId = await startScopedJob(id, "source_extraction", "Extracting updated source packet");
+    let results: Array<Awaited<ReturnType<typeof insertSource>>>;
+    try {
+      results = await Promise.all(uploads.map((source) => insertSource(id, source.buffer, source.filename, source.mimeType)));
+      await completeScopedJob(extractionJobId, "Source extraction ready", { sourceIds: results.map((source) => (source as { id?: string }).id).filter(Boolean) });
+    } catch (error) {
+      await failScopedJob(extractionJobId, "Source extraction failed", error);
+      throw error;
+    }
     await pool.query(`
       INSERT INTO activity_events (workspace_id, matter_id, actor_id, event_type, summary, metadata)
       VALUES ($1, $2, $3, 'evidence.added', $4, $5)
@@ -439,7 +833,7 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
       id,
       ACTOR_ID,
       `Added ${results.length} evidence ${results.length === 1 ? "file" : "files"}`,
-      JSON.stringify({ sourceIds: results.map((source) => (source as { id?: string }).id).filter(Boolean) }),
+      JSON.stringify({ sourceIds: results.map((source) => (source as { id?: string }).id).filter(Boolean), extractionJobId }),
     ]);
     return reply.status(201).send(results);
   });
@@ -485,7 +879,7 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
       const draft = await pool.query<{ current_version: number }>(`
         SELECT current_version FROM drafts WHERE id = $1 AND matter_id = $2
       `, [body.draftId, id]);
-      if (!draft.rowCount) return reply.status(404).send({ error: "Draft not found for this matter." });
+      if (!draft.rowCount) return reply.status(404).send({ error: "Draft not found for this case workspace." });
       if (draft.rows[0]?.current_version !== body.baseVersion) {
         return reply.status(409).send({ error: "Draft changed before regeneration started.", currentVersion: draft.rows[0]?.current_version });
       }
@@ -500,7 +894,7 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
       `, [id, body.draftId ?? null, body.baseVersion ?? null, sourceFingerprint]);
     } catch (error) {
       if ((error as { code?: string }).code === "23505") {
-        return reply.status(409).send({ error: "A generation job is already active for this matter." });
+        return reply.status(409).send({ error: "A generation job is already active for this case workspace." });
       }
       throw error;
     }
@@ -596,8 +990,10 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
       const updated = applyDirectDraftEdits(GeneratedDraftSchema.parse(lockedDraft.content), body.content);
       const nextVersion = body.version + 1;
       await client.query(
-        "INSERT INTO draft_versions (draft_id, version, content, actor_id, source_fingerprint) VALUES ($1, $2, $3, $4, $5)",
-        [id, nextVersion, JSON.stringify(updated), ACTOR_ID, lockedDraft.source_fingerprint],
+        `INSERT INTO draft_versions (draft_id, version, content, actor_id, source_fingerprint, template_map_version)
+         SELECT $1, $2, $3, $4, $5, template_map_version
+         FROM draft_versions WHERE draft_id = $1 AND version = $6`,
+        [id, nextVersion, JSON.stringify(updated), ACTOR_ID, lockedDraft.source_fingerprint, body.version],
       );
       await persistCitations(client, id, nextVersion, updated);
       await client.query("UPDATE drafts SET current_version = $2, updated_at = now() WHERE id = $1", [id, nextVersion]);
@@ -629,7 +1025,7 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
     });
     const annotationsValid = annotations.every((annotation) => {
       const block = blockById.get(annotation.blockId);
-      return block?.text.slice(annotation.start, annotation.end) === annotation.quote;
+      return !block?.locked && block?.templateRole !== "keep" && block?.text.slice(annotation.start, annotation.end) === annotation.quote;
     });
     if (!annotationsValid) return reply.status(409).send({ error: "Selected text is not part of the current draft version." });
     const wantsStream = request.headers.accept?.includes("text/event-stream") ?? false;
@@ -652,7 +1048,7 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
     const primaryProvider = createAiProvider();
     const primaryStarted = performance.now();
     try {
-      proposal = RefinementProposalSchema.parse(await primaryProvider.refine({ instruction: body.instruction, annotations, evidence }));
+      proposal = RefinementProposalSchema.parse(await primaryProvider.refine({ instruction: body.instruction, annotations, evidence, currentDraftVersion: draft.version }));
       await recordAiRun({
         matterId: draft.matterId,
         provider: primaryProvider,
@@ -750,8 +1146,10 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
       const updated = applyRefinementProposal(content, proposal);
       const nextVersion = row.current_version + 1;
       await client.query(
-        "INSERT INTO draft_versions (draft_id, version, content, actor_id, source_fingerprint) VALUES ($1, $2, $3, $4, $5)",
-        [row.draft_id, nextVersion, JSON.stringify(updated), ACTOR_ID, row.source_fingerprint],
+        `INSERT INTO draft_versions (draft_id, version, content, actor_id, source_fingerprint, template_map_version)
+         SELECT $1, $2, $3, $4, $5, template_map_version
+         FROM draft_versions WHERE draft_id = $1 AND version = $6`,
+        [row.draft_id, nextVersion, JSON.stringify(updated), ACTOR_ID, row.source_fingerprint, row.current_version],
       );
       await persistCitations(client, row.draft_id, nextVersion, updated);
       await client.query("UPDATE drafts SET current_version = $2, updated_at = now() WHERE id = $1", [row.draft_id, nextVersion]);
@@ -776,9 +1174,17 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
-      const result = await client.query<{ matter_id: string; current_version: number; content: unknown; source_fingerprint: string | null }>(`
-        SELECT d.matter_id, d.current_version, dv.content, dv.source_fingerprint
-        FROM drafts d JOIN draft_versions dv ON dv.draft_id = d.id AND dv.version = d.current_version
+      const result = await client.query<{
+        matter_id: string; current_version: number; content: unknown; source_fingerprint: string | null;
+        template_analysis: unknown; template_map: unknown;
+      }>(`
+        SELECT d.matter_id, d.current_version, dv.content, dv.source_fingerprint,
+               t.analysis AS template_analysis, tmv.map AS template_map
+        FROM drafts d
+        JOIN draft_versions dv ON dv.draft_id = d.id AND dv.version = d.current_version
+        JOIN matters m ON m.id = d.matter_id
+        JOIN templates t ON t.id = m.template_id
+        JOIN template_map_versions tmv ON tmv.template_id = t.id AND tmv.map_version = dv.template_map_version
         WHERE d.id = $1 FOR UPDATE OF d
       `, [id]);
       if (!result.rowCount) {
@@ -795,11 +1201,20 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
         await client.query("ROLLBACK");
         return reply.status(404).send({ error: "Draft field not found." });
       }
-      const { content: updated, corrected } = confirmDraftField(content, body.key, body.value);
+      const { content: confirmed, corrected } = confirmDraftField(content, body.key, body.value);
+      const templateMap = TemplateMapSchema.parse(row.template_map);
+      const template = TemplateAnalysisSchema.parse({
+        ...TemplateAnalysisSchema.parse(row.template_analysis),
+        blocks: templateMap.blocks,
+        regions: templateMap.blocks.filter((block) => (block.anchor?.partName ?? "word/document.xml") === "word/document.xml"),
+      });
+      const updated = ensureEditableCoverage(confirmed, template);
       const nextVersion = body.version + 1;
       await client.query(
-        "INSERT INTO draft_versions (draft_id, version, content, actor_id, source_fingerprint) VALUES ($1, $2, $3, $4, $5)",
-        [id, nextVersion, JSON.stringify(updated), ACTOR_ID, row.source_fingerprint],
+        `INSERT INTO draft_versions (draft_id, version, content, actor_id, source_fingerprint, template_map_version)
+         SELECT $1, $2, $3, $4, $5, template_map_version
+         FROM draft_versions WHERE draft_id = $1 AND version = $6`,
+        [id, nextVersion, JSON.stringify(updated), ACTOR_ID, row.source_fingerprint, body.version],
       );
       await persistCitations(client, id, nextVersion, updated);
       await client.query("UPDATE drafts SET current_version = $2, updated_at = now() WHERE id = $1", [id, nextVersion]);
@@ -809,6 +1224,88 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
       `, [WORKSPACE_ID, row.matter_id, ACTOR_ID, corrected ? "Corrected an extracted field" : "Verified an extracted field", JSON.stringify({ draftId: id, version: nextVersion, fieldKey: body.key })]);
       await client.query("COMMIT");
       return await loadDraft(id);
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  });
+
+  app.post("/api/drafts/:id/outcomes/:outcomeId/confirm", async (request, reply) => {
+    const params = z.object({ id: z.string().uuid(), outcomeId: z.string().min(1).max(500) }).parse(request.params);
+    const body = ConfirmOutcomeSchema.parse(request.body);
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await client.query<{
+        matter_id: string; current_version: number; content: unknown; source_fingerprint: string | null;
+      }>(`
+        SELECT d.matter_id, d.current_version, dv.content, dv.source_fingerprint
+        FROM drafts d
+        JOIN draft_versions dv ON dv.draft_id = d.id AND dv.version = d.current_version
+        WHERE d.id = $1
+        FOR UPDATE OF d
+      `, [params.id]);
+      if (!result.rowCount) {
+        await client.query("ROLLBACK");
+        return reply.status(404).send({ error: "Draft not found." });
+      }
+      const row = requiredRow(result.rows, "Draft outcome lock failed.");
+      if (row.current_version !== body.version) {
+        await client.query("ROLLBACK");
+        return reply.status(409).send({ error: "Draft changed in another session.", currentVersion: row.current_version });
+      }
+      const currentFingerprint = await sourceFingerprintForMatter(row.matter_id, client);
+      if (!row.source_fingerprint || row.source_fingerprint !== currentFingerprint) {
+        await client.query("ROLLBACK");
+        return reply.status(409).send({ error: "The evidence set changed. Regenerate before approving an omission." });
+      }
+      const content = GeneratedDraftSchema.parse(row.content);
+      const outcome = content.outcomes.find((candidate) => candidate.id === params.outcomeId);
+      if (!outcome) {
+        await client.query("ROLLBACK");
+        return reply.status(404).send({ error: "Draft outcome not found." });
+      }
+      if (outcome.status !== "omitted_no_evidence" || outcome.resolution !== "unresolved") {
+        await client.query("ROLLBACK");
+        return reply.status(409).send({ error: "Only an unresolved no-evidence omission can be confirmed." });
+      }
+      const nextVersion = body.version + 1;
+      const updated = GeneratedDraftSchema.parse({
+        ...content,
+        outcomes: content.outcomes.map((candidate) => candidate.id === params.outcomeId
+          ? { ...candidate, resolution: "confirmed" }
+          : candidate),
+      });
+      await client.query(
+        `INSERT INTO draft_versions (draft_id, version, content, actor_id, source_fingerprint, template_map_version)
+         SELECT $1, $2, $3, $4, $5, template_map_version
+         FROM draft_versions WHERE draft_id = $1 AND version = $6`,
+        [params.id, nextVersion, JSON.stringify(updated), ACTOR_ID, currentFingerprint, body.version],
+      );
+      await persistCitations(client, params.id, nextVersion, updated);
+      await client.query("UPDATE drafts SET current_version = $2, updated_at = now() WHERE id = $1", [params.id, nextVersion]);
+      await client.query(`
+        INSERT INTO matter_review_resolutions (
+          matter_id, target_id, source_fingerprint, action, actor_id, draft_id, draft_version
+        ) VALUES ($1, $2, $3, 'omit', $4, $5, $6)
+        ON CONFLICT (matter_id, target_id, source_fingerprint)
+        DO UPDATE SET actor_id = EXCLUDED.actor_id, draft_id = EXCLUDED.draft_id,
+                      draft_version = EXCLUDED.draft_version, created_at = now()
+      `, [row.matter_id, outcome.targetId, currentFingerprint, ACTOR_ID, params.id, nextVersion]);
+      await client.query(`
+        INSERT INTO activity_events (workspace_id, matter_id, actor_id, event_type, summary, metadata)
+        VALUES ($1, $2, $3, 'omission.confirmed', 'Approved a no-evidence omission in the reviewed draft', $4)
+      `, [WORKSPACE_ID, row.matter_id, ACTOR_ID, JSON.stringify({
+        draftId: params.id,
+        outcomeId: params.outcomeId,
+        targetId: outcome.targetId,
+        version: nextVersion,
+        sourceFingerprint: currentFingerprint,
+      })]);
+      await client.query("COMMIT");
+      return await loadDraft(params.id);
     } catch (error) {
       await client.query("ROLLBACK");
       throw error;
@@ -857,8 +1354,10 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
       }
       const nextVersion = body.version + 1;
       await client.query(
-        "INSERT INTO draft_versions (draft_id, version, content, actor_id, source_fingerprint) VALUES ($1, $2, $3, $4, $5)",
-        [params.id, nextVersion, JSON.stringify(updated), ACTOR_ID, row.source_fingerprint],
+        `INSERT INTO draft_versions (draft_id, version, content, actor_id, source_fingerprint, template_map_version)
+         SELECT $1, $2, $3, $4, $5, template_map_version
+         FROM draft_versions WHERE draft_id = $1 AND version = $6`,
+        [params.id, nextVersion, JSON.stringify(updated), ACTOR_ID, row.source_fingerprint, body.version],
       );
       await persistCitations(client, params.id, nextVersion, updated);
       await client.query("UPDATE drafts SET current_version = $2, updated_at = now() WHERE id = $1", [params.id, nextVersion]);
@@ -902,30 +1401,45 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
     const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
     const result = await pool.query<{
       matter_id: string; matter_name: string; storage_key: string; template_analysis: unknown;
-      content: unknown; current_version: number; source_fingerprint: string | null;
+      content: unknown; current_version: number; source_fingerprint: string | null; template_map: unknown;
     }>(`
       SELECT m.id AS matter_id, m.name AS matter_name, t.storage_key,
-             t.analysis AS template_analysis, dv.content, dv.source_fingerprint, d.current_version
+             t.analysis AS template_analysis, tmv.map AS template_map,
+             dv.content, dv.source_fingerprint, d.current_version
       FROM drafts d
       JOIN matters m ON m.id = d.matter_id
       JOIN templates t ON t.id = m.template_id
       JOIN draft_versions dv ON dv.draft_id = d.id AND dv.version = d.current_version
+      JOIN template_map_versions tmv ON tmv.template_id = t.id AND tmv.map_version = dv.template_map_version
       WHERE d.id = $1
     `, [id]);
     if (!result.rowCount) return reply.status(404).send({ error: "Draft not found." });
     const row = requiredRow(result.rows, "Draft export context was not found.");
     const content = GeneratedDraftSchema.parse(row.content);
-    const template = TemplateAnalysisSchema.parse(row.template_analysis);
-    const imageSources = await pool.query<{ storage_key: string }>(`
-      SELECT storage_key FROM source_documents
+    const templateMap = TemplateMapSchema.parse(row.template_map);
+    const template = TemplateAnalysisSchema.parse({
+      ...TemplateAnalysisSchema.parse(row.template_analysis),
+      blocks: templateMap.blocks,
+      regions: templateMap.blocks.filter((block) => (block.anchor?.partName ?? "word/document.xml") === "word/document.xml"),
+    });
+    const imageSources = await pool.query<{ id: string; storage_key: string; mime_type: string }>(`
+      SELECT id, storage_key, mime_type FROM source_documents
       WHERE matter_id = $1 AND status = 'ready' AND mime_type LIKE 'image/%'
       ORDER BY created_at
     `, [row.matter_id]);
+    const currentSourceFingerprint = await sourceFingerprintForMatter(row.matter_id);
+    const activeResolutions = await pool.query<{ target_id: string }>(`
+      SELECT target_id FROM matter_review_resolutions
+      WHERE matter_id = $1 AND source_fingerprint = $2
+    `, [row.matter_id, currentSourceFingerprint]);
+    const activeResolutionTargets = new Set(activeResolutions.rows.map((resolution) => resolution.target_id));
+    const staleResolutionTargetIds = content.outcomes
+      .filter((outcome) => ["preapproved", "confirmed"].includes(outcome.resolution) && !activeResolutionTargets.has(outcome.targetId))
+      .map((outcome) => outcome.targetId);
     const exportIssues = draftExportIssues(content, {
       draftSourceFingerprint: row.source_fingerprint,
-      currentSourceFingerprint: await sourceFingerprintForMatter(row.matter_id),
-      imageCandidates: template.imageCandidates.length,
-      imageSources: imageSources.rowCount ?? 0,
+      currentSourceFingerprint,
+      staleResolutionTargetIds,
     });
     if (!isDraftExportReady(exportIssues)) {
       return reply.status(409).send({
@@ -936,22 +1450,55 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
     }
     const outputName = `${safeDownloadName(row.matter_name)}-v${row.current_version}-${randomUUID()}.docx`;
     const outputPath = path.join(config.storageDir, "exports", outputName);
-    const patches = content.sections.flatMap((section) => section.blocks)
-      .filter((block) => block.templateParagraphIndex !== null)
-      .map((block) => ({ paragraphIndex: block.templateParagraphIndex as number, text: block.text }));
+    const mappedBlocks = new Map(templateMap.blocks.map((block) => [
+      block.id ?? `${block.anchor?.partName ?? "word/document.xml"}:p:${block.paragraphIndex}`,
+      block,
+    ]));
+    const targets = deriveGenerationTargets(template);
+    const outcomeByTarget = new Map(content.outcomes.map((outcome) => [outcome.targetId, outcome]));
+    const blocksByTarget = new Map<string, typeof content.sections[number]["blocks"]>();
+    for (const block of content.sections.flatMap((section) => section.blocks)) {
+      if (!block.targetId) continue;
+      blocksByTarget.set(block.targetId, [...(blocksByTarget.get(block.targetId) ?? []), block]);
+    }
+    const sourcePathById = new Map(imageSources.rows.map((source) => [source.id, pathForKey(source.storage_key)]));
+    const targetOperations = targets.map((target) => {
+      const outcome = outcomeByTarget.get(target.id);
+      if (!outcome) throw new Error(`Draft is missing generation outcome ${target.id}.`);
+      const targetBlocks = [...(blocksByTarget.get(target.id) ?? [])].sort((left, right) => (left.sequence ?? 0) - (right.sequence ?? 0));
+      return {
+        targetId: target.id,
+        kind: target.kind,
+        status: outcome.status,
+        anchors: target.blockIds.map((blockId) => {
+          const mapped = mappedBlocks.get(blockId);
+          if (!mapped) throw new Error(`Template map is missing target block ${blockId}.`);
+          return {
+            blockId,
+            partName: mapped.anchor?.partName ?? "word/document.xml",
+            paragraphIndex: mapped.paragraphIndex,
+            structuredGroup: mapped.structuredGroup,
+            figure: mapped.figure,
+          };
+        }),
+        ...(target.kind === "narrative" ? { paragraphs: targetBlocks.map((block) => block.text) } : {}),
+        ...(target.kind === "structured" ? { rows: targetBlocks.map((block) => ({
+          role: block.structuredRowRole ?? "body" as const,
+          cells: block.structuredCells ?? [block.text],
+        })) } : {}),
+        ...(target.kind === "figure" ? {
+          caption: targetBlocks[0]?.text ?? outcome.caption,
+          sourcePath: outcome.sourceId ? sourcePathById.get(outcome.sourceId) ?? null : null,
+        } : {}),
+      };
+    });
     const fieldReplacements = exportableFieldReplacements(content.fields);
-    const imageReplacements = template.imageCandidates.length === 1 && imageSources.rows[0]
-      ? [{
-          partName: template.imageCandidates[0]!.partName,
-          sourcePath: pathForKey(imageSources.rows[0].storage_key),
-        }]
-      : [];
     await exportDocx({
       templatePath: pathForKey(row.storage_key),
       outputPath,
-      patches,
+      patches: [],
       fieldReplacements,
-      imageReplacements,
+      targetOperations,
     });
     await pool.query(`
       INSERT INTO activity_events (workspace_id, matter_id, actor_id, event_type, summary, metadata)
@@ -990,12 +1537,33 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
     const zipPath = demoZipPath;
     const templateBuffer = await fs.readFile(templatePath);
     const template = await insertTemplate(templateBuffer, path.basename(templatePath));
-    const regions = z.array(TemplateRegionSchema).parse((template.analysis as { regions: unknown }).regions);
-    await pool.query("UPDATE templates SET status = 'confirmed', confirmed_regions = $2 WHERE id = $1", [template.id, JSON.stringify(regions)]);
+    let mapVersion = template.currentMapVersion;
+    if (!mapVersion) {
+      const analysis = TemplateAnalysisSchema.parse(template.analysis);
+      const blocks = (analysis.blocks?.length ? analysis.blocks : analysis.regions).map((block) => ({ ...block, needsAttention: false }));
+      mapVersion = 1;
+      const templateHash = (await pool.query<{ sha256: string }>("SELECT sha256 FROM templates WHERE id = $1", [template.id])).rows[0]?.sha256;
+      const confirmedMap = TemplateMapSchema.parse({
+        schemaVersion: 2,
+        mapVersion,
+        templateHash,
+        analysisVersion: analysis.analysisVersion,
+        blocks,
+        confirmedBy: ACTOR_ID,
+        confirmedAt: new Date().toISOString(),
+      });
+      await pool.query(`
+        INSERT INTO template_map_versions (template_id, map_version, analysis_version, template_hash, map, actor_id)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (template_id, map_version) DO NOTHING
+      `, [template.id, mapVersion, analysis.analysisVersion, confirmedMap.templateHash, JSON.stringify(confirmedMap), ACTOR_ID]);
+      const regions = blocks.filter((block) => (block.anchor?.partName ?? "word/document.xml") === "word/document.xml");
+      await pool.query("UPDATE templates SET status = 'confirmed', confirmed_regions = $2, current_map_version = $3 WHERE id = $1", [template.id, JSON.stringify(regions), mapVersion]);
+    }
     const matter = await pool.query<{ id: string; name: string; template_id: string }>(`
-      INSERT INTO matters (workspace_id, name, template_id)
-      VALUES ($1, 'Pat Donahue sample matter', $2) RETURNING id, name, template_id
-    `, [WORKSPACE_ID, template.id]);
+      INSERT INTO matters (workspace_id, name, template_id, template_map_version)
+      VALUES ($1, 'Pat Donahue sample case workspace', $2, $3) RETURNING id, name, template_id
+    `, [WORKSPACE_ID, template.id, mapVersion]);
     const insertedMatter = requiredRow(matter.rows, "Matter insert did not return an id.");
     const zip = new AdmZip(zipPath);
     const sources = [];

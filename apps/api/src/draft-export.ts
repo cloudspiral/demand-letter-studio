@@ -1,13 +1,12 @@
 import type { ExportReadiness, GeneratedDraft } from "@steno/contracts";
-import { exportableFieldReplacements } from "./draft-fields";
+import { exportableFieldKeys } from "./draft-fields";
 
 const reviewPlaceholder = /\[ATTORNEY REVIEW REQUIRED(?:\s|—|-|\])?/i;
 
 export interface DraftReadinessContext {
   draftSourceFingerprint?: string | null;
   currentSourceFingerprint?: string | null;
-  imageCandidates?: number;
-  imageSources?: number;
+  staleResolutionTargetIds?: string[];
 }
 
 export function draftExportIssues(
@@ -15,14 +14,18 @@ export function draftExportIssues(
   context: DraftReadinessContext = {},
 ): ExportReadiness {
   const allBlocks = content.sections.flatMap((section) => section.blocks);
-  const templateBlocks = allBlocks.filter((block) => block.templateParagraphIndex !== null);
-  const paragraphCounts = new Map<number, number>();
+  const templateBlocks = allBlocks.filter((block) => block.templateBlockId || block.templateParagraphIndex !== null);
+  const mappingOwners = new Map<string, { owners: Set<string>; paragraphIndex: number }>();
   for (const block of templateBlocks) {
-    const index = block.templateParagraphIndex as number;
-    paragraphCounts.set(index, (paragraphCounts.get(index) ?? 0) + 1);
+    const index = block.templateParagraphIndex ?? 0;
+    const key = block.templateBlockId ?? `legacy-body:${index}`;
+    const owner = block.targetId ?? block.id;
+    const current = mappingOwners.get(key) ?? { owners: new Set<string>(), paragraphIndex: index };
+    current.owners.add(owner);
+    mappingOwners.set(key, current);
   }
 
-  const safeFieldKeys = new Set(Object.keys(exportableFieldReplacements(content.fields)));
+  const safeFieldKeys = new Set(exportableFieldKeys(content.fields));
   const blockIds = allBlocks
       .filter((block) => (
         block.kind === "warning"
@@ -31,33 +34,41 @@ export function draftExportIssues(
       ))
       .map((block) => block.id);
   const fieldKeys = Object.keys(content.fields).filter((key) => !safeFieldKeys.has(key));
-  const duplicateParagraphIndexes = [...paragraphCounts.entries()]
-      .filter(([, count]) => count > 1)
-      .map(([index]) => index);
+  const outcomeIds = content.outcomes
+    .filter((outcome) => outcome.status === "omitted_no_evidence" && outcome.resolution === "unresolved")
+    .map((outcome) => outcome.id);
+  const unresolvedTargetIds = new Set(content.outcomes
+    .filter((outcome) => outcome.status === "omitted_no_evidence" && outcome.resolution === "unresolved")
+    .map((outcome) => outcome.targetId));
+  const duplicateParagraphIndexes = [...new Set([...mappingOwners.values()]
+      .filter(({ owners }) => owners.size > 1)
+      .map(({ paragraphIndex }) => paragraphIndex))];
   const blockedParagraphIndexes = new Set(allBlocks
     .filter((block) => blockIds.includes(block.id) && block.templateParagraphIndex !== null)
     .map((block) => block.templateParagraphIndex as number));
-  const imageCandidates = context.imageCandidates ?? 0;
-  const imageSources = context.imageSources ?? 0;
-  const imageIssue = imageCandidates > 0 && (imageCandidates !== 1 || imageSources !== 1)
-    ? { templateCandidates: imageCandidates, sourceImages: imageSources }
-    : null;
+  const imageIssue = null;
   const staleEvidence = context.currentSourceFingerprint !== undefined
     && context.currentSourceFingerprint !== null
     && context.draftSourceFingerprint !== context.currentSourceFingerprint;
   const blockingReviewFlagIds = content.reviewFlags
     .filter((flag) => (
-      flag.affectedTemplateParagraphIndexes.some((index) => blockedParagraphIndexes.has(index))
+      flag.severity === "blocking" && (
+      flag.affectedTargetIds.some((targetId) => unresolvedTargetIds.has(targetId))
+      || flag.affectedTemplateParagraphIndexes.some((index) => blockedParagraphIndexes.has(index))
       || flag.affectedFieldKeys.some((key) => fieldKeys.includes(key))
+      )
     ))
     .map((flag) => flag.id);
+  const staleResolutionTargetIds = context.staleResolutionTargetIds ?? [];
   return {
-    ready: !blockIds.length && !fieldKeys.length && !duplicateParagraphIndexes.length && !imageIssue && !staleEvidence,
+    ready: !blockIds.length && !fieldKeys.length && !outcomeIds.length && !duplicateParagraphIndexes.length && !staleEvidence && !staleResolutionTargetIds.length,
     blockIds,
     fieldKeys,
+    outcomeIds,
     duplicateParagraphIndexes,
     imageIssue,
     staleEvidence,
+    staleResolutionTargetIds,
     blockingReviewFlagIds,
   };
 }
