@@ -32,9 +32,9 @@ def main() -> None:
         if block["templateParagraphIndex"] is not None
     ]
     fields = {
-        key: field["value"]
+        field.get("oldValue", key): field["value"]
         for key, field in content["fields"].items()
-        if field.get("verified") or field.get("userConfirmed")
+        if field.get("value") is not None
     }
     image_replacements = []
     if args.image:

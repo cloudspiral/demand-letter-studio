@@ -1,12 +1,7 @@
 import type { ExportReadiness, GeneratedDraft } from "@steno/contracts";
-import { exportableFieldKeys } from "./draft-fields";
-
-const reviewPlaceholder = /\[ATTORNEY REVIEW REQUIRED(?:\s|—|-|\])?/i;
-
 export interface DraftReadinessContext {
   draftSourceFingerprint?: string | null;
   currentSourceFingerprint?: string | null;
-  staleResolutionTargetIds?: string[];
 }
 
 export function draftExportIssues(
@@ -25,51 +20,25 @@ export function draftExportIssues(
     mappingOwners.set(key, current);
   }
 
-  const safeFieldKeys = new Set(exportableFieldKeys(content.fields));
-  const blockIds = allBlocks
-      .filter((block) => (
-        block.kind === "warning"
-        || reviewPlaceholder.test(block.text)
-        || (!block.verified && !block.userConfirmed)
-      ))
-      .map((block) => block.id);
-  const fieldKeys = Object.keys(content.fields).filter((key) => !safeFieldKeys.has(key));
-  const outcomeIds = content.outcomes
-    .filter((outcome) => outcome.status === "omitted_no_evidence" && outcome.resolution === "unresolved")
-    .map((outcome) => outcome.id);
-  const unresolvedTargetIds = new Set(content.outcomes
-    .filter((outcome) => outcome.status === "omitted_no_evidence" && outcome.resolution === "unresolved")
-    .map((outcome) => outcome.targetId));
+  const fieldKeys = Object.entries(content.fields).filter(([, field]) => field.value === null).map(([key]) => key);
+  const confirmed = new Set(content.confirmedOmissionTargetIds);
+  const omittedTargetIds = content.outcomes
+    .filter((outcome) => outcome.status === "omitted" && !confirmed.has(outcome.targetId))
+    .map((outcome) => outcome.targetId);
   const duplicateParagraphIndexes = [...new Set([...mappingOwners.values()]
       .filter(({ owners }) => owners.size > 1)
       .map(({ paragraphIndex }) => paragraphIndex))];
-  const blockedParagraphIndexes = new Set(allBlocks
-    .filter((block) => blockIds.includes(block.id) && block.templateParagraphIndex !== null)
-    .map((block) => block.templateParagraphIndex as number));
   const imageIssue = null;
   const staleEvidence = context.currentSourceFingerprint !== undefined
     && context.currentSourceFingerprint !== null
     && context.draftSourceFingerprint !== context.currentSourceFingerprint;
-  const blockingReviewFlagIds = content.reviewFlags
-    .filter((flag) => (
-      flag.severity === "blocking" && (
-      flag.affectedTargetIds.some((targetId) => unresolvedTargetIds.has(targetId))
-      || flag.affectedTemplateParagraphIndexes.some((index) => blockedParagraphIndexes.has(index))
-      || flag.affectedFieldKeys.some((key) => fieldKeys.includes(key))
-      )
-    ))
-    .map((flag) => flag.id);
-  const staleResolutionTargetIds = context.staleResolutionTargetIds ?? [];
   return {
-    ready: !blockIds.length && !fieldKeys.length && !outcomeIds.length && !duplicateParagraphIndexes.length && !staleEvidence && !staleResolutionTargetIds.length,
-    blockIds,
+    ready: !fieldKeys.length && !omittedTargetIds.length && !duplicateParagraphIndexes.length && !staleEvidence,
     fieldKeys,
-    outcomeIds,
+    omittedTargetIds,
     duplicateParagraphIndexes,
     imageIssue,
     staleEvidence,
-    staleResolutionTargetIds,
-    blockingReviewFlagIds,
   };
 }
 

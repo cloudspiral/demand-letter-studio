@@ -1,24 +1,17 @@
-import { createHash } from "node:crypto";
 import Anthropic from "@anthropic-ai/sdk";
 import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
 import OpenAI from "openai";
 import { z } from "zod";
 import {
   CitationSchema,
-  FieldProposalSchema,
   GenerationOutcomeSchema,
   GeneratedDraftSchema,
-  ReviewFlagSchema,
   RefinementProposalSchema,
   TemplateAnalysisSchema,
   TemplateRegionSchema,
-  type EvidenceReview,
   type Citation,
-  type FieldProposal,
   type GeneratedDraft,
   type GenerationOutcome,
-  type ReviewResolution,
-  type ReviewFlag,
   type RefinementAnnotation,
   type RefinementProposal,
   type TemplateAnalysis,
@@ -48,8 +41,6 @@ export interface GenerateInput {
   matterName: string;
   template: TemplateAnalysis;
   evidence: EvidencePage[];
-  evidenceReview?: EvidenceReview | null;
-  reviewResolutions?: ReviewResolution[];
 }
 
 export interface AnalyzeTemplateInput {
@@ -65,51 +56,26 @@ export interface RefineInput {
   currentDraftVersion?: number;
 }
 
-export interface EvidenceReviewResult {
-  fieldProposals: FieldProposal[];
-  reviewFlags: ReviewFlag[];
-}
-
 export interface AiProvider {
   readonly name: string;
   readonly model: string;
   analyzeTemplate(input: AnalyzeTemplateInput): Promise<TemplateAnalysis>;
-  review(input: GenerateInput): Promise<EvidenceReviewResult>;
   generate(input: GenerateInput): Promise<GeneratedDraft>;
   refine(input: RefineInput): Promise<RefinementProposal>;
+}
+
+export function safeAiDiagnostic(error: unknown): string {
+  if (error instanceof z.ZodError) {
+    return error.issues.slice(0, 12).map((issue) => `${issue.path.join(".") || "root"}:${issue.code}`).join(", ");
+  }
+  if (error instanceof SyntaxError) return `JSON parse failed: ${error.message.slice(0, 160)}`;
+  return error instanceof Error ? error.message.slice(0, 300) : "Unknown provider error";
 }
 
 function strictJsonSchema(schema: z.ZodType): Record<string, unknown> {
   const { $schema: _metaSchema, ...jsonSchema } = z.toJSONSchema(schema, { target: "draft-7" }) as Record<string, unknown>;
   return jsonSchema;
 }
-
-const reviewFlagJsonSchema = {
-  type: "object",
-  additionalProperties: false,
-  required: ["id", "kind", "severity", "summary", "explanation", "citations", "affectedTemplateParagraphIndexes", "affectedFieldKeys", "affectedTargetIds"],
-  properties: {
-    id: { type: "string", minLength: 1, maxLength: 200 },
-    kind: { enum: ["keep_conflict", "unsupported", "low_confidence", "looks_reusable", "missing_evidence", "conflict", "general"] },
-    severity: { enum: ["blocking", "verification", "informational"] },
-    summary: { type: "string", minLength: 1, maxLength: 240 },
-    explanation: { type: "string", minLength: 1, maxLength: 2_000 },
-    citations: {
-      type: "array", maxItems: 12,
-      items: {
-        type: "object", additionalProperties: false,
-        required: ["sourceId", "sourceName", "page", "quote"],
-        properties: {
-          sourceId: { type: "string" }, sourceName: { type: "string" },
-          page: { type: ["integer", "null"] }, quote: { type: "string", maxLength: 500 },
-        },
-      },
-    },
-    affectedTemplateParagraphIndexes: { type: "array", maxItems: 100, items: { type: "integer", minimum: 0 } },
-    affectedFieldKeys: { type: "array", maxItems: 100, items: { type: "string", minLength: 1, maxLength: 500 } },
-    affectedTargetIds: { type: "array", maxItems: 100, items: { type: "string", minLength: 1, maxLength: 500 } },
-  },
-} as const;
 
 const TemplateDecisionOutputSchema = z.object({
   decisions: z.array(z.object({
@@ -302,24 +268,10 @@ const ModelCitationSchema = z.object({
   visualDescription: z.string().max(1_000).nullable(),
 });
 
-const ModelReviewFlagSchema = z.object({
-  id: z.string().min(1).max(200),
-  kind: z.enum(["keep_conflict", "unsupported", "low_confidence", "looks_reusable", "missing_evidence", "conflict", "general"]),
-  severity: z.enum(["blocking", "verification", "informational"]),
-  summary: z.string().min(1).max(240),
-  explanation: z.string().min(1).max(2_000),
-  citations: z.array(ModelCitationSchema).max(12),
-  affectedTemplateParagraphIndexes: z.array(z.number().int().nonnegative()).max(100),
-  affectedFieldKeys: z.array(z.string().min(1).max(500)).max(100),
-  affectedTargetIds: z.array(z.string().min(1).max(500)).max(100),
-});
-
 const ModelGenerationOutputSchema = z.object({
-  title: z.string(),
-  matterName: z.string(),
   outcomes: z.array(z.object({
     targetId: z.string().min(1).max(500),
-    status: z.enum(["generated", "omitted_no_evidence", "omitted_not_applicable"]),
+    status: z.enum(["generated", "omitted"]),
     paragraphs: z.array(z.object({
       text: z.string().min(1).max(20_000),
       citations: z.array(ModelCitationSchema).min(1).max(50),
@@ -336,39 +288,16 @@ const ModelGenerationOutputSchema = z.object({
     citations: z.array(ModelCitationSchema).max(100),
     note: z.string().max(2_000).nullable(),
   })).max(500),
-  warnings: z.array(z.string().max(2_000)).max(100),
-  reviewFlags: z.array(ModelReviewFlagSchema).max(100),
   replacements: z.array(z.object({
     fieldKey: z.string().min(1).max(500),
     oldValue: z.string().min(1),
-    status: z.enum(["replaced", "omitted_no_evidence", "omitted_not_applicable"]),
-    newValue: z.string().min(1).nullable(),
-    sourceId: z.string().uuid().nullable(),
-    page: z.number().int().positive().nullable(),
+    value: z.string().min(1).nullable(),
     citations: z.array(ModelCitationSchema).max(50),
     note: z.string().max(2_000).nullable(),
   })).max(500),
 });
 
 export const generatedDraftJsonSchema = strictJsonSchema(ModelGenerationOutputSchema);
-
-export const evidenceReviewJsonSchema = {
-  type: "object",
-  additionalProperties: false,
-  required: ["fieldProposals", "reviewFlags"],
-  properties: {
-    fieldProposals: {
-      type: "array",
-      maxItems: 500,
-      items: strictJsonSchema(FieldProposalSchema),
-    },
-    reviewFlags: {
-      type: "array",
-      maxItems: 100,
-      items: reviewFlagJsonSchema,
-    },
-  },
-} as const;
 
 const refinementJsonSchema = {
   type: "object", additionalProperties: false,
@@ -394,7 +323,6 @@ function promptForGeneration(input: GenerateInput): string {
   const blocks = input.template.blocks?.length ? input.template.blocks : input.template.regions;
   const targets = deriveGenerationTargets(input.template).map((target) => ({
     ...target,
-    preapprovedOmission: Boolean(input.reviewResolutions?.some((resolution) => resolution.targetId === target.id)),
     exemplars: target.blockIds.map((id) => {
       const block = blocks.find((candidate) => templateBlockId(candidate) === id)!;
       return { blockId: id, text: block.text, style: block.formatting, structuredGroup: block.structuredGroup, figure: block.figure };
@@ -407,6 +335,9 @@ function promptForGeneration(input: GenerateInput): string {
     text: block.text,
     inlineFields: block.inlineFields,
   }));
+  const evidenceText = normalizeEvidenceText(input.evidence.map((page) => page.text).join("\n"));
+  const forbiddenPreviousCaseValues = (input.template.knownCaseSpecificValues ?? [])
+    .filter((value) => value.trim() && !evidenceText.includes(normalizeEvidenceText(value)));
   return `Create an attorney-review draft demand letter for ${input.matterName}.
 Accuracy rules:
 - The complete mapped template is a previous-case exemplar, never evidence.
@@ -417,14 +348,14 @@ Accuracy rules:
 - For a narrative target, status generated requires 1-${12} paragraphs, each with citations. The number of paragraphs may differ from the exemplars when the evidence warrants it.
 - For a structured target, status generated requires 1-50 rows with role body or total. Preserve the exemplar's column count and total-row semantics; each row requires citations. Use at most one total row and put it last.
 - For a figure target, status generated requires an existing standalone uploaded image sourceId/page, its exact image mediaType, a grounded caption, and visual citations. A rendered PDF page is review context, not a replacement image. Never synthesize or invent an image.
-- If evidence is silent, return omitted_no_evidence with no generated paragraphs/rows/figure. If evidence positively establishes that a target is inapplicable, return omitted_not_applicable with supporting citations.
-- A target marked preapprovedOmission must return omitted_no_evidence. Do not draft content for it.
-- If sources conflict about a name, claim number, date, amount, coverage, liability, treatment, or deadline, do not choose a value. Omit the affected target as no evidence and describe the conflict in warnings and reviewFlags.
-- Carry forward the advisory evidence-review field proposals and warnings, but independently ground all generated factual content in EVIDENCE.
+- If evidence is missing, ambiguous, or conflicting, return omitted with no generated paragraphs, rows, or figure and a concise user-facing note. Include citations to every conflicting source when a conflict exists.
+- If evidence affirmatively establishes a negative fact, generate useful cited language such as "No future medical care is currently recommended." Do not omit a target merely because the supported fact is negative.
 - Preserve document order, defined terms, pronouns, chronology, surrounding flow, rhetorical purpose, and approximate layout. Code reuses keep language exactly; do not return it.
+- Never repeat a value from FORBIDDEN PREVIOUS-CASE VALUES in any generated text or field value. Omit the affected target or return a null field instead of copying an exemplar value.
+- Do not return a document title. Application code supplies the neutral attorney-review title.
 - Return concise structured JSON, never HTML, Markdown, code, or OOXML.
-- Return exactly one replacement outcome for every INLINE FIELD DECISION and no others. Copy fieldKey and oldValue exactly. Use replaced with a grounded newValue/sourceId/page and at least one exact quote citation from that same source page, or an explicit omitted status with null value/source/page. A heading value may reformat a cited date, name, reference, or amount to fit the surrounding template. Silent field omission is invalid.
-- Review flags must use only supplied targetIds, paragraph indexes, and field keys. Use severity blocking for unresolved missing/conflicting evidence, verification for a kept-content conflict or low confidence, and informational for not-applicable or shape changes.
+- Return exactly one replacement outcome for every INLINE FIELD DECISION and no others. Copy fieldKey and oldValue exactly. A non-null value requires at least one exact grounding citation. A null value requires a concise user-facing note and may include source citations for ambiguity or conflict. A heading value may reformat a cited date, name, reference, or amount to fit the surrounding template. Silent field omission is invalid.
+- For every generated target set note to null. For every omitted target provide a non-empty note.
 
 KEEP/HEADING CONTEXT IN DOCUMENT ORDER:
 ${JSON.stringify(keptContext)}
@@ -435,55 +366,12 @@ ${JSON.stringify(targets)}
 INLINE FIELD DECISIONS:
 ${JSON.stringify(input.template.replacementCandidates)}
 
-ADVISORY EVIDENCE REVIEW:
-${JSON.stringify(input.evidenceReview ?? null)}
+FORBIDDEN PREVIOUS-CASE VALUES:
+${JSON.stringify(forbiddenPreviousCaseValues)}
 
 EVIDENCE:
 ${JSON.stringify(input.evidence.map(({ imageData: _imageData, ...page }) => page))}`;
 }
-
-function promptForEvidenceReview(input: GenerateInput): string {
-  const completeMap = (input.template.blocks?.length ? input.template.blocks : input.template.regions).map((region) => ({
-    blockId: region.id ?? `word/document.xml:p:${region.paragraphIndex}`,
-    paragraphIndex: region.paragraphIndex,
-    partName: region.anchor?.partName ?? "word/document.xml",
-    text: region.text,
-    role: region.role === "editable" ? "replace" : region.role === "heading" ? "heading" : "keep",
-    inlineFields: region.inlineFields,
-  }));
-  const targets = deriveGenerationTargets(input.template);
-  return `Review the uploaded evidence before drafting an attorney-review demand letter for ${input.matterName}.
-The complete mapped template is from a previous case. Its text is context only and is never evidence.
-Return provenance-backed proposals for inline fields plus high-signal advisory review flags.
-- Use only the complete uploaded case packet in EVIDENCE.
-- For every proposed field value, copy an exact source-page quote and provide sourceId, sourceName, page, and confidence.
-- If support is missing, do not invent a value. Create a missing_evidence blocking flag linked to the affected targetIds and/or field keys.
-- Do not classify documents or assign types, severities, or validity labels.
-- Do not decide authenticity, evidentiary admissibility, legal sufficiency, or legal validity.
-- Do not draft letter language and do not produce a case summary.
-- When sources appear inconsistent, cite short exact contiguous quotes from every relevant source page.
-- Visual-only observations must use evidenceType=visual with an explicit visualDescription; never present a visual observation as quoted text.
-- When supporting evidence cannot be located, use no citations and identify the affected stable targetIds and/or field keys.
-- A review flag is advisory and non-exhaustive. Do not claim the packet is complete.
-- Use only targetIds, paragraph indexes, and field keys supplied below. Use empty target arrays only for a genuinely packet-wide advisory concern.
-
-COMPLETE CONFIRMED TEMPLATE MAP:
-${JSON.stringify(completeMap)}
-
-TEMPLATE REPLACEMENT CANDIDATES:
-${JSON.stringify(input.template.replacementCandidates)}
-
-STABLE GENERATION TARGETS:
-${JSON.stringify(targets)}
-
-EVIDENCE:
-${JSON.stringify(input.evidence.map(({ imageData: _imageData, ...page }) => page))}`;
-}
-
-const ReviewFlagsOutputSchema = z.object({
-  fieldProposals: z.array(FieldProposalSchema).max(500).default([]),
-  reviewFlags: z.array(ReviewFlagSchema).max(100),
-});
 
 const normalizeEvidenceText = (value: string): string => value
   .normalize("NFKC")
@@ -491,123 +379,6 @@ const normalizeEvidenceText = (value: string): string => value
   .trim()
   .toLocaleLowerCase();
 
-function stableFlagId(flag: Omit<ReviewFlag, "id">): string {
-  return `source-review-${createHash("sha256").update(JSON.stringify({
-    kind: flag.kind,
-    severity: flag.severity,
-    summary: normalizeEvidenceText(flag.summary),
-    paragraphs: flag.affectedTemplateParagraphIndexes,
-    fields: flag.affectedFieldKeys,
-    targets: flag.affectedTargetIds,
-    citations: flag.citations.map((citation) => [
-      citation.sourceId,
-      citation.page,
-      citation.evidenceType ?? "text",
-      normalizeEvidenceText(citation.quote),
-      normalizeEvidenceText(citation.visualDescription ?? ""),
-    ]),
-  })).digest("hex").slice(0, 16)}`;
-}
-
-export function validateReviewFlags(
-  rawFlags: unknown,
-  evidence: EvidencePage[],
-  template: TemplateAnalysis,
-): ReviewFlag[] {
-  const parsed = z.array(ReviewFlagSchema).max(100).parse(rawFlags);
-  const pages = new Map(evidence.map((page) => [`${page.sourceId}:${page.page}`, page]));
-  const paragraphIndexes = new Set(template.regions.filter((region) => region.role === "editable").map((region) => region.paragraphIndex));
-  const fieldKeys = new Set(template.replacementCandidates.flatMap((candidate) => [candidate.fieldKey, candidate.value]
-    .filter((value): value is string => Boolean(value))));
-  const targets = deriveGenerationTargets(template);
-  const targetIds = new Set(targets.map((target) => target.id));
-  const blockById = new Map((template.blocks?.length ? template.blocks : template.regions).map((block) => [templateBlockId(block), block]));
-  const flags: ReviewFlag[] = [];
-  const seen = new Set<string>();
-
-  for (const flag of parsed) {
-    const citations = flag.citations.flatMap((citation) => {
-      if (citation.page === null) return [];
-      const page = pages.get(`${citation.sourceId}:${citation.page}`);
-      if (!page) return [];
-      if (citation.evidenceType === "visual") {
-        if (!page.visualInput || !citation.visualDescription?.trim()) return [];
-        return [{ ...citation, sourceName: page.sourceName }];
-      }
-      if (!citation.quote.trim() || !normalizeEvidenceText(page.text).includes(normalizeEvidenceText(citation.quote))) return [];
-      return [{ ...citation, sourceName: page.sourceName }];
-    });
-    if (flag.citations.length > 0 && citations.length === 0) continue;
-
-    const affectedTemplateParagraphIndexes = [...new Set(flag.affectedTemplateParagraphIndexes.filter((index) => paragraphIndexes.has(index)))];
-    const affectedFieldKeys = [...new Set(flag.affectedFieldKeys.filter((key) => fieldKeys.has(key)))];
-    const affectedTargetIds = [...new Set([
-      ...flag.affectedTargetIds.filter((id) => targetIds.has(id)),
-      ...targets.filter((target) => target.blockIds.some((blockId) => (
-        affectedTemplateParagraphIndexes.includes(blockById.get(blockId)?.paragraphIndex ?? -1)
-      ))).map((target) => target.id),
-    ])];
-    const uncitedTarget = affectedTargetIds.length
-      ? `the affected generation ${affectedTargetIds.length === 1 ? "target" : "targets"}`
-      : affectedFieldKeys.length
-      ? `the affected template ${affectedFieldKeys.length === 1 ? "field" : "fields"}`
-      : affectedTemplateParagraphIndexes.length
-        ? `the affected template ${affectedTemplateParagraphIndexes.length === 1 ? "region" : "regions"}`
-        : "the case-specific draft";
-    const normalized: Omit<ReviewFlag, "id"> = citations.length
-      ? {
-          kind: flag.kind,
-          severity: flag.severity,
-          summary: flag.summary,
-          explanation: flag.explanation,
-          citations,
-          affectedTemplateParagraphIndexes,
-          affectedFieldKeys,
-          affectedTargetIds,
-        }
-      : {
-          kind: "missing_evidence" as const,
-          severity: "blocking" as const,
-          summary: "Supporting evidence not located",
-          explanation: `The uploaded sources did not provide support for ${uncitedTarget}. Review the source materials before relying on this point.`,
-          citations: [],
-          affectedTemplateParagraphIndexes,
-          affectedFieldKeys,
-          affectedTargetIds,
-        };
-    const id = stableFlagId(normalized);
-    if (seen.has(id)) continue;
-    seen.add(id);
-    flags.push({ id, ...normalized });
-  }
-  return flags;
-}
-
-export function parseEvidenceReview(raw: unknown, evidence: EvidencePage[], template: TemplateAnalysis): EvidenceReviewResult {
-  const parsed = ReviewFlagsOutputSchema.parse(raw);
-  const pages = new Map(evidence.map((page) => [`${page.sourceId}:${page.page}`, page]));
-  const allowedFieldKeys = new Set(template.replacementCandidates.flatMap((candidate) => [candidate.fieldKey, candidate.value].filter((value): value is string => Boolean(value))));
-  const fieldProposals = parsed.fieldProposals.filter((proposal) => {
-    const page = pages.get(`${proposal.sourceId}:${proposal.page}`);
-    return Boolean(
-      page
-      && allowedFieldKeys.has(proposal.fieldKey)
-      && normalizeEvidenceText(page.text).includes(normalizeEvidenceText(proposal.quote))
-      && normalizeEvidenceText(proposal.quote).includes(normalizeEvidenceText(proposal.value)),
-    );
-  }).map((proposal) => ({ ...proposal, sourceName: pages.get(`${proposal.sourceId}:${proposal.page}`)!.sourceName }));
-  const proposedFieldKeys = new Set<string>();
-  for (const proposal of fieldProposals) {
-    if (proposedFieldKeys.has(proposal.fieldKey)) {
-      throw new Error(`Evidence review returned duplicate proposals for field ${proposal.fieldKey}.`);
-    }
-    proposedFieldKeys.add(proposal.fieldKey);
-  }
-  return {
-    fieldProposals,
-    reviewFlags: validateReviewFlags(parsed.reviewFlags, evidence, template),
-  };
-}
 
 function groundedCitations(citations: z.infer<typeof ModelCitationSchema>[], evidence: EvidencePage[]): Citation[] {
   const pages = new Map(evidence.map((page) => [`${page.sourceId}:${page.page}`, page]));
@@ -627,10 +398,8 @@ export function parseModelDraft(
   raw: unknown,
   evidence: EvidencePage[],
   template: TemplateAnalysis,
-  reviewResolutions: ReviewResolution[] = [],
 ): GeneratedDraft {
   const parsed = ModelGenerationOutputSchema.parse(raw);
-  const pages = new Map(evidence.map((page) => [`${page.sourceId}:${page.page}`, page]));
   const targets = deriveGenerationTargets(template);
   const targetById = new Map(targets.map((target) => [target.id, target]));
   const outputByTarget = new Map<string, (typeof parsed.outcomes)[number]>();
@@ -642,18 +411,12 @@ export function parseModelDraft(
   const missing = targets.filter((target) => !outputByTarget.has(target.id));
   if (missing.length) throw new Error(`Generation omitted ${missing.length} required target outcome(s).`);
 
-  const currentResolutionTargets = new Set(reviewResolutions.map((resolution) => resolution.targetId));
   const generatedBlocks: GeneratedDraft["sections"][number]["blocks"] = [];
   const outcomes: GenerationOutcome[] = [];
   for (const target of targets) {
     const output = outputByTarget.get(target.id)!;
-    const preapproved = currentResolutionTargets.has(target.id);
-    if (preapproved && output.status !== "omitted_no_evidence") {
-      throw new Error(`Generation wrote target ${target.id} despite its pre-approved omission.`);
-    }
-    let status = output.status;
+    const status = output.status;
     let citations = groundedCitations(output.citations, evidence);
-    if (status === "omitted_not_applicable" && !citations.length) status = "omitted_no_evidence";
 
     if (status === "generated") {
       if (target.kind === "narrative") {
@@ -669,10 +432,7 @@ export function parseModelDraft(
             templateParagraphIndex: null,
             templateBlockId: target.blockIds[Math.min(sequence, target.blockIds.length - 1)]!,
             citations: paragraphCitations,
-            verified: true,
-            userConfirmed: false,
-            templateRole: "replace",
-            locked: false,
+            attorneyEdited: false,
             targetId: target.id,
             outcomeId: `outcome:${target.id}`,
             sequence,
@@ -700,10 +460,7 @@ export function parseModelDraft(
             templateParagraphIndex: null,
             templateBlockId: target.blockIds[Math.min(sequence, target.blockIds.length - 1)]!,
             citations: rowCitations,
-            verified: true,
-            userConfirmed: false,
-            templateRole: "replace",
-            locked: false,
+            attorneyEdited: false,
             targetId: target.id,
             outcomeId: `outcome:${target.id}`,
             sequence,
@@ -724,14 +481,16 @@ export function parseModelDraft(
           templateParagraphIndex: null,
           templateBlockId: target.blockIds[0]!,
           citations,
-          verified: true,
-          userConfirmed: false,
-          templateRole: "replace",
-          locked: false,
+          attorneyEdited: false,
           targetId: target.id,
           outcomeId: `outcome:${target.id}`,
           sequence: 0,
         });
+      }
+      if (target.kind === "narrative") {
+        citations = groundedCitations(output.paragraphs.flatMap((paragraph) => paragraph.citations), evidence);
+      } else if (target.kind === "structured") {
+        citations = groundedCitations(output.rows.flatMap((row) => row.citations), evidence);
       }
     } else {
       if (output.paragraphs.length || output.rows.length || output.caption || output.sourceId || output.page || output.mediaType) {
@@ -744,9 +503,6 @@ export function parseModelDraft(
       targetId: target.id,
       targetKind: target.kind,
       status,
-      resolution: status === "generated" || status === "omitted_not_applicable"
-        ? "not_required"
-        : preapproved ? "preapproved" : "unresolved",
       citations,
       note: output.note,
       sourceId: target.kind === "figure" && status === "generated" ? output.sourceId : null,
@@ -763,11 +519,11 @@ export function parseModelDraft(
   }
 
   const supportedEvidenceText = normalizeEvidenceText(evidence.map((page) => page.text).join("\n"));
-  for (const oldValue of template.knownCaseSpecificValues ?? []) {
+  for (const [oldValueIndex, oldValue] of (template.knownCaseSpecificValues ?? []).entries()) {
     if (!oldValue.trim() || supportedEvidenceText.includes(normalizeEvidenceText(oldValue))) continue;
-    const leaked = generatedBlocks
-      .some((block) => normalizeEvidenceText(block.text).includes(normalizeEvidenceText(oldValue)));
-    if (leaked) throw new Error("Generation reused a previous-case value without new-case support.");
+    const normalizedOldValue = normalizeEvidenceText(oldValue);
+    const leakedBlock = generatedBlocks.find((block) => normalizeEvidenceText(block.text).includes(normalizedOldValue));
+    if (leakedBlock) throw new Error(`Generation reused unsupported previous-case value #${oldValueIndex + 1} in target ${leakedBlock.targetId}.`);
   }
   const allowedOldValues = new Set(template.replacementCandidates.map((candidate) => candidate.value));
   const fields: GeneratedDraft["fields"] = {};
@@ -780,41 +536,28 @@ export function parseModelDraft(
     const fieldKey = candidate.fieldKey ?? candidate.value;
     if (replacementByKey.has(fieldKey)) throw new Error(`Generation returned duplicate output for inline field ${fieldKey}.`);
     replacementByKey.set(fieldKey, replacement);
-    if (replacement.status === "replaced") {
-      if (!replacement.newValue || !replacement.sourceId || !replacement.page) throw new Error(`Replacement field ${fieldKey} is missing its grounded value or source.`);
-      const source = pages.get(`${replacement.sourceId}:${replacement.page}`);
+    if (replacement.value !== null) {
       const replacementCitations = groundedCitations(replacement.citations, evidence);
-      if (!source || !replacementCitations.some((citation) => citation.sourceId === source.sourceId && citation.page === source.page)) {
-        throw new Error(`Replacement field ${fieldKey} is not grounded on its cited source page.`);
-      }
+      if (!replacementCitations.length) throw new Error(`Replacement field ${fieldKey} is missing a grounding citation.`);
       fields[fieldKey] = {
-        value: replacement.newValue,
+        fieldKey,
+        oldValue: replacement.oldValue,
+        value: replacement.value,
         label: candidate.label ?? fieldKey,
-        templateValue: replacement.oldValue,
-        verified: true,
-        confidence: 1,
-        userConfirmed: false,
-        sourceId: source.sourceId,
-        page: source.page,
-        sourceLabel: `${source.sourceName} p. ${source.page}`,
-        quote: replacementCitations.find((citation) => citation.sourceId === source.sourceId && citation.page === source.page)!.quote,
+        citations: replacementCitations,
+        note: null,
+        attorneyEdited: false,
       };
     } else {
-      if (replacement.newValue || replacement.sourceId || replacement.page) throw new Error(`Omitted replacement field ${fieldKey} returned generated content.`);
       const omissionCitations = groundedCitations(replacement.citations, evidence);
-      if (replacement.status === "omitted_not_applicable" && !omissionCitations.length) {
-        throw new Error(`Not-applicable replacement field ${fieldKey} requires supporting evidence.`);
-      }
       fields[fieldKey] = {
-        value: "[ATTORNEY REVIEW REQUIRED]",
+        fieldKey,
+        oldValue: replacement.oldValue,
+        value: null,
         label: candidate.label ?? fieldKey,
-        templateValue: replacement.oldValue,
-        verified: false,
-        confidence: null,
-        userConfirmed: false,
-        sourceId: null,
-        page: null,
-        sourceLabel: null,
+        citations: omissionCitations,
+        note: replacement.note,
+        attorneyEdited: false,
       };
     }
   }
@@ -822,14 +565,20 @@ export function parseModelDraft(
     .map((candidate) => candidate.fieldKey ?? candidate.value)
     .filter((fieldKey) => !replacementByKey.has(fieldKey));
   if (missingFields.length) throw new Error(`Generation omitted ${missingFields.length} required inline-field outcome(s).`);
+  for (const [oldValueIndex, oldValue] of (template.knownCaseSpecificValues ?? []).entries()) {
+    if (!oldValue.trim() || supportedEvidenceText.includes(normalizeEvidenceText(oldValue))) continue;
+    const normalizedOldValue = normalizeEvidenceText(oldValue);
+    const leakedField = Object.values(fields).find((field) => field.value && normalizeEvidenceText(field.value).includes(normalizedOldValue));
+    if (leakedField) {
+      throw new Error(`Generation reused unsupported previous-case value #${oldValueIndex + 1} in field ${leakedField.fieldKey}.`);
+    }
+  }
   return GeneratedDraftSchema.parse({
-    title: parsed.title,
-    matterName: parsed.matterName,
+    title: "Demand letter",
     fields,
     sections: [{ id: "generated-targets", heading: null, blocks: generatedBlocks }],
-    warnings: parsed.warnings,
-    reviewFlags: validateReviewFlags(parsed.reviewFlags, evidence, template),
     outcomes,
+    confirmedOmissionTargetIds: [],
   });
 }
 
@@ -894,17 +643,6 @@ class OpenAiProvider implements AiProvider {
     return parseTemplateAnalysis(JSON.parse(response.output_text), input);
   }
 
-  async review(input: GenerateInput): Promise<EvidenceReviewResult> {
-    const response = await this.client.responses.create({
-      model: this.model,
-      input: openAiMultimodalInput(promptForEvidenceReview(input), input.evidence),
-      reasoning: { effort: (process.env.OPENAI_REASONING_EFFORT as "low" | "medium" | "high") ?? "high" },
-      store: false,
-      text: { format: { type: "json_schema", name: "evidence_review", strict: true, schema: evidenceReviewJsonSchema } },
-    });
-    return parseEvidenceReview(JSON.parse(response.output_text), input.evidence, input.template);
-  }
-
   async generate(input: GenerateInput): Promise<GeneratedDraft> {
     const response = await this.client.responses.create({
       model: this.model,
@@ -913,7 +651,7 @@ class OpenAiProvider implements AiProvider {
       store: false,
       text: { format: { type: "json_schema", name: "generated_draft", strict: true, schema: generatedDraftJsonSchema } },
     });
-    return parseModelDraft(JSON.parse(response.output_text), input.evidence, input.template, input.reviewResolutions);
+    return parseModelDraft(JSON.parse(response.output_text), input.evidence, input.template);
   }
 
   async refine(input: RefineInput): Promise<RefinementProposal> {
@@ -956,12 +694,8 @@ class AnthropicProvider implements AiProvider {
     return parseTemplateAnalysis(await this.json(promptForTemplateAnalysis(input), templateAnalysisJsonSchema), input);
   }
 
-  async review(input: GenerateInput): Promise<EvidenceReviewResult> {
-    return parseEvidenceReview(await this.json(promptForEvidenceReview(input), evidenceReviewJsonSchema, input.evidence), input.evidence, input.template);
-  }
-
   async generate(input: GenerateInput): Promise<GeneratedDraft> {
-    return parseModelDraft(await this.json(promptForGeneration(input), generatedDraftJsonSchema, input.evidence), input.evidence, input.template, input.reviewResolutions);
+    return parseModelDraft(await this.json(promptForGeneration(input), generatedDraftJsonSchema, input.evidence), input.evidence, input.template);
   }
 
   async refine(input: RefineInput): Promise<RefinementProposal> {
@@ -1000,12 +734,8 @@ class BedrockProvider implements AiProvider {
     return parseTemplateAnalysis(await this.json(promptForTemplateAnalysis(input), templateAnalysisJsonSchema, 16_000), input);
   }
 
-  async review(input: GenerateInput): Promise<EvidenceReviewResult> {
-    return parseEvidenceReview(await this.json(promptForEvidenceReview(input), evidenceReviewJsonSchema, 8_000, input.evidence), input.evidence, input.template);
-  }
-
   async generate(input: GenerateInput): Promise<GeneratedDraft> {
-    return parseModelDraft(await this.json(promptForGeneration(input), generatedDraftJsonSchema, 16_000, input.evidence), input.evidence, input.template, input.reviewResolutions);
+    return parseModelDraft(await this.json(promptForGeneration(input), generatedDraftJsonSchema, 16_000, input.evidence), input.evidence, input.template);
   }
 
   async refine(input: RefineInput): Promise<RefinementProposal> {
@@ -1038,34 +768,11 @@ class MockProvider implements AiProvider {
     }, input);
   }
 
-  async review(input: GenerateInput): Promise<EvidenceReviewResult> {
-    await this.modelDelay();
-    const textualEvidence = input.evidence.filter((page) => page.text.trim() && !page.text.startsWith("[Image evidence:"));
-    const affectedTemplateParagraphIndexes = input.template.regions
-      .filter((region) => region.role === "editable")
-      .slice(textualEvidence.length ? 1 : 0, textualEvidence.length ? 3 : 2)
-      .map((region) => region.paragraphIndex);
-    const affectedFieldKeys = input.template.replacementCandidates
-      .filter((candidate) => !textualEvidence.some((page) => page.text.includes(candidate.value)))
-      .slice(0, 3)
-      .map((candidate) => candidate.fieldKey ?? candidate.value);
-    if (!affectedTemplateParagraphIndexes.length && !affectedFieldKeys.length) return { fieldProposals: [], reviewFlags: [] };
-    return { fieldProposals: [], reviewFlags: validateReviewFlags([{
-      id: "mock-review",
-      summary: "Supporting evidence not located",
-      explanation: "The deterministic review did not locate support for every case-specific template target.",
-      citations: [],
-      affectedTemplateParagraphIndexes,
-      affectedFieldKeys,
-    }], input.evidence, input.template) };
-  }
-
   async generate(input: GenerateInput): Promise<GeneratedDraft> {
     await this.modelDelay();
     const textual = input.evidence.find((page) => page.text.trim() && !page.text.startsWith("[Image evidence:"));
     const visual = input.evidence.find((page) => page.mimeType?.startsWith("image/") && page.imageData);
     const targets = deriveGenerationTargets(input.template);
-    const preapproved = new Set(input.reviewResolutions?.map((resolution) => resolution.targetId) ?? []);
     const textCitation = textual ? {
       sourceId: textual.sourceId,
       sourceName: textual.sourceName,
@@ -1078,13 +785,9 @@ class MockProvider implements AiProvider {
       title: "Time-Limited Policy Limits Demand",
       matterName: input.matterName,
       outcomes: targets.map((target) => {
-        if (preapproved.has(target.id)) return {
-          targetId: target.id, status: "omitted_no_evidence", paragraphs: [], rows: [], caption: null,
-          sourceId: null, page: null, mediaType: null, citations: [], note: "Omitted for this matter before generation.",
-        };
         if (target.kind === "figure") {
           if (!visual?.imageData) return {
-            targetId: target.id, status: "omitted_no_evidence", paragraphs: [], rows: [], caption: null,
+            targetId: target.id, status: "omitted", paragraphs: [], rows: [], caption: null,
             sourceId: null, page: null, mediaType: null, citations: [], note: "No uploaded image supports this figure slot.",
           };
           const citation = {
@@ -1098,7 +801,7 @@ class MockProvider implements AiProvider {
           };
         }
         if (!textCitation) return {
-          targetId: target.id, status: "omitted_no_evidence", paragraphs: [], rows: [], caption: null,
+          targetId: target.id, status: "omitted", paragraphs: [], rows: [], caption: null,
           sourceId: null, page: null, mediaType: null, citations: [], note: "No extractable evidence supports this target.",
         };
         if (target.kind === "structured") {
@@ -1116,19 +819,14 @@ class MockProvider implements AiProvider {
           rows: [], caption: null, sourceId: null, page: null, mediaType: null, citations: [], note: null,
         };
       }),
-      warnings: ["The provided packet contains billing documents and an image, not the complete underlying case record."],
-      reviewFlags: (await this.review(input)).reviewFlags,
       replacements: input.template.replacementCandidates.map((candidate) => ({
         fieldKey: candidate.fieldKey ?? candidate.value,
         oldValue: candidate.value,
-        status: "omitted_no_evidence",
-        newValue: null,
-        sourceId: null,
-        page: null,
+        value: null,
         citations: [],
         note: "The deterministic provider did not identify a grounded replacement value.",
       })),
-    }, input.evidence, input.template, input.reviewResolutions);
+    }, input.evidence, input.template);
   }
 
   async refine(input: RefineInput): Promise<RefinementProposal> {

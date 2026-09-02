@@ -1,9 +1,33 @@
 import type { GeneratedDraft, RefinementAnnotation, RefinementProposal } from "@steno/contracts";
 
+function editedBlock(block: GeneratedDraft["sections"][number]["blocks"][number], text: string) {
+  if (!block.structuredCells) return { ...block, text, attorneyEdited: true };
+  const structuredCells = text.split(" · ");
+  if (structuredCells.length !== block.structuredCells.length) {
+    throw new Error(`Structured row edits must preserve ${block.structuredCells.length} cells separated by " · ".`);
+  }
+  return { ...block, text, structuredCells, attorneyEdited: true };
+}
+
 export function applyDirectDraftEdits(current: GeneratedDraft, candidate: GeneratedDraft): GeneratedDraft {
-  const candidateBlocks = new Map(candidate.sections.flatMap((section) => section.blocks).map((block) => [block.id, block]));
+  const candidateBlockList = candidate.sections.flatMap((section) => section.blocks);
+  const candidateBlocks = new Map(candidateBlockList.map((block) => [block.id, block]));
   const currentBlocks = current.sections.flatMap((section) => section.blocks);
-  if (candidateBlocks.size !== currentBlocks.length || currentBlocks.some((block) => !candidateBlocks.has(block.id))) {
+  const preservesOrder = candidateBlockList.every((block, index) => block.id === currentBlocks[index]?.id);
+  const preservesSections = candidate.sections.every((section, index) => {
+    const currentSection = current.sections[index];
+    return currentSection?.id === section.id
+      && currentSection.heading === section.heading
+      && section.blocks.every((block, blockIndex) => block.id === currentSection.blocks[blockIndex]?.id)
+      && section.blocks.length === currentSection.blocks.length;
+  });
+  if (
+    candidate.sections.length !== current.sections.length
+    || candidateBlocks.size !== currentBlocks.length
+    || currentBlocks.some((block) => !candidateBlocks.has(block.id))
+    || !preservesOrder
+    || !preservesSections
+  ) {
     throw new Error("Direct edits may change paragraph text but not the reviewed template structure.");
   }
 
@@ -14,15 +38,7 @@ export function applyDirectDraftEdits(current: GeneratedDraft, candidate: Genera
       blocks: section.blocks.map((block) => {
         const nextText = candidateBlocks.get(block.id)?.text ?? block.text;
         if (nextText === block.text) return block;
-        if (block.locked || block.templateRole === "keep") {
-          throw new Error("Direct edits cannot change exact Keep language from the confirmed template map.");
-        }
-        return {
-          ...block,
-          text: nextText,
-          verified: false,
-          userConfirmed: false,
-        };
+        return editedBlock(block, nextText);
       }),
     })),
   };
@@ -62,9 +78,6 @@ export function applyRefinementProposal(content: GeneratedDraft, proposal: Refin
       blocks: section.blocks.map((block) => {
         const edits = grouped.get(block.id);
         if (!edits?.length) return block;
-        if (block.locked || block.templateRole === "keep") {
-          throw new Error("AI refinements cannot change exact Keep language from the confirmed template map.");
-        }
         const ordered = [...edits].sort((a, b) => a.start - b.start);
         for (let index = 0; index < ordered.length; index += 1) {
           const edit = ordered[index];
@@ -78,45 +91,10 @@ export function applyRefinementProposal(content: GeneratedDraft, proposal: Refin
           text = `${text.slice(0, edit.start)}${edit.replacementText}${text.slice(edit.end)}`;
           applied += 1;
         }
-        return {
-          ...block,
-          text,
-          verified: false,
-          userConfirmed: false,
-        };
+        return editedBlock(block, text);
       }),
     })),
   };
   if (applied !== normalized.length) throw new Error("One or more proposal targets no longer exist in this draft.");
-  return updated;
-}
-
-export function confirmDraftBlock(
-  content: GeneratedDraft,
-  blockId: string,
-  reviewedText: string,
-): GeneratedDraft {
-  let found = false;
-  const updated = {
-    ...content,
-    sections: content.sections.map((section) => ({
-      ...section,
-      blocks: section.blocks.map((block) => {
-        if (block.id !== blockId) return block;
-        found = true;
-        if (block.locked || block.templateRole === "keep") {
-          throw new Error("Attorney confirmation cannot change exact Keep language from the confirmed template map.");
-        }
-        return {
-          ...block,
-          kind: block.kind === "warning" ? "paragraph" as const : block.kind,
-          text: reviewedText,
-          verified: false,
-          userConfirmed: true,
-        };
-      }),
-    })),
-  };
-  if (!found) throw new Error("Draft block not found.");
   return updated;
 }

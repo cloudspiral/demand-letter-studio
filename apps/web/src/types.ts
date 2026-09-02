@@ -1,4 +1,4 @@
-import type { EvidenceReview, ExportReadiness, GeneratedDraft, GenerationTarget, ReviewResolution, TemplateAnalysis, TemplateMap, TemplateRegion } from "@steno/contracts";
+import type { DraftVersionSummary, ExportReadiness, GeneratedDraft, GenerationTarget, TemplateAnalysis, TemplateMap, TemplateRegion } from "@steno/contracts";
 
 export interface TemplateResponse {
   id: string;
@@ -30,23 +30,20 @@ export interface MatterResponse {
   templateMapVersion: number;
   sources: SourceResponse[];
   sourceFingerprint: string;
-  evidenceReview: EvidenceReview | null;
-  evidenceReviewStale: boolean;
   activeDraft: { id: string; version: number } | null;
-  reviewResolutions: ReviewResolution[];
   generationTargets: GenerationTarget[];
 }
 
 export interface JobResponse {
   id?: string;
   jobId?: string;
-  jobType?: "generation" | "evidence_review" | "template_analysis" | "source_extraction";
+  jobType?: "generation" | "template_analysis" | "source_extraction";
   status: "queued" | "processing" | "completed" | "failed";
   progress?: number;
   step?: string;
   draftId?: string | null;
   error?: string | null;
-  result?: EvidenceReview | { draftId: string; version: number; sourceFingerprint: string } | null;
+  result?: { draftId: string; version: number; sourceFingerprint: string } | null;
 }
 
 export interface DraftResponse {
@@ -58,7 +55,10 @@ export interface DraftResponse {
   sourceFingerprint: string | null;
   createdAt: string;
   updatedAt: string;
+  targets: Array<GenerationTarget & { label: string; exemplarExcerpt: string }>;
 }
+
+export type VersionResponse = DraftVersionSummary;
 
 export interface ProposalResponse {
   id: string;

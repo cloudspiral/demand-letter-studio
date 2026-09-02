@@ -8,15 +8,12 @@ import multipart from "@fastify/multipart";
 import AdmZip from "adm-zip";
 import { z } from "zod";
 import {
-  EvidenceReviewSchema,
   GeneratedDraftSchema,
-  ReviewResolutionSchema,
   RefinementAnnotationSchema,
   RefinementProposalSchema,
   TemplateAnalysisSchema,
   TemplateMapSchema,
   TemplateRegionSchema,
-  type GeneratedDraft,
 } from "@steno/contracts";
 import { createAiProvider, type EvidencePage } from "./ai";
 import { config } from "./config";
@@ -24,8 +21,10 @@ import { ACTOR_ID, migrate, persistCitations, pool, sourceFingerprintForMatter, 
 import { analyzeTemplate, exportDocx, extractSource } from "./document-worker";
 import { draftExportIssues, isDraftExportReady } from "./draft-export";
 import { confirmDraftField, exportableFieldReplacements } from "./draft-fields";
-import { appendJobEvent, ensureEditableCoverage, processEvidenceReviewJob, processGenerationJob, recordAiRun, resumeQueuedJobs } from "./jobs";
-import { applyDirectDraftEdits, applyRefinementProposal, confirmDraftBlock, validateProposalTargets } from "./refinement";
+import { appendJobEvent, ensureEditableCoverage, processGenerationJob, recordAiRun, resumeQueuedJobs } from "./jobs";
+import { normalizeDraftContent } from "./draft-compat";
+import { confirmOmission } from "./draft-omissions";
+import { applyDirectDraftEdits, applyRefinementProposal, validateProposalTargets } from "./refinement";
 import { pathForKey, putFile } from "./storage";
 import {
   mergedTemplateProvenance,
@@ -33,9 +32,10 @@ import {
   templateDisplayName,
   testTemplateFromHeader,
 } from "./template-metadata";
-import { analysisWithConfirmedMap, deriveGenerationTargets, validateConfirmedBlocks } from "./template-map";
+import { analysisWithConfirmedMap, deriveGenerationTargets, templateBlockId, validateConfirmedBlocks } from "./template-map";
 
-const CreateMatterSchema = z.object({ name: z.string().min(1).max(200), templateId: z.string().uuid() });
+const CreateMatterSchema = z.object({ name: z.string().min(1).max(200).optional(), templateId: z.string().uuid() });
+const RenameMatterSchema = z.object({ name: z.string().trim().min(1).max(200) });
 const ConfirmTemplateSchema = z.object({
   schemaVersion: z.literal(2),
   blocks: z.array(TemplateRegionSchema).min(1),
@@ -67,18 +67,11 @@ const ConfirmFieldSchema = z.object({
     message: "Replace the placeholder with a reviewed value before confirming this field.",
   }),
 });
-const ConfirmBlockSchema = z.object({
-  version: z.number().int().positive(),
-  text: z.string().trim().min(1).max(20_000).refine((value) => !/\[ATTORNEY REVIEW REQUIRED/i.test(value), {
-    message: "Replace the attorney-review placeholder before confirming this paragraph.",
-  }),
-  note: z.string().trim().min(3).max(1_000),
-});
-const ReviewResolutionRequestSchema = z.object({
-  sourceFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
-  action: z.enum(["omit", "clear"]),
-});
 const ConfirmOutcomeSchema = z.object({ version: z.number().int().positive() });
+const RestoreDraftSchema = z.object({
+  currentVersion: z.number().int().positive(),
+  restoreVersion: z.number().int().positive(),
+});
 
 const mimeFor = (filename: string): string => {
   const extension = path.extname(filename).toLowerCase();
@@ -365,27 +358,31 @@ async function loadDraft(draftId: string) {
   `, [draftId]);
   const row = result.rows[0];
   if (!row) return null;
-  const content = GeneratedDraftSchema.parse(row.content);
+  const historicalResolutions = await pool.query<{ target_id: string }>(`
+    SELECT target_id FROM matter_review_resolutions
+    WHERE matter_id = $1 AND source_fingerprint = $2
+  `, [row.matterId, row.sourceFingerprint]);
+  const content = normalizeDraftContent(row.content, historicalResolutions.rows.map((resolution) => resolution.target_id));
   const currentSourceFingerprint = await sourceFingerprintForMatter(row.matterId);
   const template = analysisWithConfirmedMap(
     TemplateAnalysisSchema.parse(row.templateAnalysis),
     TemplateMapSchema.parse(row.templateMap),
   );
-  const activeResolutions = await pool.query<{ target_id: string }>(`
-    SELECT target_id FROM matter_review_resolutions
-    WHERE matter_id = $1 AND source_fingerprint = $2
-  `, [row.matterId, currentSourceFingerprint]);
-  const activeResolutionTargets = new Set(activeResolutions.rows.map((resolution) => resolution.target_id));
-  const staleResolutionTargetIds = content.outcomes
-    .filter((outcome) => ["preapproved", "confirmed"].includes(outcome.resolution) && !activeResolutionTargets.has(outcome.targetId))
-    .map((outcome) => outcome.targetId);
   const readiness = draftExportIssues(content, {
     draftSourceFingerprint: row.sourceFingerprint,
     currentSourceFingerprint,
-    staleResolutionTargetIds,
   });
   const { templateAnalysis: _templateAnalysis, templateMap: _templateMap, ...publicRow } = row;
-  return { ...publicRow, content, readiness, targets: deriveGenerationTargets(template) };
+  const templateBlocks = template.blocks?.length ? template.blocks : template.regions;
+  const targets = deriveGenerationTargets(template).map((target) => {
+    const exemplar = templateBlocks.find((block) => target.blockIds.includes(templateBlockId(block)));
+    return {
+      ...target,
+      label: target.section?.trim() || exemplar?.text.trim().slice(0, 100) || "Unlabeled template section",
+      exemplarExcerpt: exemplar?.text.trim().slice(0, 180) ?? "",
+    };
+  });
+  return { ...publicRow, content, readiness, targets };
 }
 
 async function evidenceForDraft(draftId: string): Promise<EvidencePage[]> {
@@ -526,12 +523,10 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
   app.post("/api/intakes", async (request, reply) => {
     let templateId: string | null = null;
     let templateUpload: { buffer: Buffer; filename: string } | null = null;
-    let caseName = "New demand letter case";
     const sourceUploads: Array<{ buffer: Buffer; filename: string; mimeType: string }> = [];
     for await (const part of request.parts()) {
       if (part.type === "field") {
         if (part.fieldname === "templateId") templateId = z.string().uuid().parse(part.value);
-        if (part.fieldname === "caseName") caseName = z.string().trim().min(1).max(200).parse(part.value);
         continue;
       }
       const uploaded = { buffer: await part.toBuffer(), filename: part.filename, mimeType: part.mimetype };
@@ -551,7 +546,7 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
       INSERT INTO matters (workspace_id, name, template_id, template_map_version)
       VALUES ($1, $2, NULL, NULL)
       RETURNING id
-    `, [WORKSPACE_ID, caseName]);
+    `, [WORKSPACE_ID, "New matter"]);
     const caseWorkspaceId = requiredRow(workspace.rows, "Case workspace insert did not return an id.").id;
 
     const sourceExtractionJobId = await startScopedJob(caseWorkspaceId, "source_extraction", "Extracting complete source packet");
@@ -608,7 +603,7 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
     return reply.status(201).send({
       caseWorkspace: {
         id: caseWorkspaceId,
-        name: caseName,
+        name: "New matter",
         templateId: template.id,
         templateMapVersion: template.currentMapVersion ?? null,
       },
@@ -644,8 +639,25 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
     const result = await pool.query(`
       INSERT INTO matters (workspace_id, name, template_id, template_map_version) VALUES ($1, $2, $3, $4)
       RETURNING id, name, template_id AS "templateId", template_map_version AS "templateMapVersion", created_at AS "createdAt"
-    `, [WORKSPACE_ID, body.name, body.templateId, mapVersion]);
+    `, [WORKSPACE_ID, "New matter", body.templateId, mapVersion]);
     return reply.status(201).send(result.rows[0]);
+  });
+
+  app.patch("/api/matters/:id", async (request, reply) => {
+    const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+    const body = RenameMatterSchema.parse(request.body);
+    const result = await pool.query(`
+      UPDATE matters
+      SET name = $3, name_manually_edited = true, updated_at = now()
+      WHERE id = $1 AND workspace_id = $2
+      RETURNING id, name, template_id AS "templateId", template_map_version AS "templateMapVersion", created_at AS "createdAt"
+    `, [id, WORKSPACE_ID, body.name]);
+    if (!result.rowCount) return reply.status(404).send({ error: "Case workspace not found." });
+    await pool.query(`
+      INSERT INTO activity_events (workspace_id, matter_id, actor_id, event_type, summary, metadata)
+      VALUES ($1, $2, $3, 'matter.renamed', 'Renamed the matter', $4)
+    `, [WORKSPACE_ID, id, ACTOR_ID, JSON.stringify({ name: body.name })]);
+    return reply.send(result.rows[0]);
   });
 
   app.get("/api/matters/:id", async (request, reply) => {
@@ -662,13 +674,6 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
       WHERE s.matter_id = $1 GROUP BY s.id ORDER BY s.created_at
     `, [id]);
     const sourceFingerprint = await sourceFingerprintForMatter(id);
-    const evidenceReview = await pool.query<{ result: unknown; source_fingerprint: string | null }>(`
-      SELECT result, source_fingerprint
-      FROM jobs
-      WHERE matter_id = $1 AND job_type = 'evidence_review' AND status = 'completed' AND result IS NOT NULL
-      ORDER BY updated_at DESC
-      LIMIT 1
-    `, [id]);
     const activeDraft = await pool.query<{ id: string; version: number }>(`
       SELECT id, current_version AS version
       FROM drafts
@@ -676,8 +681,6 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
       ORDER BY updated_at DESC
       LIMIT 1
     `, [id]);
-    const reviewRow = evidenceReview.rows[0];
-    const parsedReview = reviewRow ? EvidenceReviewSchema.parse(reviewRow.result) : null;
     const map = await pool.query<{ analysis: unknown; map: unknown }>(`
       SELECT t.analysis, tmv.map
       FROM matters m
@@ -688,80 +691,13 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
     const mappedTemplate = map.rows[0]
       ? analysisWithConfirmedMap(TemplateAnalysisSchema.parse(map.rows[0].analysis), TemplateMapSchema.parse(map.rows[0].map))
       : null;
-    const resolutions = await pool.query(`
-      SELECT r.id, r.matter_id AS "matterId", r.target_id AS "targetId",
-             r.source_fingerprint AS "sourceFingerprint", r.action,
-             r.actor_id AS "actorId", a.display_name AS "actorName",
-             r.draft_id AS "draftId", r.draft_version AS "draftVersion", r.created_at AS "createdAt"
-      FROM matter_review_resolutions r
-      JOIN actors a ON a.id = r.actor_id
-      WHERE r.matter_id = $1 AND r.source_fingerprint = $2
-      ORDER BY r.created_at
-    `, [id, sourceFingerprint]);
     return {
       ...matter.rows[0],
       sources: sources.rows,
       sourceFingerprint,
-      evidenceReview: parsedReview,
-      evidenceReviewStale: parsedReview ? parsedReview.sourceFingerprint !== sourceFingerprint : false,
       activeDraft: activeDraft.rows[0] ?? null,
-      reviewResolutions: resolutions.rows.map((resolution) => ReviewResolutionSchema.parse({
-        ...resolution,
-        createdAt: new Date(resolution.createdAt as string | Date).toISOString(),
-      })),
       generationTargets: mappedTemplate ? deriveGenerationTargets(mappedTemplate) : [],
     };
-  });
-
-  app.put("/api/matters/:id/review-resolutions/:targetId", async (request, reply) => {
-    const params = z.object({ id: z.string().uuid(), targetId: z.string().min(1).max(500) }).parse(request.params);
-    const body = ReviewResolutionRequestSchema.parse(request.body);
-    const currentFingerprint = await sourceFingerprintForMatter(params.id);
-    if (body.sourceFingerprint !== currentFingerprint) {
-      return reply.status(409).send({ error: "The evidence set changed. Review the current sources before resolving this target." });
-    }
-    const context = await pool.query<{ analysis: unknown; map: unknown }>(`
-      SELECT t.analysis, tmv.map
-      FROM matters m
-      JOIN templates t ON t.id = m.template_id
-      JOIN template_map_versions tmv ON tmv.template_id = t.id AND tmv.map_version = m.template_map_version
-      WHERE m.id = $1 AND m.workspace_id = $2
-    `, [params.id, WORKSPACE_ID]);
-    if (!context.rowCount) return reply.status(404).send({ error: "Case workspace or confirmed template map not found." });
-    const row = requiredRow(context.rows, "Review-resolution context was not found.");
-    const template = analysisWithConfirmedMap(TemplateAnalysisSchema.parse(row.analysis), TemplateMapSchema.parse(row.map));
-    if (!deriveGenerationTargets(template).some((target) => target.id === params.targetId)) {
-      return reply.status(404).send({ error: "Generation target not found in the pinned template map." });
-    }
-    if (body.action === "clear") {
-      await pool.query(`
-        DELETE FROM matter_review_resolutions
-        WHERE matter_id = $1 AND target_id = $2 AND source_fingerprint = $3
-      `, [params.id, params.targetId, currentFingerprint]);
-      await pool.query(`
-        INSERT INTO activity_events (workspace_id, matter_id, actor_id, event_type, summary, metadata)
-        VALUES ($1, $2, $3, 'omission.cleared', 'Cleared a pre-generation omission decision', $4)
-      `, [WORKSPACE_ID, params.id, ACTOR_ID, JSON.stringify({ targetId: params.targetId, sourceFingerprint: currentFingerprint })]);
-      return reply.send({ targetId: params.targetId, cleared: true });
-    }
-    const result = await pool.query(`
-      INSERT INTO matter_review_resolutions (matter_id, target_id, source_fingerprint, action, actor_id)
-      VALUES ($1, $2, $3, 'omit', $4)
-      ON CONFLICT (matter_id, target_id, source_fingerprint)
-      DO UPDATE SET action = 'omit', actor_id = EXCLUDED.actor_id, draft_id = NULL, draft_version = NULL, created_at = now()
-      RETURNING id, matter_id AS "matterId", target_id AS "targetId",
-                source_fingerprint AS "sourceFingerprint", action, actor_id AS "actorId",
-                draft_id AS "draftId", draft_version AS "draftVersion", created_at AS "createdAt"
-    `, [params.id, params.targetId, currentFingerprint, ACTOR_ID]);
-    await pool.query(`
-      INSERT INTO activity_events (workspace_id, matter_id, actor_id, event_type, summary, metadata)
-      VALUES ($1, $2, $3, 'omission.preapproved', 'Approved a target omission for this matter', $4)
-    `, [WORKSPACE_ID, params.id, ACTOR_ID, JSON.stringify({ targetId: params.targetId, sourceFingerprint: currentFingerprint })]);
-    return reply.send(ReviewResolutionSchema.parse({
-      ...requiredRow(result.rows, "Review resolution insert failed."),
-      actorName: "Faby Rivera",
-      createdAt: new Date(requiredRow(result.rows, "Review resolution insert failed.").createdAt as string | Date).toISOString(),
-    }));
   });
 
   app.get("/api/matters/:id/sources", async (request, reply) => {
@@ -836,30 +772,6 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
       JSON.stringify({ sourceIds: results.map((source) => (source as { id?: string }).id).filter(Boolean), extractionJobId }),
     ]);
     return reply.status(201).send(results);
-  });
-
-  app.post("/api/matters/:id/evidence-reviews", async (request, reply) => {
-    const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
-    const eligible = await pool.query(`
-      SELECT EXISTS(
-        SELECT 1 FROM matters m JOIN templates t ON t.id = m.template_id
-        WHERE m.id = $1 AND m.workspace_id = $2 AND t.status = 'confirmed'
-      ) AS template_ready,
-      EXISTS(SELECT 1 FROM source_documents WHERE matter_id = $1 AND status = 'ready') AS sources_ready
-    `, [id, WORKSPACE_ID]);
-    if (!eligible.rows[0]?.template_ready || !eligible.rows[0]?.sources_ready) {
-      return reply.status(409).send({ error: "A confirmed template and at least one ready source are required." });
-    }
-    const sourceFingerprint = await sourceFingerprintForMatter(id);
-    const result = await pool.query<{ id: string }>(`
-      INSERT INTO jobs (matter_id, job_type, source_fingerprint)
-      VALUES ($1, 'evidence_review', $2)
-      RETURNING id
-    `, [id, sourceFingerprint]);
-    const jobId = requiredRow(result.rows, "Evidence review job insert did not return an id.").id;
-    await appendJobEvent(jobId, "queued", { progress: 0, step: "Queued" });
-    setImmediate(() => void processEvidenceReviewJob(jobId));
-    return reply.status(202).send({ jobId, jobType: "evidence_review", status: "queued" });
   });
 
   app.post("/api/matters/:id/generations", async (request, reply) => {
@@ -965,6 +877,79 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
     return draft;
   });
 
+  app.get("/api/drafts/:id/versions", async (request, reply) => {
+    const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+    const result = await pool.query(`
+      SELECT dv.version, COALESCE(a.display_name, 'System') AS actor,
+             dv.created_at AS timestamp, dv.change_summary AS "changeSummary",
+             (dv.version = d.current_version) AS current
+      FROM draft_versions dv
+      JOIN drafts d ON d.id = dv.draft_id
+      LEFT JOIN actors a ON a.id = dv.actor_id
+      WHERE dv.draft_id = $1
+      ORDER BY dv.version DESC
+    `, [id]);
+    if (!result.rowCount) {
+      const draft = await pool.query("SELECT 1 FROM drafts WHERE id = $1", [id]);
+      if (!draft.rowCount) return reply.status(404).send({ error: "Draft not found." });
+    }
+    return reply.send(result.rows);
+  });
+
+  app.post("/api/drafts/:id/restore", async (request, reply) => {
+    const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+    const body = RestoreDraftSchema.parse(request.body);
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const draftResult = await client.query<{ matter_id: string; current_version: number }>(`
+        SELECT matter_id, current_version FROM drafts WHERE id = $1 FOR UPDATE
+      `, [id]);
+      if (!draftResult.rowCount) {
+        await client.query("ROLLBACK");
+        return reply.status(404).send({ error: "Draft not found." });
+      }
+      const current = requiredRow(draftResult.rows, "Draft restore lock failed.");
+      if (current.current_version !== body.currentVersion) {
+        await client.query("ROLLBACK");
+        return reply.status(409).send({ error: "Draft changed in another session.", currentVersion: current.current_version });
+      }
+      const selectedResult = await client.query<{ content: unknown; source_fingerprint: string | null; template_map_version: number | null }>(`
+        SELECT content, source_fingerprint, template_map_version
+        FROM draft_versions WHERE draft_id = $1 AND version = $2
+      `, [id, body.restoreVersion]);
+      if (!selectedResult.rowCount) {
+        await client.query("ROLLBACK");
+        return reply.status(404).send({ error: "Draft version not found." });
+      }
+      const selected = requiredRow(selectedResult.rows, "Draft restore version lookup failed.");
+      const historicalResolutions = await client.query<{ target_id: string }>(`
+        SELECT target_id FROM matter_review_resolutions
+        WHERE matter_id = $1 AND source_fingerprint = $2
+      `, [current.matter_id, selected.source_fingerprint]);
+      const restored = normalizeDraftContent(selected.content, historicalResolutions.rows.map((resolution) => resolution.target_id));
+      const nextVersion = current.current_version + 1;
+      const changeSummary = `Restored draft version ${body.restoreVersion}`;
+      await client.query(`
+        INSERT INTO draft_versions (draft_id, version, content, actor_id, source_fingerprint, template_map_version, change_summary)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `, [id, nextVersion, JSON.stringify(restored), ACTOR_ID, selected.source_fingerprint, selected.template_map_version, changeSummary]);
+      await persistCitations(client, id, nextVersion, restored);
+      await client.query("UPDATE drafts SET current_version = $2, updated_at = now() WHERE id = $1", [id, nextVersion]);
+      await client.query(`
+        INSERT INTO activity_events (workspace_id, matter_id, actor_id, event_type, summary, metadata)
+        VALUES ($1, $2, $3, 'draft.restored', $4, $5)
+      `, [WORKSPACE_ID, current.matter_id, ACTOR_ID, changeSummary, JSON.stringify({ draftId: id, version: nextVersion, restoreVersion: body.restoreVersion })]);
+      await client.query("COMMIT");
+      return await loadDraft(id);
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  });
+
   app.put("/api/drafts/:id", async (request, reply) => {
     const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
     const body = SaveDraftSchema.parse(request.body);
@@ -987,13 +972,16 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
         await client.query("ROLLBACK");
         return reply.status(409).send({ error: "Draft changed in another session.", currentVersion: lockedDraft.current_version });
       }
-      const updated = applyDirectDraftEdits(GeneratedDraftSchema.parse(lockedDraft.content), body.content);
+      const currentContent = normalizeDraftContent(lockedDraft.content);
+      const updated = applyDirectDraftEdits(currentContent, body.content);
+      const editedCount = currentContent.sections.flatMap((section) => section.blocks)
+        .filter((block) => updated.sections.flatMap((section) => section.blocks).find((candidate) => candidate.id === block.id)?.text !== block.text).length;
       const nextVersion = body.version + 1;
       await client.query(
-        `INSERT INTO draft_versions (draft_id, version, content, actor_id, source_fingerprint, template_map_version)
-         SELECT $1, $2, $3, $4, $5, template_map_version
+        `INSERT INTO draft_versions (draft_id, version, content, actor_id, source_fingerprint, template_map_version, change_summary)
+         SELECT $1, $2, $3, $4, $5, template_map_version, $7
          FROM draft_versions WHERE draft_id = $1 AND version = $6`,
-        [id, nextVersion, JSON.stringify(updated), ACTOR_ID, lockedDraft.source_fingerprint, body.version],
+        [id, nextVersion, JSON.stringify(updated), ACTOR_ID, lockedDraft.source_fingerprint, body.version, `Edited ${editedCount} draft ${editedCount === 1 ? "paragraph" : "paragraphs"}`],
       );
       await persistCitations(client, id, nextVersion, updated);
       await client.query("UPDATE drafts SET current_version = $2, updated_at = now() WHERE id = $1", [id, nextVersion]);
@@ -1016,7 +1004,7 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
     const body = RefineSchema.parse(request.body);
     const draft = await loadDraft(id);
     if (!draft) return reply.status(404).send({ error: "Draft not found." });
-    const content = GeneratedDraftSchema.parse(draft.content);
+    const content = normalizeDraftContent(draft.content);
     const blockById = new Map(content.sections.flatMap((section) => section.blocks).map((block) => [block.id, block]));
     const annotations = body.annotations.map((annotation) => {
       if (annotation.blockId !== "legacy") return annotation;
@@ -1025,7 +1013,7 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
     });
     const annotationsValid = annotations.every((annotation) => {
       const block = blockById.get(annotation.blockId);
-      return !block?.locked && block?.templateRole !== "keep" && block?.text.slice(annotation.start, annotation.end) === annotation.quote;
+      return block?.text.slice(annotation.start, annotation.end) === annotation.quote;
     });
     if (!annotationsValid) return reply.status(409).send({ error: "Selected text is not part of the current draft version." });
     const wantsStream = request.headers.accept?.includes("text/event-stream") ?? false;
@@ -1142,14 +1130,14 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
         return reply.status(409).send({ error: "Draft changed after this proposal was created." });
       }
       const proposal = RefinementProposalSchema.parse(row.proposal);
-      const content = GeneratedDraftSchema.parse(row.content);
+      const content = normalizeDraftContent(row.content);
       const updated = applyRefinementProposal(content, proposal);
       const nextVersion = row.current_version + 1;
       await client.query(
-        `INSERT INTO draft_versions (draft_id, version, content, actor_id, source_fingerprint, template_map_version)
-         SELECT $1, $2, $3, $4, $5, template_map_version
+        `INSERT INTO draft_versions (draft_id, version, content, actor_id, source_fingerprint, template_map_version, change_summary)
+         SELECT $1, $2, $3, $4, $5, template_map_version, $7
          FROM draft_versions WHERE draft_id = $1 AND version = $6`,
-        [row.draft_id, nextVersion, JSON.stringify(updated), ACTOR_ID, row.source_fingerprint, row.current_version],
+        [row.draft_id, nextVersion, JSON.stringify(updated), ACTOR_ID, row.source_fingerprint, row.current_version, `Accepted AI refinement: ${proposal.summary.slice(0, 300)}`],
       );
       await persistCitations(client, row.draft_id, nextVersion, updated);
       await client.query("UPDATE drafts SET current_version = $2, updated_at = now() WHERE id = $1", [row.draft_id, nextVersion]);
@@ -1196,7 +1184,7 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
         await client.query("ROLLBACK");
         return reply.status(409).send({ error: "Draft changed in another session.", currentVersion: row.current_version });
       }
-      const content = GeneratedDraftSchema.parse(row.content);
+      const content = normalizeDraftContent(row.content);
       if (!content.fields[body.key]) {
         await client.query("ROLLBACK");
         return reply.status(404).send({ error: "Draft field not found." });
@@ -1211,17 +1199,17 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
       const updated = ensureEditableCoverage(confirmed, template);
       const nextVersion = body.version + 1;
       await client.query(
-        `INSERT INTO draft_versions (draft_id, version, content, actor_id, source_fingerprint, template_map_version)
-         SELECT $1, $2, $3, $4, $5, template_map_version
+        `INSERT INTO draft_versions (draft_id, version, content, actor_id, source_fingerprint, template_map_version, change_summary)
+         SELECT $1, $2, $3, $4, $5, template_map_version, $7
          FROM draft_versions WHERE draft_id = $1 AND version = $6`,
-        [id, nextVersion, JSON.stringify(updated), ACTOR_ID, row.source_fingerprint, body.version],
+        [id, nextVersion, JSON.stringify(updated), ACTOR_ID, row.source_fingerprint, body.version, `${corrected ? "Corrected" : "Supplied"} ${content.fields[body.key]?.label ?? body.key}`],
       );
       await persistCitations(client, id, nextVersion, updated);
       await client.query("UPDATE drafts SET current_version = $2, updated_at = now() WHERE id = $1", [id, nextVersion]);
       await client.query(`
         INSERT INTO activity_events (workspace_id, matter_id, actor_id, event_type, summary, metadata)
-        VALUES ($1, $2, $3, 'field.confirmed', $4, $5)
-      `, [WORKSPACE_ID, row.matter_id, ACTOR_ID, corrected ? "Corrected an extracted field" : "Verified an extracted field", JSON.stringify({ draftId: id, version: nextVersion, fieldKey: body.key })]);
+        VALUES ($1, $2, $3, 'field.supplied', $4, $5)
+      `, [WORKSPACE_ID, row.matter_id, ACTOR_ID, corrected ? "Corrected a draft field" : "Supplied a missing draft field", JSON.stringify({ draftId: id, version: nextVersion, fieldKey: body.key })]);
       await client.query("COMMIT");
       return await loadDraft(id);
     } catch (error) {
@@ -1240,10 +1228,15 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
       await client.query("BEGIN");
       const result = await client.query<{
         matter_id: string; current_version: number; content: unknown; source_fingerprint: string | null;
+        template_analysis: unknown; template_map: unknown;
       }>(`
-        SELECT d.matter_id, d.current_version, dv.content, dv.source_fingerprint
+        SELECT d.matter_id, d.current_version, dv.content, dv.source_fingerprint,
+               t.analysis AS template_analysis, tmv.map AS template_map
         FROM drafts d
         JOIN draft_versions dv ON dv.draft_id = d.id AND dv.version = d.current_version
+        JOIN matters m ON m.id = d.matter_id
+        JOIN templates t ON t.id = m.template_id
+        JOIN template_map_versions tmv ON tmv.template_id = t.id AND tmv.map_version = dv.template_map_version
         WHERE d.id = $1
         FOR UPDATE OF d
       `, [params.id]);
@@ -1261,114 +1254,37 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
         await client.query("ROLLBACK");
         return reply.status(409).send({ error: "The evidence set changed. Regenerate before approving an omission." });
       }
-      const content = GeneratedDraftSchema.parse(row.content);
+      const content = normalizeDraftContent(row.content);
       const outcome = content.outcomes.find((candidate) => candidate.id === params.outcomeId);
       if (!outcome) {
         await client.query("ROLLBACK");
         return reply.status(404).send({ error: "Draft outcome not found." });
       }
-      if (outcome.status !== "omitted_no_evidence" || outcome.resolution !== "unresolved") {
+      if (outcome.status !== "omitted" || content.confirmedOmissionTargetIds.includes(outcome.targetId)) {
         await client.query("ROLLBACK");
-        return reply.status(409).send({ error: "Only an unresolved no-evidence omission can be confirmed." });
+        return reply.status(409).send({ error: "Only an unresolved omitted target can be confirmed." });
       }
       const nextVersion = body.version + 1;
-      const updated = GeneratedDraftSchema.parse({
-        ...content,
-        outcomes: content.outcomes.map((candidate) => candidate.id === params.outcomeId
-          ? { ...candidate, resolution: "confirmed" }
-          : candidate),
-      });
+      const template = analysisWithConfirmedMap(TemplateAnalysisSchema.parse(row.template_analysis), TemplateMapSchema.parse(row.template_map));
+      const { content: updated, headingCleared } = confirmOmission(content, outcome.targetId, template);
       await client.query(
-        `INSERT INTO draft_versions (draft_id, version, content, actor_id, source_fingerprint, template_map_version)
-         SELECT $1, $2, $3, $4, $5, template_map_version
+        `INSERT INTO draft_versions (draft_id, version, content, actor_id, source_fingerprint, template_map_version, change_summary)
+         SELECT $1, $2, $3, $4, $5, template_map_version, $7
          FROM draft_versions WHERE draft_id = $1 AND version = $6`,
-        [params.id, nextVersion, JSON.stringify(updated), ACTOR_ID, currentFingerprint, body.version],
+        [params.id, nextVersion, JSON.stringify(updated), ACTOR_ID, currentFingerprint, body.version, `Confirmed omission${headingCleared ? " and cleared its empty heading" : ""}`],
       );
       await persistCitations(client, params.id, nextVersion, updated);
       await client.query("UPDATE drafts SET current_version = $2, updated_at = now() WHERE id = $1", [params.id, nextVersion]);
       await client.query(`
-        INSERT INTO matter_review_resolutions (
-          matter_id, target_id, source_fingerprint, action, actor_id, draft_id, draft_version
-        ) VALUES ($1, $2, $3, 'omit', $4, $5, $6)
-        ON CONFLICT (matter_id, target_id, source_fingerprint)
-        DO UPDATE SET actor_id = EXCLUDED.actor_id, draft_id = EXCLUDED.draft_id,
-                      draft_version = EXCLUDED.draft_version, created_at = now()
-      `, [row.matter_id, outcome.targetId, currentFingerprint, ACTOR_ID, params.id, nextVersion]);
-      await client.query(`
         INSERT INTO activity_events (workspace_id, matter_id, actor_id, event_type, summary, metadata)
-        VALUES ($1, $2, $3, 'omission.confirmed', 'Approved a no-evidence omission in the reviewed draft', $4)
+        VALUES ($1, $2, $3, 'omission.confirmed', 'Confirmed an omitted target in the reviewed draft', $4)
       `, [WORKSPACE_ID, row.matter_id, ACTOR_ID, JSON.stringify({
         draftId: params.id,
         outcomeId: params.outcomeId,
         targetId: outcome.targetId,
         version: nextVersion,
+        headingCleared,
         sourceFingerprint: currentFingerprint,
-      })]);
-      await client.query("COMMIT");
-      return await loadDraft(params.id);
-    } catch (error) {
-      await client.query("ROLLBACK");
-      throw error;
-    } finally {
-      client.release();
-    }
-  });
-
-  app.post("/api/drafts/:id/blocks/:blockId/confirm", async (request, reply) => {
-    const params = z.object({ id: z.string().uuid(), blockId: z.string().min(1).max(500) }).parse(request.params);
-    const body = ConfirmBlockSchema.parse(request.body);
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
-      const result = await client.query<{
-        matter_id: string;
-        current_version: number;
-        content: unknown;
-        source_fingerprint: string | null;
-      }>(`
-        SELECT d.matter_id, d.current_version, dv.content, dv.source_fingerprint
-        FROM drafts d
-        JOIN draft_versions dv ON dv.draft_id = d.id AND dv.version = d.current_version
-        WHERE d.id = $1
-        FOR UPDATE OF d
-      `, [params.id]);
-      if (!result.rowCount) {
-        await client.query("ROLLBACK");
-        return reply.status(404).send({ error: "Draft not found." });
-      }
-      const row = requiredRow(result.rows, "Draft block lock failed.");
-      if (row.current_version !== body.version) {
-        await client.query("ROLLBACK");
-        return reply.status(409).send({ error: "Draft changed in another session.", currentVersion: row.current_version });
-      }
-      const content = GeneratedDraftSchema.parse(row.content);
-      let updated: GeneratedDraft;
-      try {
-        updated = GeneratedDraftSchema.parse(confirmDraftBlock(content, params.blockId, body.text));
-      } catch (error) {
-        await client.query("ROLLBACK");
-        if (error instanceof Error && error.message === "Draft block not found.") {
-          return reply.status(404).send({ error: error.message });
-        }
-        throw error;
-      }
-      const nextVersion = body.version + 1;
-      await client.query(
-        `INSERT INTO draft_versions (draft_id, version, content, actor_id, source_fingerprint, template_map_version)
-         SELECT $1, $2, $3, $4, $5, template_map_version
-         FROM draft_versions WHERE draft_id = $1 AND version = $6`,
-        [params.id, nextVersion, JSON.stringify(updated), ACTOR_ID, row.source_fingerprint, body.version],
-      );
-      await persistCitations(client, params.id, nextVersion, updated);
-      await client.query("UPDATE drafts SET current_version = $2, updated_at = now() WHERE id = $1", [params.id, nextVersion]);
-      await client.query(`
-        INSERT INTO activity_events (workspace_id, matter_id, actor_id, event_type, summary, metadata)
-        VALUES ($1, $2, $3, 'block.confirmed', 'Confirmed an attorney-reviewed draft paragraph', $4)
-      `, [WORKSPACE_ID, row.matter_id, ACTOR_ID, JSON.stringify({
-        draftId: params.id,
-        blockId: params.blockId,
-        version: nextVersion,
-        note: body.note,
       })]);
       await client.query("COMMIT");
       return await loadDraft(params.id);
@@ -1415,7 +1331,11 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
     `, [id]);
     if (!result.rowCount) return reply.status(404).send({ error: "Draft not found." });
     const row = requiredRow(result.rows, "Draft export context was not found.");
-    const content = GeneratedDraftSchema.parse(row.content);
+    const legacyResolutions = await pool.query<{ target_id: string }>(`
+      SELECT target_id FROM matter_review_resolutions
+      WHERE matter_id = $1 AND source_fingerprint = $2
+    `, [row.matter_id, row.source_fingerprint]);
+    const content = normalizeDraftContent(row.content, legacyResolutions.rows.map((resolution) => resolution.target_id));
     const templateMap = TemplateMapSchema.parse(row.template_map);
     const template = TemplateAnalysisSchema.parse({
       ...TemplateAnalysisSchema.parse(row.template_analysis),
@@ -1428,23 +1348,14 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
       ORDER BY created_at
     `, [row.matter_id]);
     const currentSourceFingerprint = await sourceFingerprintForMatter(row.matter_id);
-    const activeResolutions = await pool.query<{ target_id: string }>(`
-      SELECT target_id FROM matter_review_resolutions
-      WHERE matter_id = $1 AND source_fingerprint = $2
-    `, [row.matter_id, currentSourceFingerprint]);
-    const activeResolutionTargets = new Set(activeResolutions.rows.map((resolution) => resolution.target_id));
-    const staleResolutionTargetIds = content.outcomes
-      .filter((outcome) => ["preapproved", "confirmed"].includes(outcome.resolution) && !activeResolutionTargets.has(outcome.targetId))
-      .map((outcome) => outcome.targetId);
     const exportIssues = draftExportIssues(content, {
       draftSourceFingerprint: row.source_fingerprint,
       currentSourceFingerprint,
-      staleResolutionTargetIds,
     });
     if (!isDraftExportReady(exportIssues)) {
       return reply.status(409).send({
         error: "Draft is not ready for Word export.",
-        detail: `Resolve ${exportIssues.blockIds.length} draft regions, ${exportIssues.fieldKeys.length} template fields, ${exportIssues.duplicateParagraphIndexes.length} duplicate template mappings${exportIssues.imageIssue ? ", the image mapping" : ""}${exportIssues.staleEvidence ? ", and regenerate from the current evidence" : ""} before export.`,
+        detail: `Resolve ${exportIssues.omittedTargetIds.length} omitted targets, ${exportIssues.fieldKeys.length} template fields, ${exportIssues.duplicateParagraphIndexes.length} duplicate template mappings${exportIssues.imageIssue ? ", the image mapping" : ""}${exportIssues.staleEvidence ? ", and regenerate from the current evidence" : ""} before export.`,
         issues: exportIssues,
       });
     }
@@ -1493,10 +1404,20 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
       };
     });
     const fieldReplacements = exportableFieldReplacements(content.fields);
+    const patches = content.sections.flatMap((section) => section.blocks).flatMap((block) => {
+      if (block.targetId || !block.attorneyEdited || !block.templateBlockId) return [];
+      const mapped = mappedBlocks.get(block.templateBlockId);
+      if (!mapped) throw new Error(`Template map is missing edited block ${block.templateBlockId}.`);
+      return [{
+        partName: mapped.anchor?.partName ?? "word/document.xml",
+        paragraphIndex: mapped.paragraphIndex,
+        text: block.text,
+      }];
+    });
     await exportDocx({
       templatePath: pathForKey(row.storage_key),
       outputPath,
-      patches: [],
+      patches,
       fieldReplacements,
       targetOperations,
     });
@@ -1562,7 +1483,7 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
     }
     const matter = await pool.query<{ id: string; name: string; template_id: string }>(`
       INSERT INTO matters (workspace_id, name, template_id, template_map_version)
-      VALUES ($1, 'Pat Donahue sample case workspace', $2, $3) RETURNING id, name, template_id
+      VALUES ($1, 'New matter', $2, $3) RETURNING id, name, template_id
     `, [WORKSPACE_ID, template.id, mapVersion]);
     const insertedMatter = requiredRow(matter.rows, "Matter insert did not return an id.");
     const zip = new AdmZip(zipPath);

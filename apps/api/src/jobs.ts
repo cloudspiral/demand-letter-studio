@@ -1,7 +1,7 @@
 import { performance } from "node:perf_hooks";
 import fs from "node:fs/promises";
-import { EvidenceReviewSchema, GeneratedDraftSchema, ReviewResolutionSchema, TemplateAnalysisSchema, TemplateMapSchema, type EvidenceReview, type GeneratedDraft, type ReviewResolution } from "@steno/contracts";
-import { createAiProvider, type AiProvider, type EvidencePage, type EvidenceReviewResult } from "./ai";
+import { GeneratedDraftSchema, TemplateAnalysisSchema, TemplateMapSchema, type GeneratedDraft } from "@steno/contracts";
+import { createAiProvider, safeAiDiagnostic, type AiProvider, type EvidencePage } from "./ai";
 import { ACTOR_ID, persistCitations, pool, sourceFingerprintForMatter, WORKSPACE_ID } from "./db";
 import { pathForKey } from "./storage";
 import { analysisWithConfirmedMap, deriveGenerationTargets, templateBlockId } from "./template-map";
@@ -51,20 +51,17 @@ async function setJobProgress(jobId: string, progress: number, step: string): Pr
 async function loadJobContext(jobId: string): Promise<{
   matterId: string;
   matterName: string;
-  jobType: "generation" | "evidence_review";
   targetDraftId: string | null;
   baseVersion: number | null;
   sourceFingerprint: string;
   templateMapVersion: number;
   template: ReturnType<typeof TemplateAnalysisSchema.parse>;
   evidence: EvidencePage[];
-  evidenceReview: EvidenceReview | null;
-  reviewResolutions: ReviewResolution[];
+  nameManuallyEdited: boolean;
 }> {
   const context = await pool.query<{
     matter_id: string;
     matter_name: string;
-    job_type: "generation" | "evidence_review";
     draft_id: string | null;
     base_version: number | null;
     source_fingerprint: string | null;
@@ -72,9 +69,11 @@ async function loadJobContext(jobId: string): Promise<{
     confirmed_regions: unknown;
     template_map_version: number | null;
     template_map: unknown;
+    name_manually_edited: boolean;
   }>(`
-    SELECT j.matter_id, j.job_type, j.draft_id, j.base_version, j.source_fingerprint,
-           m.name AS matter_name, m.template_map_version, t.analysis, t.confirmed_regions,
+    SELECT j.matter_id, j.draft_id, j.base_version, j.source_fingerprint,
+           m.name AS matter_name, m.template_map_version, m.name_manually_edited,
+           t.analysis, t.confirmed_regions,
            tmv.map AS template_map
     FROM jobs j
     JOIN matters m ON m.id = j.matter_id
@@ -116,29 +115,9 @@ async function loadJobContext(jobId: string): Promise<{
     WHERE s.matter_id = $1 AND s.status = 'ready'
     ORDER BY s.created_at, p.page_number
   `, [row.matter_id]);
-  const latestReview = await pool.query<{ result: unknown }>(`
-    SELECT result
-    FROM jobs
-    WHERE matter_id = $1 AND job_type = 'evidence_review' AND status = 'completed'
-      AND source_fingerprint = $2 AND result IS NOT NULL
-    ORDER BY updated_at DESC
-    LIMIT 1
-  `, [row.matter_id, row.source_fingerprint ?? await sourceFingerprintForMatter(row.matter_id)]);
-  const resolutions = await pool.query<{
-    id: string; matter_id: string; target_id: string; source_fingerprint: string; action: "omit";
-    actor_id: string; actor_name: string; draft_id: string | null; draft_version: number | null; created_at: Date;
-  }>(`
-    SELECT r.id, r.matter_id, r.target_id, r.source_fingerprint, r.action, r.actor_id,
-           a.display_name AS actor_name, r.draft_id, r.draft_version, r.created_at
-    FROM matter_review_resolutions r
-    JOIN actors a ON a.id = r.actor_id
-    WHERE r.matter_id = $1 AND r.source_fingerprint = $2
-    ORDER BY r.created_at
-  `, [row.matter_id, row.source_fingerprint ?? await sourceFingerprintForMatter(row.matter_id)]);
   return {
     matterId: row.matter_id,
     matterName: row.matter_name,
-    jobType: row.job_type,
     targetDraftId: row.draft_id,
     baseVersion: row.base_version,
     sourceFingerprint: row.source_fingerprint ?? await sourceFingerprintForMatter(row.matter_id),
@@ -165,19 +144,7 @@ async function loadJobContext(jobId: string): Promise<{
         ...(imageData ? { imageData } : {}),
       };
     })),
-    evidenceReview: latestReview.rows[0] ? EvidenceReviewSchema.parse(latestReview.rows[0].result) : null,
-    reviewResolutions: resolutions.rows.map((resolution) => ReviewResolutionSchema.parse({
-      id: resolution.id,
-      matterId: resolution.matter_id,
-      targetId: resolution.target_id,
-      sourceFingerprint: resolution.source_fingerprint,
-      action: resolution.action,
-      actorId: resolution.actor_id,
-      actorName: resolution.actor_name,
-      draftId: resolution.draft_id,
-      draftVersion: resolution.draft_version,
-      createdAt: new Date(resolution.created_at).toISOString(),
-    })),
+    nameManuallyEdited: row.name_manually_edited,
   };
 }
 
@@ -187,34 +154,34 @@ export function validateGrounding(draft: GeneratedDraft, evidence: EvidencePage[
     page.text.normalize("NFKC").replace(/\s+/g, " ").trim().toLocaleLowerCase(),
   ]));
   const visualPages = new Set(evidence.filter((page) => page.visualInput).map((page) => `${page.sourceId}:${page.page}`));
-  const warnings = new Set(draft.warnings);
-  const sections = draft.sections.map((section) => ({
-    ...section,
-    blocks: section.blocks.map((block) => {
-      const citations = block.citations.filter((citation) => {
-        if (citation.page === null) return false;
-        if (citation.evidenceType === "visual") {
-          return visualPages.has(`${citation.sourceId}:${citation.page}`) && Boolean(citation.visualDescription?.trim());
-        }
-        if (!citation.quote.trim()) return false;
-        const pageText = normalizedPages.get(`${citation.sourceId}:${citation.page}`);
-        const quote = citation.quote.normalize("NFKC").replace(/\s+/g, " ").trim().toLocaleLowerCase();
-        return Boolean(pageText?.includes(quote));
-      });
-      const supported = block.kind === "warning" || citations.length > 0;
-      if (!supported) {
-        warnings.add(`Unsupported draft block ${block.id} requires attorney review.`);
-      }
-      return {
-        ...block,
-        text: supported ? block.text : "[ATTORNEY REVIEW REQUIRED — this generated block lacks a valid source-page citation.]",
-        citations,
-        verified: block.kind !== "warning" && supported && block.verified,
-        kind: supported ? block.kind : "warning" as const,
-      };
-    }),
-  }));
-  return GeneratedDraftSchema.parse({ ...draft, sections, warnings: [...warnings] });
+  const isValid = (citation: GeneratedDraft["outcomes"][number]["citations"][number]): boolean => {
+    if (citation.page === null) return false;
+    if (citation.evidenceType === "visual") {
+      return visualPages.has(`${citation.sourceId}:${citation.page}`) && Boolean(citation.visualDescription?.trim());
+    }
+    if (!citation.quote.trim()) return false;
+    const pageText = normalizedPages.get(`${citation.sourceId}:${citation.page}`);
+    const quote = citation.quote.normalize("NFKC").replace(/\s+/g, " ").trim().toLocaleLowerCase();
+    return Boolean(pageText?.includes(quote));
+  };
+  for (const block of draft.sections.flatMap((section) => section.blocks)) {
+    if (!block.citations.length || !block.citations.every(isValid)) {
+      throw new Error(`Generated block ${block.id} lacks valid source grounding.`);
+    }
+  }
+  for (const outcome of draft.outcomes) {
+    if (outcome.status === "generated" && (!outcome.citations.length || !outcome.citations.every(isValid))) {
+      throw new Error(`Generated target ${outcome.targetId} lacks valid source grounding.`);
+    }
+    if (!outcome.citations.every(isValid)) throw new Error(`Target ${outcome.targetId} contains an invalid citation.`);
+  }
+  for (const field of Object.values(draft.fields)) {
+    if (field.value !== null && (!field.citations.length || !field.citations.every(isValid))) {
+      throw new Error(`Generated field ${field.fieldKey} lacks valid source grounding.`);
+    }
+    if (!field.citations.every(isValid)) throw new Error(`Field ${field.fieldKey} contains an invalid citation.`);
+  }
+  return GeneratedDraftSchema.parse(draft);
 }
 
 export function ensureEditableCoverage(draft: GeneratedDraft, template: ReturnType<typeof TemplateAnalysisSchema.parse>): GeneratedDraft {
@@ -234,28 +201,18 @@ export function ensureEditableCoverage(draft: GeneratedDraft, template: ReturnTy
   }
   for (const blocks of blocksByTarget.values()) blocks.sort((left, right) => (left.sequence ?? 0) - (right.sequence ?? 0));
   const targetByBlockId = new Map(targets.flatMap((target) => target.blockIds.map((blockId) => [blockId, target] as const)));
+  const existingKeepByBlockId = new Map(generatedBlocks
+    .filter((block) => !block.targetId && block.templateBlockId)
+    .map((block) => [block.templateBlockId!, block]));
   const emittedTargets = new Set<string>();
   const fields = { ...draft.fields };
   const missingReplacements = template.replacementCandidates.filter((candidate) => !Object.hasOwn(fields, candidate.fieldKey ?? candidate.value));
-  for (const candidate of missingReplacements) {
-    const fieldKey = candidate.fieldKey ?? candidate.value;
-    fields[fieldKey] = {
-      value: "[ATTORNEY REVIEW REQUIRED]",
-      label: candidate.label ?? fieldKey,
-      templateValue: candidate.value,
-      verified: false,
-      confidence: null,
-      userConfirmed: false,
-      sourceId: null,
-      page: null,
-      sourceLabel: null,
-    };
-  }
+  if (missingReplacements.length) throw new Error(`Validated draft is missing ${missingReplacements.length} inline field outcome(s).`);
   const renderKeepText = (region: (typeof completeMap)[number]): string => {
     let text = region.text;
     const inlineFields = [...(region.inlineFields ?? [])].filter((field) => field.role === "replace").sort((left, right) => right.start - left.start);
     for (const inlineField of inlineFields) {
-      const replacement = fields[inlineField.key]?.value ?? "[ATTORNEY REVIEW REQUIRED]";
+      const replacement = fields[inlineField.key]?.value ?? "";
       text = `${text.slice(0, inlineField.start)}${replacement}${text.slice(inlineField.end)}`;
     }
     return text;
@@ -265,17 +222,16 @@ export function ensureEditableCoverage(draft: GeneratedDraft, template: ReturnTy
     if (figureCaptionIds.has(blockId)) return [];
     if (region.role !== "editable") {
       if (region.semanticKind === "figure") return [];
+      const existing = existingKeepByBlockId.get(blockId);
       return [{
+        ...existing,
         id: `keep-template-${blockId}`,
         kind: region.semanticKind === "heading" ? "heading" as const : region.anchor?.kind === "table-cell" || region.structuredGroup ? "table-row" as const : "paragraph" as const,
-        text: renderKeepText(region),
+        text: existing?.attorneyEdited ? existing.text : renderKeepText(region),
         templateParagraphIndex: region.paragraphIndex,
         templateBlockId: blockId,
         citations: [],
-        verified: true,
-        userConfirmed: true,
-        templateRole: "keep" as const,
-        locked: true,
+        attorneyEdited: existing?.attorneyEdited ?? false,
         targetId: null,
         outcomeId: null,
       }];
@@ -285,20 +241,12 @@ export function ensureEditableCoverage(draft: GeneratedDraft, template: ReturnTy
     emittedTargets.add(target.id);
     const outcome = outcomeByTarget.get(target.id)!;
     if (outcome.status !== "generated") return [];
-    return (blocksByTarget.get(target.id) ?? []).map((block) => ({
-      ...block,
-      templateRole: "replace" as const,
-      locked: false,
-    }));
+    return blocksByTarget.get(target.id) ?? [];
   });
   return GeneratedDraftSchema.parse({
     ...draft,
     fields,
     sections: [{ id: "assembled-document", heading: null, blocks: assembledBlocks }],
-    warnings: [
-      ...draft.warnings,
-      ...(missingReplacements.length ? [`${missingReplacements.length} header/footer values were cleared because no supported replacement was generated.`] : []),
-    ],
   });
 }
 
@@ -328,74 +276,33 @@ export async function recordAiRun(args: {
 async function generateWithFallback(context: Awaited<ReturnType<typeof loadJobContext>>): Promise<GeneratedDraft> {
   const names = [process.env.AI_PROVIDER ?? "openai"];
   if (names[0] !== "anthropic" && process.env.ANTHROPIC_API_KEY) names.push("anthropic");
+  const configuredAttempts = Number(process.env.AI_GENERATION_ATTEMPTS ?? 2);
+  const primaryAttempts = Number.isInteger(configuredAttempts) ? Math.min(3, Math.max(1, configuredAttempts)) : 2;
   const failures: string[] = [];
-  for (const name of names) {
+  for (const [providerIndex, name] of names.entries()) {
     const provider = createAiProvider(name);
-    const started = performance.now();
-    try {
-      const result = await provider.generate(context);
-      await recordAiRun({ matterId: context.matterId, provider, purpose: "generation", status: "completed", latencyMs: performance.now() - started });
-      const proposalFields: GeneratedDraft["fields"] = {};
-      for (const proposal of context.evidenceReview?.fieldProposals ?? []) {
-        const candidate = context.template.replacementCandidates.find((item) => (item.fieldKey ?? item.value) === proposal.fieldKey);
-        if (!candidate) continue;
-        proposalFields[proposal.fieldKey] = {
-          value: proposal.value,
-          label: candidate.label ?? proposal.fieldKey,
-          templateValue: candidate.value,
-          verified: true,
-          confidence: proposal.confidence,
-          userConfirmed: false,
-          sourceId: proposal.sourceId,
-          page: proposal.page,
-          sourceLabel: `${proposal.sourceName} p. ${proposal.page}`,
-          quote: proposal.quote,
-        };
+    const attempts = providerIndex === 0 ? primaryAttempts : 1;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      const started = performance.now();
+      try {
+        const result = await provider.generate(context);
+        const grounded = validateGrounding(result, context.evidence);
+        const assembled = ensureEditableCoverage(grounded, context.template);
+        await recordAiRun({ matterId: context.matterId, provider, purpose: "generation", status: "completed", latencyMs: performance.now() - started });
+        return assembled;
+      } catch (error) {
+        const code = error instanceof Error ? error.name : "ProviderError";
+        failures.push(`${provider.name}:${code}:attempt-${attempt}`);
+        if (process.env.AI_DEBUG === "true") console.error(`[ai-debug] ${provider.name} generation attempt ${attempt}: ${safeAiDiagnostic(error)}`);
+        await recordAiRun({
+          matterId: context.matterId,
+          provider,
+          purpose: "generation",
+          status: "failed",
+          latencyMs: performance.now() - started,
+          errorCode: error instanceof Error ? error.name : "unknown",
+        });
       }
-      const grounded = validateGrounding({
-        ...result,
-        fields: { ...proposalFields, ...result.fields },
-        reviewFlags: context.evidenceReview?.reviewFlags ?? result.reviewFlags,
-      }, context.evidence);
-      return ensureEditableCoverage(grounded, context.template);
-    } catch (error) {
-      const code = error instanceof Error ? error.name : "ProviderError";
-      failures.push(`${provider.name}:${code}`);
-      await recordAiRun({
-        matterId: context.matterId,
-        provider,
-        purpose: "generation",
-        status: "failed",
-        latencyMs: performance.now() - started,
-        errorCode: error instanceof Error ? error.name : "unknown",
-      });
-    }
-  }
-  throw new Error(failures.length ? `All AI providers failed (${failures.join(", ")}).` : "All AI providers failed.");
-}
-
-async function reviewWithFallback(context: Awaited<ReturnType<typeof loadJobContext>>): Promise<EvidenceReviewResult> {
-  const names = [process.env.AI_PROVIDER ?? "openai"];
-  if (names[0] !== "anthropic" && process.env.ANTHROPIC_API_KEY) names.push("anthropic");
-  const failures: string[] = [];
-  for (const name of names) {
-    const provider = createAiProvider(name);
-    const started = performance.now();
-    try {
-      const result = await provider.review(context);
-      await recordAiRun({ matterId: context.matterId, provider, purpose: "evidence_review", status: "completed", latencyMs: performance.now() - started });
-      return result;
-    } catch (error) {
-      const code = error instanceof Error ? error.name : "ProviderError";
-      failures.push(`${provider.name}:${code}`);
-      await recordAiRun({
-        matterId: context.matterId,
-        provider,
-        purpose: "evidence_review",
-        status: "failed",
-        latencyMs: performance.now() - started,
-        errorCode: code,
-      });
     }
   }
   throw new Error(failures.length ? `All AI providers failed (${failures.join(", ")}).` : "All AI providers failed.");
@@ -406,14 +313,14 @@ async function failJob(jobId: string, jobType: string, error: unknown): Promise<
   await pool.query(`
     UPDATE jobs SET status = 'failed', step = $2, error = $3, updated_at = now()
     WHERE id = $1
-  `, [jobId, jobType === "evidence_review" ? "Evidence review failed" : "Generation failed", safeMessage]);
+  `, [jobId, "Generation failed", safeMessage]);
   await pool.query(`
     INSERT INTO dead_letter_jobs (job_id, job_type, error_code, payload)
     VALUES ($1, $2, $3, $4)
     ON CONFLICT (job_id) DO NOTHING
   `, [jobId, jobType, error instanceof Error ? error.name : "unknown", JSON.stringify({ retryable: true })]);
   await appendJobEvent(jobId, "failed", {
-    step: jobType === "evidence_review" ? "Evidence review failed" : "Generation failed",
+    step: "Generation failed",
     error: safeMessage,
   });
 }
@@ -421,13 +328,29 @@ async function failJob(jobId: string, jobType: string, error: unknown): Promise<
 export function requireCurrentSourceFingerprint(
   expected: string,
   current: string,
-  operation: "generation" | "evidence review",
 ): void {
   if (expected !== current) {
-    throw new Error(operation === "generation"
-      ? "Source materials changed during generation. Run the evidence review and generation again."
-      : "Source materials changed during evidence review. Run the review again.");
+    throw new Error("Source materials changed during generation. Regenerate from the latest evidence.");
   }
+}
+
+export function deriveMatterName(draft: GeneratedDraft, template: ReturnType<typeof TemplateAnalysisSchema.parse>): string {
+  const candidates = template.replacementCandidates.map((candidate) => ({
+    candidate,
+    field: draft.fields[candidate.fieldKey ?? candidate.value],
+    searchable: `${candidate.fieldKey ?? ""} ${candidate.label ?? ""}`.toLocaleLowerCase(),
+  }));
+  const claimant = candidates.find(({ candidate, field, searchable }) => (
+    candidate.kind === "person"
+    && field?.value
+    && /(claimant|client)/.test(searchable)
+    && !/(recipient|adjuster|insured)/.test(searchable)
+  ))?.field?.value ?? null;
+  const claimNumber = candidates.find(({ candidate, field, searchable }) => (
+    field?.value && (candidate.kind === "claim-number" || /claim.?number/.test(searchable))
+  ))?.field?.value ?? null;
+  if (claimant && claimNumber) return `${claimant} - ${claimNumber}`;
+  return claimant ?? claimNumber ?? "New matter";
 }
 
 export async function processGenerationJob(jobId: string): Promise<void> {
@@ -452,7 +375,7 @@ export async function processGenerationJob(jobId: string): Promise<void> {
     try {
       await client.query("BEGIN");
       const currentFingerprint = await sourceFingerprintForMatter(context.matterId, client);
-      requireCurrentSourceFingerprint(context.sourceFingerprint, currentFingerprint, "generation");
+      requireCurrentSourceFingerprint(context.sourceFingerprint, currentFingerprint);
       let draftId: string;
       let version: number;
       if (context.targetDraftId) {
@@ -478,12 +401,15 @@ export async function processGenerationJob(jobId: string): Promise<void> {
         version = 1;
       }
       await client.query(
-        "INSERT INTO draft_versions (draft_id, version, content, actor_id, source_fingerprint, template_map_version) VALUES ($1, $2, $3, $4, $5, $6)",
-        [draftId, version, JSON.stringify(draftContent), ACTOR_ID, context.sourceFingerprint, context.templateMapVersion],
+        "INSERT INTO draft_versions (draft_id, version, content, actor_id, source_fingerprint, template_map_version, change_summary) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        [draftId, version, JSON.stringify(draftContent), ACTOR_ID, context.sourceFingerprint, context.templateMapVersion, context.targetDraftId ? "Regenerated from updated evidence" : "Generated initial grounded draft"],
       );
       await persistCitations(client, draftId, version, draftContent);
       if (context.targetDraftId) {
         await client.query("UPDATE drafts SET current_version = $2, updated_at = now() WHERE id = $1", [draftId, version]);
+      }
+      if (!context.nameManuallyEdited) {
+        await client.query("UPDATE matters SET name = $2, updated_at = now() WHERE id = $1 AND name_manually_edited = false", [context.matterId, deriveMatterName(draftContent, context.template)]);
       }
       await client.query(`
         UPDATE jobs
@@ -515,64 +441,17 @@ export async function processGenerationJob(jobId: string): Promise<void> {
   }
 }
 
-export async function processEvidenceReviewJob(jobId: string): Promise<void> {
-  const claimed = await pool.query(`
-    UPDATE jobs
-    SET status = 'processing', attempts = attempts + 1, progress = 5,
-        step = 'Loading evidence', updated_at = now()
-    WHERE id = $1 AND status = 'queued' AND job_type = 'evidence_review'
-    RETURNING id
-  `, [jobId]);
-  if (!claimed.rowCount) return;
-
-  try {
-    await appendJobEvent(jobId, "progress", { progress: 5, step: "Loading evidence" });
-    const context = await loadJobContext(jobId);
-    if (!context.evidence.length) throw new Error("At least one ready source page is required.");
-    requireWholeContextFits(context.template, context.evidence);
-    await setJobProgress(jobId, 35, "Reviewing source coverage");
-    const review = await reviewWithFallback(context);
-    await setJobProgress(jobId, 85, "Validating source references");
-    const currentFingerprint = await sourceFingerprintForMatter(context.matterId);
-    requireCurrentSourceFingerprint(context.sourceFingerprint, currentFingerprint, "evidence review");
-    const result = EvidenceReviewSchema.parse({
-      sourceFingerprint: context.sourceFingerprint,
-      fieldProposals: review.fieldProposals,
-      reviewFlags: review.reviewFlags,
-      createdAt: new Date().toISOString(),
-    });
-    await pool.query(`
-      UPDATE jobs
-      SET status = 'completed', progress = 100, step = 'Evidence review ready', result = $2, updated_at = now()
-      WHERE id = $1
-    `, [jobId, JSON.stringify(result)]);
-    await pool.query(`
-      INSERT INTO activity_events (workspace_id, matter_id, actor_id, event_type, summary, metadata)
-      VALUES ($1, $2, $3, 'evidence.reviewed', 'Completed an AI-assisted evidence review', $4)
-    `, [WORKSPACE_ID, context.matterId, ACTOR_ID, JSON.stringify({
-      jobId,
-      sourceFingerprint: context.sourceFingerprint,
-      flagCount: review.reviewFlags.length,
-      fieldProposalCount: review.fieldProposals.length,
-    })]);
-    await appendJobEvent(jobId, "completed", { progress: 100, step: "Evidence review ready", result });
-  } catch (error) {
-    await failJob(jobId, "evidence_review", error);
-  }
-}
-
 export async function processQueuedJob(jobId: string): Promise<void> {
   const job = await pool.query<{ job_type: string }>("SELECT job_type FROM jobs WHERE id = $1", [jobId]);
   const jobType = job.rows[0]?.job_type;
   if (jobType === "generation") return processGenerationJob(jobId);
-  if (jobType === "evidence_review") return processEvidenceReviewJob(jobId);
   throw new Error(`Unsupported job type: ${jobType ?? "unknown"}`);
 }
 
 export async function resumeQueuedJobs(): Promise<void> {
   const jobs = await pool.query<{ id: string }>(`
     SELECT id FROM jobs
-    WHERE status = 'queued' AND job_type IN ('generation', 'evidence_review')
+    WHERE status = 'queued' AND job_type = 'generation'
     ORDER BY created_at LIMIT 10
   `);
   await Promise.allSettled(jobs.rows.map((job) => processQueuedJob(job.id)));

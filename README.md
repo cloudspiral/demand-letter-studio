@@ -11,16 +11,19 @@ Demand Letter Studio turns a reviewed firm Word template and a case evidence pac
 - Import and analyze a reviewed `.docx`; use the full annotated-letter workbench to confirm Keep/Replace blocks, locked headings with replaceable inline fields, structured groups, and evidence-backed figure slots. Queue filters never hide the complete letter, and document/card selection stays synchronized.
 - Reject legacy `.doc`, PDF templates, macros, existing tracked changes, malformed packages, and unsupported source types with specific errors.
 - Upload PDFs and images. PDF text is stored by page; standalone uploads remain eligible visual evidence. Every mapped figure keeps its exact media relationship and caption anchor; generation may select an existing uploaded image or explicitly omit the figure, but it may never synthesize one.
-- Review evidence asynchronously before drafting. Category-free review flags provide a short, non-exhaustive explanation, exact source/page excerpts when available, and links to affected template regions or fields without classifying a document or deciding authenticity or legal validity.
-- Generate asynchronously through one whole-document OpenAI Responses request, with Anthropic and Bedrock adapters behind the same strict contracts and a deterministic mock for tests. Application code derives elastic prose runs from the confirmed map; the model returns exactly one explicit outcome for every narrative, structured, and figure target plus every replaceable inline field.
-- Validate exact target coverage, bounds, citations, figure media, source fingerprints, and previous-matter leakage before revealing any draft. `omitted_no_evidence` and cited `omitted_not_applicable` are explicit outcomes, never silent missing output.
-- Review the clean generated letter beside synchronized Blocking, Needs verification, and Informational cards. Sources, refinement, and activity use the same right-side workbench. Direct or AI-applied edits become unverified and require a separate attorney confirmation.
-- Add evidence from the source drawer without leaving the matter. The current draft remains visible but becomes stale immediately; a fresh evidence review and same-draft regeneration append the next immutable version while retaining history.
+- Start generation directly after source upload for a saved template, or after Keep/Replace map confirmation for a new template. There is no standalone evidence-review job or pre-generation omission workflow.
+- Start each matter as `New matter`; after the first validated generation, derive `Claimant - claim number` from grounded replacement fields. An inline attorney rename is sticky across regeneration.
+- Generate asynchronously through one whole-document OpenAI Responses request, with Anthropic and Bedrock adapters behind the same strict contracts and a deterministic mock for tests. Application code derives elastic prose runs from the confirmed map; the model returns exactly one `generated` or `omitted` outcome for every narrative, structured, and figure target plus one nullable result for every replaceable inline field.
+- Validate exact target and field coverage, bounds, citations, figure media, source fingerprints, structured rows, and previous-matter leakage before persisting or revealing any draft. A missing, ambiguous, or conflicting fact becomes one omission or null field with a concise note; a grounded negative fact remains cited generated content.
+- Open every completed draft in the editable letter workspace with one compact Review panel. It shows exactly one actionable card per unresolved omission or null field and a single Ready to export state when no blockers remain.
+- Add evidence from the source drawer without leaving the matter. The current draft becomes stale immediately and same-draft regeneration appends a new version without carrying forward old omission approvals.
 - Inspect reading-order citations in the drawer, including exact extracted pages and an authorized link to the original PDF at the cited page.
-- Verify or correct low-confidence merge fields before they can enter export; every confirmation is versioned and recorded in activity.
+- Supply any missing merge-field value before export; the saved correction is the attorney's approval and creates an audited version.
 - Annotate up to five exact text ranges and stream one atomic multi-block AI proposal over SSE; accept or reject the entire proposal and retain a semantic activity log.
-- Pre-approve an evidence-review omission for the current matter, or confirm one unresolved no-evidence outcome after generation. Both actions are audited against the stable target and current source fingerprint; evidence changes make the decision stale instead of silently carrying it forward.
-- Compute one canonical export-readiness result on the server and return it with every draft. The browser and Word endpoint use that identical result to lock export for unresolved omissions, warning/placeholder content, unconfirmed edits or fields, cross-target duplicate mappings, stale evidence, and stale resolutions.
+- Confirm an unresolved omission after generation. Confirmation is stored inside the new immutable version snapshot; if it leaves an orphan heading, the heading text is blanked while its DOCX paragraph anchor remains intact.
+- Edit any existing generated, Keep, heading, header, or footer text directly. Blur saves a new version; accepting an AI proposal also creates a version, and neither action creates a second confirmation task. Original citations remain visible with an **Attorney edited** label because the changed wording is not revalidated.
+- Undo the latest persisted operation by restoring its preceding snapshot, or restore any older snapshot from Activity. Restoring always appends a new latest version and never overwrites history.
+- Compute one canonical export-readiness result on the server and return it with every draft. The browser and Word endpoint use that identical result to lock export only for unresolved omissions, null fields, stale evidence, and invalid or duplicate template mappings.
 - Assemble a genuine `.docx` deterministically from a copied template package. Code expands/contracts compatible prose exemplars, rebuilds 0-N table or paragraph-based structured rows, applies inline substitutions without flattening surrounding runs, and replaces or removes mapped figures and captions while preserving unrelated styles, numbering, headers, footers, relationships, and section settings.
 - Run locally with PostgreSQL and inspect the undeployed AWS SAM shape for API Gateway, Lambda, SQS/DLQ, and encrypted/versioned S3.
 
@@ -38,7 +41,7 @@ pnpm dev
 
 Open [http://127.0.0.1:5173](http://127.0.0.1:5173). Add the reference DOCX and source ZIP at the repository root if you want the local **Use the supplied Steno sample packet** shortcut; those assignment artifacts are intentionally ignored by Git.
 
-For a no-cost deterministic run, set `AI_PROVIDER=mock`. The normal configuration uses `AI_PROVIDER=openai`, `OPENAI_MODEL=gpt-5.6-sol`, `OPENAI_STORE=false`, and `OPENAI_REASONING_EFFORT=high`. An Anthropic identity-linked key also requires `ANTHROPIC_WORKSPACE_ID`; ordinary Anthropic API keys do not.
+For a no-cost deterministic run, set `AI_PROVIDER=mock`. The normal configuration uses `AI_PROVIDER=openai`, `OPENAI_MODEL=gpt-5.6-sol`, `OPENAI_STORE=false`, `OPENAI_REASONING_EFFORT=high`, and up to two complete generation attempts (`AI_GENERATION_ATTEMPTS=2`) when strict output validation rejects a model variation. Each attempt is one whole-context drafting call; there is no separate evidence-review call. An Anthropic identity-linked key also requires `ANTHROPIC_WORKSPACE_ID`; ordinary Anthropic API keys do not.
 
 The live AWS demo uses direct OpenAI rather than routing through Bedrock. Its API key remains in AWS Secrets Manager and is resolved only at container startup through the AWS Workload Credentials Provider and AWS Agent Toolkit `asm-exec` wrapper; the key is never stored in the source archive, CloudFormation parameters, EC2 user data, or deployment logs.
 
@@ -75,15 +78,13 @@ docs                     Architecture and decision records
 ## API
 
 - `POST /api/templates` and schema-v2-only `POST /api/templates/:id/confirm`
-- `POST /api/matters`, `GET /api/matters/:id`, and `POST /api/matters/:id/sources`
-- `POST /api/matters/:id/evidence-reviews`
-- `PUT /api/matters/:id/review-resolutions/:targetId` to create or clear a fingerprint-scoped pre-generation omission
+- `POST /api/matters`, `GET /api/matters/:id`, `PATCH /api/matters/:id`, and `POST /api/matters/:id/sources`
 - `POST /api/matters/:id/generations` for initial generation or same-draft regeneration with `draftId` and `baseVersion`
 - `GET /api/jobs/:id` and `GET /api/jobs/:id/events`
-- `GET /api/drafts/:id` and `PUT /api/drafts/:id`
+- `GET /api/drafts/:id`, `PUT /api/drafts/:id`, and `GET /api/drafts/:id/versions`
+- `POST /api/drafts/:id/restore`
 - `POST /api/drafts/:id/fields/confirm`
 - `POST /api/drafts/:id/outcomes/:outcomeId/confirm`
-- `POST /api/drafts/:id/blocks/:blockId/confirm`
 - `POST /api/drafts/:id/refinements`
 - `POST /api/proposals/:id/accept` or `/reject`
 - `GET /api/sources/:id/file`

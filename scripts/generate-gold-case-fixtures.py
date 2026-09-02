@@ -348,7 +348,7 @@ def main() -> None:
             "complete": "All case-specific regions should be grounded and exportable.",
             "missingCritical": "Missing medical and damages evidence must lock export.",
             "conflicting": "Conflicting claim, loss-date, and limit values must be surfaced and lock export.",
-            "incremental": "The initial missing-wage packet must remain locked; adding the wage statement, reviewing again, and regenerating the same draft should make the next version exportable.",
+            "incremental": "The initial missing-wage packet must remain blocked; adding the wage statement and regenerating the same draft should make the next version exportable.",
         },
     }
     (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")

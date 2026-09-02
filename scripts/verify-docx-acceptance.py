@@ -23,6 +23,7 @@ from lxml import etree
 from pypdf import PdfReader
 
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+W14 = "http://schemas.microsoft.com/office/word/2010/wordml"
 REL = "http://schemas.openxmlformats.org/package/2006/relationships"
 NS = {"w": W}
 DEFAULT_MUTABLE_PATTERNS = (
@@ -57,6 +58,10 @@ def canonical(element: etree._Element | None) -> bytes:
 
 def paragraph_text(paragraph: etree._Element) -> str:
     return "".join(paragraph.xpath(".//w:t/text()", namespaces=NS))
+
+
+def paragraph_id(paragraph: etree._Element) -> str | None:
+    return paragraph.get(f"{{{W14}}}paraId")
 
 
 def paragraph_signature(paragraph: etree._Element) -> dict[str, Any]:
@@ -139,6 +144,7 @@ def verify(
     forbidden: list[str],
     render_dir: Path | None,
     allowed_media: set[str],
+    allow_page_count_change: bool,
 ) -> dict[str, Any]:
     failures: list[str] = []
     warnings: list[str] = []
@@ -176,16 +182,29 @@ def verify(
             before_paragraphs = before_root.xpath("//w:body/w:p", namespaces=NS)
             after_paragraphs = after_root.xpath("//w:body/w:p", namespaces=NS)
             if len(before_paragraphs) != len(after_paragraphs):
-                failures.append(
+                message = (
                     f"Body paragraph count changed from {len(before_paragraphs)} to {len(after_paragraphs)}"
                 )
+                (warnings if allow_page_count_change else failures).append(message)
             before_sections = [canonical(item) for item in before_root.xpath("//w:sectPr", namespaces=NS)]
             after_sections = [canonical(item) for item in after_root.xpath("//w:sectPr", namespaces=NS)]
             if before_sections != after_sections:
                 failures.append("Section geometry/properties changed")
 
         changed_paragraphs: list[dict[str, Any]] = []
-        for index, (before, after) in enumerate(zip(before_paragraphs, after_paragraphs, strict=False)):
+        before_by_id = {
+            identifier: paragraph
+            for paragraph in before_paragraphs
+            if (identifier := paragraph_id(paragraph)) is not None
+        }
+        for index, after in enumerate(after_paragraphs):
+            identifier = paragraph_id(after)
+            before = before_by_id.get(identifier) if identifier is not None else None
+            if before is None and len(before_paragraphs) == len(after_paragraphs):
+                before = before_paragraphs[index]
+            if before is None:
+                failures.append(f"Candidate paragraph {index} has no stable source paragraph anchor")
+                continue
             before_signature = paragraph_signature(before)
             after_signature = paragraph_signature(after)
             if before_signature != after_signature:
@@ -200,6 +219,7 @@ def verify(
                     )
                 changed_paragraphs.append({
                     "index": index,
+                    "paragraphId": identifier,
                     "beforeCharacters": len(before_text),
                     "afterCharacters": len(after_text),
                     "growthRatio": round(risk, 3),
@@ -246,10 +266,13 @@ def verify(
         original_render = render_docx(original, render_dir / "original")
         candidate_render = render_docx(candidate, render_dir / "candidate")
         if original_render["pageCount"] != candidate_render["pageCount"]:
-            failures.append(
+            message = (
                 f"Rendered page count changed from {original_render['pageCount']} to {candidate_render['pageCount']}"
             )
-        if original_render["pageSizes"] != candidate_render["pageSizes"]:
+            (warnings if allow_page_count_change else failures).append(message)
+        original_page_sizes = {tuple(size) for size in original_render["pageSizes"]}
+        candidate_page_sizes = {tuple(size) for size in candidate_render["pageSizes"]}
+        if original_page_sizes != candidate_page_sizes:
             failures.append("Rendered page sizes changed")
         rendering = {"original": original_render, "candidate": candidate_render}
 
@@ -276,6 +299,11 @@ def main() -> None:
     parser.add_argument("--forbid", action="append", default=[])
     parser.add_argument("--render-dir", type=Path)
     parser.add_argument("--allow-media", action="append", default=[])
+    parser.add_argument(
+        "--allow-page-count-change",
+        action="store_true",
+        help="Allow intentional target expansion/omission to change paragraph and rendered page counts while preserving anchors and page geometry.",
+    )
     parser.add_argument("--report", type=Path)
     args = parser.parse_args()
 
@@ -285,6 +313,7 @@ def main() -> None:
         args.forbid,
         args.render_dir.resolve() if args.render_dir else None,
         set(args.allow_media),
+        args.allow_page_count_change,
     )
     output = json.dumps(report, indent=2)
     if args.report:

@@ -16,56 +16,23 @@ export const CitationSchema = z.object({
   }
 });
 
-export const FieldProposalSchema = z.object({
-  fieldKey: z.string().min(1).max(500),
-  value: z.string().min(1).max(2_000),
-  sourceId: z.string().uuid(),
-  sourceName: z.string(),
-  page: z.number().int().positive(),
-  quote: z.string().min(1).max(500),
-  confidence: z.number().min(0).max(1),
-});
-
-export const ReviewFlagSchema = z.object({
-  id: z.string().min(1).max(200),
-  kind: z.enum(["keep_conflict", "unsupported", "low_confidence", "looks_reusable", "missing_evidence", "conflict", "general"]).default("general"),
-  severity: z.enum(["blocking", "verification", "informational"]).default("verification"),
-  summary: z.string().min(1).max(240),
-  explanation: z.string().min(1).max(2_000),
-  citations: z.array(CitationSchema).max(12),
-  affectedTemplateParagraphIndexes: z.array(z.number().int().nonnegative()).max(100),
-  affectedFieldKeys: z.array(z.string().min(1).max(500)).max(100),
-  affectedTargetIds: z.array(z.string().min(1).max(500)).max(100).default([]),
-});
-
-export const EvidenceReviewSchema = z.object({
-  sourceFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
-  fieldProposals: z.array(FieldProposalSchema).max(500).optional(),
-  reviewFlags: z.array(ReviewFlagSchema).max(100),
-  createdAt: z.string().datetime(),
-});
-
 export const ExportReadinessSchema = z.object({
   ready: z.boolean(),
-  blockIds: z.array(z.string()),
   fieldKeys: z.array(z.string()),
-  outcomeIds: z.array(z.string()).default([]),
+  omittedTargetIds: z.array(z.string()).default([]),
   duplicateParagraphIndexes: z.array(z.number().int().nonnegative()),
   imageIssue: z.object({
     templateCandidates: z.number().int().nonnegative(),
     sourceImages: z.number().int().nonnegative(),
   }).nullable(),
   staleEvidence: z.boolean(),
-  staleResolutionTargetIds: z.array(z.string()).default([]),
-  blockingReviewFlagIds: z.array(z.string()),
 });
 
 export const GenerationOutcomeSchema = z.object({
   id: z.string().min(1).max(500),
   targetId: z.string().min(1).max(500),
   targetKind: z.enum(["narrative", "structured", "figure"]),
-  status: z.enum(["generated", "omitted_no_evidence", "omitted_not_applicable"]),
-  resolution: z.enum(["not_required", "unresolved", "preapproved", "confirmed"]),
+  status: z.enum(["generated", "omitted"]),
   citations: z.array(CitationSchema).max(100),
   note: z.string().max(2_000).nullable().default(null),
   sourceId: z.string().uuid().nullable().default(null),
@@ -76,14 +43,14 @@ export const GenerationOutcomeSchema = z.object({
   exemplarCount: z.number().int().nonnegative(),
   generatedCount: z.number().int().nonnegative(),
 }).superRefine((outcome, context) => {
-  if (outcome.status === "generated" && outcome.resolution !== "not_required") {
-    context.addIssue({ code: "custom", path: ["resolution"], message: "Generated outcomes do not require omission approval." });
+  if (outcome.status === "generated" && outcome.note !== null) {
+    context.addIssue({ code: "custom", path: ["note"], message: "Generated outcomes must have a null note." });
   }
-  if (outcome.status === "omitted_not_applicable" && !outcome.citations.length) {
-    context.addIssue({ code: "custom", path: ["citations"], message: "Not-applicable omissions require supporting citations." });
+  if (outcome.status === "generated" && !outcome.citations.length) {
+    context.addIssue({ code: "custom", path: ["citations"], message: "Generated outcomes require grounding citations." });
   }
-  if (outcome.status === "omitted_no_evidence" && outcome.resolution === "not_required") {
-    context.addIssue({ code: "custom", path: ["resolution"], message: "No-evidence omissions must be unresolved or approved." });
+  if (outcome.status === "omitted" && !outcome.note?.trim()) {
+    context.addIssue({ code: "custom", path: ["note"], message: "Omitted outcomes require a concise review note." });
   }
   if (outcome.targetKind === "figure" && outcome.status === "generated" && (!outcome.sourceId || !outcome.page || !outcome.caption)) {
     context.addIssue({ code: "custom", path: ["sourceId"], message: "Generated figures require a source image, page, and caption." });
@@ -92,15 +59,12 @@ export const GenerationOutcomeSchema = z.object({
 
 export const DraftBlockSchema = z.object({
   id: z.string(),
-  kind: z.enum(["heading", "paragraph", "list-item", "table-row", "figure-caption", "warning"]),
+  kind: z.enum(["heading", "paragraph", "list-item", "table-row", "figure-caption"]),
   text: z.string(),
   templateParagraphIndex: z.number().int().nonnegative().nullable(),
   templateBlockId: z.string().min(1).max(500).nullable().optional(),
   citations: z.array(CitationSchema),
-  verified: z.boolean(),
-  userConfirmed: z.boolean().optional(),
-  templateRole: z.enum(["keep", "replace"]).optional(),
-  locked: z.boolean().optional(),
+  attorneyEdited: z.boolean().default(false),
   targetId: z.string().min(1).max(500).nullable().optional(),
   outcomeId: z.string().min(1).max(500).nullable().optional(),
   sequence: z.number().int().nonnegative().optional(),
@@ -115,26 +79,31 @@ export const DraftSectionSchema = z.object({
 });
 
 export const DraftFieldSchema = z.object({
-  value: z.string(),
+  fieldKey: z.string().min(1).max(500),
+  oldValue: z.string(),
+  value: z.string().max(2_000).nullable(),
   label: z.string().nullable().optional(),
-  templateValue: z.string().nullable().optional(),
-  verified: z.boolean(),
-  confidence: z.number().min(0).max(1).nullable().default(null),
-  userConfirmed: z.boolean().default(false),
-  sourceId: z.string().uuid().nullable().default(null),
-  page: z.number().int().positive().nullable().default(null),
-  sourceLabel: z.string().nullable().default(null),
-  quote: z.string().max(500).nullable().optional(),
+  citations: z.array(CitationSchema).max(50),
+  note: z.string().max(2_000).nullable(),
+  attorneyEdited: z.boolean().default(false),
+}).superRefine((field, context) => {
+  if (field.value !== null && !field.citations.length && !field.attorneyEdited) {
+    context.addIssue({ code: "custom", path: ["citations"], message: "Non-null field values require grounding citations." });
+  }
+  if (field.value !== null && field.note !== null) {
+    context.addIssue({ code: "custom", path: ["note"], message: "Populated fields must have a null note." });
+  }
+  if (field.value === null && !field.note?.trim()) {
+    context.addIssue({ code: "custom", path: ["note"], message: "Null field values require a concise review note." });
+  }
 });
 
 export const GeneratedDraftSchema = z.object({
   title: z.string(),
-  matterName: z.string(),
   fields: z.record(z.string(), DraftFieldSchema),
   sections: z.array(DraftSectionSchema),
-  warnings: z.array(z.string()),
-  reviewFlags: z.array(ReviewFlagSchema).default([]),
   outcomes: z.array(GenerationOutcomeSchema).default([]),
+  confirmedOmissionTargetIds: z.array(z.string().min(1).max(500)).default([]),
 });
 
 export const TemplateFormattingSchema = z.object({
@@ -221,7 +190,7 @@ export const TemplateRegionSchema = z.object({
     }
   }
   if (region.semanticKind === "heading" && region.role !== "heading") {
-    context.addIssue({ code: "custom", path: ["role"], message: "Heading structure is always locked." });
+    context.addIssue({ code: "custom", path: ["role"], message: "Heading map entries must retain the heading role." });
   }
   if (region.semanticKind === "figure" && !region.figure) {
     context.addIssue({ code: "custom", path: ["figure"], message: "Figure blocks require immutable OOXML figure metadata." });
@@ -283,19 +252,6 @@ export const GenerationTargetSchema = z.object({
   figure: TemplateFigureSchema.nullable().default(null),
 });
 
-export const ReviewResolutionSchema = z.object({
-  id: z.string().uuid(),
-  matterId: z.string().uuid(),
-  targetId: z.string().min(1).max(500),
-  sourceFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
-  action: z.literal("omit"),
-  actorId: z.string().uuid(),
-  actorName: z.string(),
-  draftId: z.string().uuid().nullable().default(null),
-  draftVersion: z.number().int().positive().nullable().default(null),
-  createdAt: z.string().datetime(),
-});
-
 export const RefinementAnnotationSchema = z.object({
   blockId: z.string().min(1),
   quote: z.string().min(1).max(20_000),
@@ -350,9 +306,6 @@ export const ExtractedFactSchema = z.object({
 });
 
 export type Citation = z.infer<typeof CitationSchema>;
-export type FieldProposal = z.infer<typeof FieldProposalSchema>;
-export type ReviewFlag = z.infer<typeof ReviewFlagSchema>;
-export type EvidenceReview = z.infer<typeof EvidenceReviewSchema>;
 export type ExportReadiness = z.infer<typeof ExportReadinessSchema>;
 export type GenerationOutcome = z.infer<typeof GenerationOutcomeSchema>;
 export type DraftBlock = z.infer<typeof DraftBlockSchema>;
@@ -366,7 +319,6 @@ export type TemplateFigure = z.infer<typeof TemplateFigureSchema>;
 export type TemplateMap = z.infer<typeof TemplateMapSchema>;
 export type TemplateAnalysis = z.infer<typeof TemplateAnalysisSchema>;
 export type GenerationTarget = z.infer<typeof GenerationTargetSchema>;
-export type ReviewResolution = z.infer<typeof ReviewResolutionSchema>;
 export type RefinementProposal = z.infer<typeof RefinementProposalSchema>;
 export type RefinementAnnotation = z.infer<typeof RefinementAnnotationSchema>;
 export type RefinementEdit = z.infer<typeof RefinementEditSchema>;
@@ -398,7 +350,6 @@ export interface Matter {
   templateId: string | null;
   templateMapVersion: number | null;
   createdAt: string;
-  reviewResolutions?: ReviewResolution[];
 }
 
 export interface DraftRecord {
@@ -408,6 +359,14 @@ export interface DraftRecord {
   content: GeneratedDraft;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface DraftVersionSummary {
+  version: number;
+  actor: string;
+  timestamp: string;
+  changeSummary: string;
+  current: boolean;
 }
 
 export interface JobRecord {

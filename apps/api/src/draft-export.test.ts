@@ -2,21 +2,42 @@ import { describe, expect, it } from "vitest";
 import type { GeneratedDraft } from "@steno/contracts";
 import { draftExportIssues, isDraftExportReady } from "./draft-export";
 
+const citation = {
+  sourceId: "10000000-0000-4000-8000-000000000001",
+  sourceName: "claim.pdf",
+  page: 1,
+  quote: "Claim number: PPC-2026-0417",
+  evidenceType: "text" as const,
+  visualDescription: null,
+};
+
 const content: GeneratedDraft = {
   title: "Demand",
-  matterName: "Example",
-  warnings: [],
-  reviewFlags: [],
-  outcomes: [],
+  confirmedOmissionTargetIds: [],
+  outcomes: [{
+    id: "outcome:target-1",
+    targetId: "target-1",
+    targetKind: "narrative",
+    status: "generated",
+    citations: [citation],
+    note: null,
+    sourceId: null,
+    page: null,
+    sourceName: null,
+    mediaType: null,
+    caption: null,
+    exemplarCount: 1,
+    generatedCount: 1,
+  }],
   fields: {
-    "old claim": {
-      value: "new claim",
-      verified: true,
-      confidence: 0.95,
-      userConfirmed: false,
-      sourceId: null,
-      page: null,
-      sourceLabel: null,
+    claim_number: {
+      fieldKey: "claim_number",
+      oldValue: "OLD-123",
+      value: "PPC-2026-0417",
+      label: "Claim number",
+      citations: [citation],
+      note: null,
+      attorneyEdited: false,
     },
   },
   sections: [{
@@ -25,193 +46,106 @@ const content: GeneratedDraft = {
     blocks: [{
       id: "supported",
       kind: "paragraph",
-      text: "Supported replacement.",
+      text: "The claim number is PPC-2026-0417.",
       templateParagraphIndex: 4,
       templateBlockId: "word/document.xml:p:4",
-      citations: [],
-      verified: true,
+      citations: [citation],
+      attorneyEdited: false,
+      targetId: "target-1",
+      outcomeId: "outcome:target-1",
+      sequence: 0,
     }],
   }],
 };
 
 describe("Word export readiness", () => {
-  it("allows a fully grounded draft", () => {
+  it("allows a grounded draft and attorney edits without a second confirmation", () => {
     expect(isDraftExportReady(draftExportIssues(content))).toBe(true);
-    expect(isDraftExportReady(draftExportIssues({
+    const edited: GeneratedDraft = {
+      ...content,
+      sections: [{ ...content.sections[0]!, blocks: [{ ...content.sections[0]!.blocks[0]!, text: "Attorney revision.", attorneyEdited: true }] }],
+    };
+    expect(draftExportIssues(edited).ready).toBe(true);
+  });
+
+  it("blocks a null field until the attorney supplies a value", () => {
+    const blocked: GeneratedDraft = {
       ...content,
       fields: {
-        semantic_claim_number: {
-          ...content.fields["old claim"]!,
-          templateValue: "old claim",
-        },
-      },
-    }))).toBe(true);
-  });
-
-  it("blocks warning prose from being inserted into the immutable Word template", () => {
-    const blocked: GeneratedDraft = {
-      ...content,
-      sections: [{ ...content.sections[0]!, blocks: [{
-        ...content.sections[0]!.blocks[0]!,
-        id: "unsupported",
-        kind: "warning",
-        text: "[ATTORNEY REVIEW REQUIRED — no supported replacement was generated.]",
-        verified: false,
-      }] }],
-    };
-    expect(draftExportIssues(blocked).blockIds).toEqual(["unsupported"]);
-  });
-
-  it("blocks a general conflict warning without a template paragraph mapping", () => {
-    const blocked: GeneratedDraft = {
-      ...content,
-      sections: [{
-        ...content.sections[0]!,
-        blocks: [{
-          id: "claim-conflict",
-          kind: "warning",
-          text: "The uploaded sources contain conflicting claim numbers.",
-          templateParagraphIndex: null,
+        claim_number: {
+          ...content.fields.claim_number!,
+          value: null,
           citations: [],
-          verified: false,
-        }, ...content.sections[0]!.blocks],
-      }],
-    };
-    expect(draftExportIssues(blocked).blockIds).toContain("claim-conflict");
-    expect(isDraftExportReady(draftExportIssues(blocked))).toBe(false);
-  });
-
-  it("blocks any unconfirmed edited content even when it has no template mapping", () => {
-    const blocked: GeneratedDraft = {
-      ...content,
-      sections: [{
-        ...content.sections[0]!,
-        blocks: [{
-          ...content.sections[0]!.blocks[0]!,
-          id: "unmapped-edit",
-          templateParagraphIndex: null,
-          templateBlockId: null,
-          verified: false,
-          userConfirmed: false,
-        }],
-      }],
-    };
-    expect(draftExportIssues(blocked).blockIds).toEqual(["unmapped-edit"]);
-  });
-
-  it("does not confuse equal paragraph indexes in different OOXML parts", () => {
-    const crossPart: GeneratedDraft = {
-      ...content,
-      sections: [{ ...content.sections[0]!, blocks: [
-        { ...content.sections[0]!.blocks[0]!, templateParagraphIndex: 0, templateBlockId: "word/document.xml:p:0" },
-        { ...content.sections[0]!.blocks[0]!, id: "header", templateParagraphIndex: 0, templateBlockId: "word/header1.xml:p:0" },
-      ] }],
-    };
-    expect(draftExportIssues(crossPart).duplicateParagraphIndexes).toEqual([]);
-  });
-
-  it("allows an attorney-confirmed replacement but rejects unresolved and duplicate slots", () => {
-    const reviewed = {
-      ...content.sections[0]!.blocks[0]!,
-      id: "reviewed",
-      text: "Attorney reviewed replacement.",
-      verified: false,
-      userConfirmed: true,
-    };
-    const unresolvedField: GeneratedDraft = {
-      ...content,
-      fields: {
-        legacy: {
-          value: "[ATTORNEY REVIEW REQUIRED]",
-          verified: false,
-          confidence: null,
-          userConfirmed: false,
-          sourceId: null,
-          page: null,
-          sourceLabel: null,
+          note: "No unambiguous claim number was found.",
         },
       },
-      sections: [{ ...content.sections[0]!, blocks: [reviewed, { ...reviewed, id: "duplicate" }] }],
     };
-    const issues = draftExportIssues(unresolvedField);
-    expect(issues.blockIds).toEqual([]);
-    expect(issues.fieldKeys).toEqual(["legacy"]);
-    expect(issues.duplicateParagraphIndexes).toEqual([4]);
+    expect(draftExportIssues(blocked)).toMatchObject({ ready: false, fieldKeys: ["claim_number"] });
   });
 
-  it("allows elastic paragraphs from one stable target to share the final exemplar anchor", () => {
-    const exemplar = content.sections[0]!.blocks[0]!;
-    const elastic: GeneratedDraft = {
+  it("blocks an omitted target exactly until its versioned omission is confirmed", () => {
+    const omitted = {
+      ...content.outcomes[0]!,
+      status: "omitted" as const,
+      citations: [],
+      note: "No treatment records support this section.",
+      generatedCount: 0,
+    };
+    expect(draftExportIssues({ ...content, outcomes: [omitted] })).toMatchObject({
+      ready: false,
+      omittedTargetIds: ["target-1"],
+    });
+    expect(draftExportIssues({
       ...content,
-      sections: [{ ...content.sections[0]!, blocks: [
-        { ...exemplar, id: "run-0", targetId: "narrative-1", sequence: 0 },
-        { ...exemplar, id: "run-1", targetId: "narrative-1", sequence: 1 },
-      ] }],
-    };
-    expect(draftExportIssues(elastic).duplicateParagraphIndexes).toEqual([]);
-    expect(isDraftExportReady(draftExportIssues(elastic))).toBe(true);
+      outcomes: [omitted],
+      confirmedOmissionTargetIds: ["target-1"],
+    })).toMatchObject({ ready: true, omittedTargetIds: [] });
   });
 
-  it("uses the same readiness result for stale evidence", () => {
+  it("detects stale evidence and duplicate template mappings", () => {
     const stale = draftExportIssues(content, {
       draftSourceFingerprint: "a".repeat(64),
       currentSourceFingerprint: "b".repeat(64),
     });
-    expect(stale).toMatchObject({
-      ready: false,
-      staleEvidence: true,
-      imageIssue: null,
-    });
-  });
+    expect(stale).toMatchObject({ ready: false, staleEvidence: true });
 
-  it("blocks only unresolved or stale omission decisions", () => {
-    const omission = {
-      id: "outcome:target-1", targetId: "target-1", targetKind: "narrative" as const,
-      status: "omitted_no_evidence" as const, resolution: "unresolved" as const,
-      citations: [], note: "No support located.", sourceId: null, page: null, sourceName: null,
-      mediaType: null, caption: null, exemplarCount: 1, generatedCount: 0,
-    };
-    expect(draftExportIssues({ ...content, outcomes: [omission] })).toMatchObject({
-      ready: false, outcomeIds: ["outcome:target-1"], staleResolutionTargetIds: [],
-    });
-    expect(draftExportIssues({
-      ...content, outcomes: [{ ...omission, resolution: "preapproved" }],
-    })).toMatchObject({ ready: true, outcomeIds: [] });
-    expect(draftExportIssues({
-      ...content, outcomes: [{ ...omission, resolution: "confirmed" }],
-    }, { staleResolutionTargetIds: ["target-1"] })).toMatchObject({
-      ready: false, outcomeIds: [], staleResolutionTargetIds: ["target-1"],
-    });
-  });
-
-  it("links generic review flags only to concrete blocking targets", () => {
-    const flagged: GeneratedDraft = {
+    const duplicate: GeneratedDraft = {
       ...content,
-      reviewFlags: [{
-        id: "source-review-linked",
-        kind: "missing_evidence",
-        severity: "blocking",
-        summary: "Needs source review",
-        explanation: "Review this source-backed region.",
-        citations: [],
-        affectedTemplateParagraphIndexes: [4],
-        affectedFieldKeys: [],
-        affectedTargetIds: [],
-      }, {
-        id: "source-review-advisory",
-        kind: "general",
-        severity: "verification",
-        summary: "Advisory",
-        explanation: "This flag has no blocked target.",
-        citations: [],
-        affectedTemplateParagraphIndexes: [],
-        affectedFieldKeys: [],
-        affectedTargetIds: [],
-      }],
-      sections: [{ ...content.sections[0]!, blocks: [{
-        ...content.sections[0]!.blocks[0]!, kind: "warning", verified: false,
-      }] }],
+      sections: [{ ...content.sections[0]!, blocks: [
+        content.sections[0]!.blocks[0]!,
+        {
+          ...content.sections[0]!.blocks[0]!,
+          id: "other-target",
+          targetId: "target-2",
+          outcomeId: "outcome:target-2",
+        },
+      ] }],
     };
-    expect(draftExportIssues(flagged).blockingReviewFlagIds).toEqual(["source-review-linked"]);
+    expect(draftExportIssues(duplicate)).toMatchObject({ ready: false, duplicateParagraphIndexes: [4] });
+  });
+
+  it("allows multiple generated paragraphs from one target to share its exemplar anchor", () => {
+    const exemplar = content.sections[0]!.blocks[0]!;
+    const elastic: GeneratedDraft = {
+      ...content,
+      sections: [{ ...content.sections[0]!, blocks: [
+        { ...exemplar, id: "run-0", sequence: 0 },
+        { ...exemplar, id: "run-1", sequence: 1 },
+      ] }],
+    };
+    expect(draftExportIssues(elastic).duplicateParagraphIndexes).toEqual([]);
+    expect(draftExportIssues(elastic).ready).toBe(true);
+  });
+
+  it("does not confuse equal paragraph indexes in different OOXML parts", () => {
+    const exemplar = content.sections[0]!.blocks[0]!;
+    const crossPart: GeneratedDraft = {
+      ...content,
+      sections: [{ ...content.sections[0]!, blocks: [
+        { ...exemplar, templateParagraphIndex: 0, templateBlockId: "word/document.xml:p:0" },
+        { ...exemplar, id: "header", templateParagraphIndex: 0, templateBlockId: "word/header1.xml:p:0" },
+      ] }],
+    };
+    expect(draftExportIssues(crossPart).duplicateParagraphIndexes).toEqual([]);
   });
 });

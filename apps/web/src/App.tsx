@@ -6,11 +6,11 @@ import {
   LoaderCircle, Plus, RotateCcw, Search, Send, Sparkles, Upload, X,
 } from "lucide-react";
 import type {
-  Citation, DraftBlock, GeneratedDraft, RefinementAnnotation, RefinementEdit, ReviewFlag, TemplateRegion,
+  Citation, DraftBlock, GeneratedDraft, RefinementAnnotation, RefinementEdit, TemplateRegion,
 } from "@steno/contracts";
 import { api, streamEvent, upload } from "./api";
 import type {
-  ActivityResponse, DraftResponse, JobResponse, MatterResponse, ProposalResponse, TemplateResponse,
+  ActivityResponse, DraftResponse, JobResponse, MatterResponse, ProposalResponse, TemplateResponse, VersionResponse,
 } from "./types";
 
 type WorkspaceTab = "review" | "refine" | "activity";
@@ -60,7 +60,7 @@ function renderProposedText(text: string, edits: RefinementEdit[]) {
 }
 
 function BlockEditor({
-  block, active, citationNumbers, edits, disabled, onFocus, onChange, onBlur, onCitation, onSelect, onConfirm,
+  block, active, citationNumbers, edits, disabled, onFocus, onChange, onBlur, onCitation, onSelect,
 }: {
   block: DraftBlock;
   active: boolean;
@@ -72,7 +72,6 @@ function BlockEditor({
   onBlur: (text: string) => void;
   onCitation: (index: number) => void;
   onSelect: (selection: SelectionPopover) => void;
-  onConfirm: () => void;
 }) {
   const editor = useEditor({
     extensions: [StarterKit.configure({ heading: false, bulletList: false, orderedList: false, blockquote: false, codeBlock: false })],
@@ -95,7 +94,7 @@ function BlockEditor({
   }, [block.text, editor, edits.length]);
 
   const captureSelection = (event: React.MouseEvent<HTMLDivElement>) => {
-    if (edits.length || disabled || block.templateRole === "keep") return;
+    if (edits.length || disabled) return;
     const selection = window.getSelection();
     const root = event.currentTarget.querySelector<HTMLElement>(".ProseMirror");
     if (!selection || selection.rangeCount === 0 || selection.isCollapsed || !root || !root.contains(selection.anchorNode)) return;
@@ -111,8 +110,7 @@ function BlockEditor({
   };
 
   return (
-    <div data-draft-block={block.id} className={`draft-block ${active ? "active" : ""} ${block.kind === "warning" ? "unsupported" : ""}`} onClick={onFocus}>
-      {block.kind === "warning" && <CircleAlert className="warning-icon" size={15} aria-label="Attorney review required" />}
+    <div data-draft-block={block.id} className={`draft-block ${active ? "active" : ""}`} onClick={onFocus}>
       {edits.length
         ? <div className="block-editor proposal-render" aria-label={`Proposed changes for ${block.id}`}>{renderProposedText(block.text, edits)}</div>
         : <div onMouseUp={captureSelection}><EditorContent editor={editor} /></div>}
@@ -127,9 +125,7 @@ function BlockEditor({
             {citationNumbers[index]}
           </button>
         ))}
-        {!block.verified && !block.userConfirmed && <span className="needs-review">Attorney review required</span>}
-        {block.templateRole === "keep" ? <span className="template-kept">Exact template language</span> : block.userConfirmed && <span className="attorney-confirmed">Attorney confirmed</span>}
-        {!block.verified && !block.userConfirmed && <button className="confirm-block" onClick={(event) => { event.stopPropagation(); onConfirm(); }}><Check size={12} /> Confirm reviewed text</button>}
+        {block.attorneyEdited && <span className="attorney-confirmed">Attorney edited · citations not revalidated</span>}
       </div>
     </div>
   );
@@ -409,45 +405,7 @@ function RegionReviewModal({ template, onCancel, onConfirmed }: {
   </div>;
 }
 
-function ReviewFlagList({ flags, blockingIds, onCitation, onTarget }: {
-  flags: ReviewFlag[];
-  blockingIds?: Set<string>;
-  onCitation: (citation: Citation) => void;
-  onTarget?: (paragraphIndex: number) => void;
-}) {
-  if (!flags.length) return <div className="review-clear"><Check size={16} /><span>No material source-review flags were returned. This is not a completeness determination.</span></div>;
-  return <div className="review-flag-list">{flags.map((flag) => {
-    const blocksExport = blockingIds?.has(flag.id) ?? false;
-    return <article className={`review-flag ${blocksExport ? "blocking" : "advisory"}`} key={flag.id}>
-      <div className="review-flag-heading"><CircleAlert size={16} /><div><small>{blocksExport ? "Linked to an export blocker" : "Needs source review"}</small><strong>{flag.summary}</strong></div></div>
-      <p>{flag.explanation}</p>
-      {flag.citations.length > 0 && <div className="review-flag-citations">{flag.citations.map((citation, index) => <button key={`${citation.sourceId}-${citation.page}-${index}`} onClick={() => onCitation(citation)}>
-        <span>{citation.sourceName} · p. {citation.page}</span><q>{citation.quote}</q>
-      </button>)}</div>}
-      {!!flag.affectedTemplateParagraphIndexes.length && onTarget && <div className="review-targets">{flag.affectedTemplateParagraphIndexes.map((paragraphIndex) => <button key={paragraphIndex} onClick={() => onTarget(paragraphIndex)}>Open affected draft region {paragraphIndex + 1}</button>)}</div>}
-    </article>;
-  })}</div>;
-}
-
-function ConfirmBlockModal({ block, busy, onCancel, onConfirm }: {
-  block: DraftBlock;
-  busy: boolean;
-  onCancel: () => void;
-  onConfirm: (note: string) => void;
-}) {
-  const [note, setNote] = useState("");
-  return <div className="modal-backdrop" role="presentation">
-    <section className="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-block-title">
-      <div className="modal-head"><div><p className="eyebrow">Attorney confirmation</p><h2 id="confirm-block-title">Confirm this reviewed text</h2></div><button className="icon-button" onClick={onCancel} aria-label="Close confirmation"><X size={18} /></button></div>
-      <p className="modal-copy">Editing alone does not resolve unsupported content. Confirm that you reviewed the final text and record why it is appropriate to use.</p>
-      <blockquote>{block.text}</blockquote>
-      <label className="confirmation-note"><span>Review note</span><textarea value={note} onChange={(event) => setNote(event.target.value)} placeholder="Example: Confirmed against the signed treatment summary and corrected the service date." rows={3} /></label>
-      <div className="modal-actions"><button className="secondary" onClick={onCancel}>Cancel</button><button className="primary" disabled={busy || note.trim().length < 3} onClick={() => onConfirm(note.trim())}>{busy ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />} Confirm reviewed text</button></div>
-    </section>
-  </div>;
-}
-
-function Setup({ onReady }: { onReady: (matterId: string, autoReview: boolean) => Promise<void> }) {
+function Setup({ onReady }: { onReady: (matterId: string) => Promise<void> }) {
   const [templates, setTemplates] = useState<TemplateResponse[]>([]);
   const [selected, setSelected] = useState<TemplateResponse | null>(null);
   const [pendingTemplate, setPendingTemplate] = useState<File | null>(null);
@@ -493,8 +451,6 @@ function Setup({ onReady }: { onReady: (matterId: string, autoReview: boolean) =
     try {
       setBusyLabel("Analyzing the template and extracting the complete case packet…");
       const form = new FormData();
-      const caseLabel = templateLabel(selected?.name ?? pendingTemplate?.name ?? "New case");
-      form.append("caseName", `${caseLabel} case workspace`);
       if (selected) form.append("templateId", selected.id);
       if (pendingTemplate) form.append("template", pendingTemplate);
       files.forEach((file) => form.append("sources", file));
@@ -504,7 +460,7 @@ function Setup({ onReady }: { onReady: (matterId: string, autoReview: boolean) =
       }>("/api/intakes", { method: "POST", body: form });
       setTemplates((current) => [intake.template, ...current.filter((template) => template.id !== intake.template.id)]);
       if (intake.template.status === "confirmed") {
-        await onReady(intake.caseWorkspace.id, true);
+        await onReady(intake.caseWorkspace.id);
       } else {
         setSelected(intake.template);
         setPendingTemplate(null);
@@ -519,7 +475,7 @@ function Setup({ onReady }: { onReady: (matterId: string, autoReview: boolean) =
     setBusy(true); setBusyLabel("Preparing supplied sample…"); setError(null);
     try {
       const result = await api<{ matterId: string }>("/api/demo/bootstrap", { method: "POST", body: "{}" });
-      await onReady(result.matterId, true);
+      await onReady(result.matterId);
     } catch (caught) { setError(caught instanceof Error ? caught.message : "Sample packet could not be prepared"); }
     finally { setBusy(false); }
   };
@@ -565,7 +521,7 @@ function Setup({ onReady }: { onReady: (matterId: string, autoReview: boolean) =
             {query && filtered.length === 0 && <p className="template-empty">No real templates match “{query}”. Clear the search or upload a DOCX.</p>}
           </div>
           {sampleAvailable && <button className="sample-shortcut" onClick={() => void loadSample()} disabled={busy}>
-            <Sparkles size={16} /><span><strong>Use the supplied Steno sample packet</strong><small>Loads the provided completed letter and all five real case files.</small></span><ChevronRight size={17} />
+            <Sparkles size={16} /><span><strong>Use the supplied Steno sample packet</strong><small>Loads the provided completed letter and five fictional case files.</small></span><ChevronRight size={17} />
           </button>}
         </section>
 
@@ -590,7 +546,7 @@ function Setup({ onReady }: { onReady: (matterId: string, autoReview: boolean) =
 
         <div className="generate-row">
           <button className="primary generate-button" onClick={() => void generate()} disabled={(!selected && !pendingTemplate) || !files.length || busy}>
-            {busy ? <LoaderCircle className="spin" size={17} /> : <Sparkles size={17} />} Continue to template map
+            {busy ? <LoaderCircle className="spin" size={17} /> : <Sparkles size={17} />} {selected?.status === "confirmed" && !pendingTemplate ? "Generate draft" : "Continue to template map"}
           </button>
           <p>The uploaded DOCX is analyzed while PDF text and OCR are extracted. No hidden case summary is created. Nothing is sent to a carrier.</p>
         </div>
@@ -607,7 +563,7 @@ function Setup({ onReady }: { onReady: (matterId: string, autoReview: boolean) =
             const caseWorkspaceId = pendingCaseWorkspaceId;
             setPendingCaseWorkspaceId(null);
             void api(`/api/matters/${caseWorkspaceId}/template-map`, { method: "POST", body: "{}" })
-              .then(() => onReady(caseWorkspaceId, true))
+              .then(() => onReady(caseWorkspaceId))
               .catch((caught) => setError(caught instanceof Error ? caught.message : "The template map could not be pinned."));
           }
         }}
@@ -618,12 +574,13 @@ function Setup({ onReady }: { onReady: (matterId: string, autoReview: boolean) =
 
 function RefinePanel({
   tab, setTab, messages, activity, annotations, instruction, proposal, thinking, activeBlock,
-  reviewContent, onInstruction, onRemoveAnnotation, onSend, onResolve,
+  reviewContent, versions, onInstruction, onRemoveAnnotation, onSend, onResolve, onRestore,
 }: {
   tab: WorkspaceTab;
   setTab: (tab: WorkspaceTab) => void;
   messages: ChatMessage[];
   activity: ActivityResponse[];
+  versions: VersionResponse[];
   annotations: RefinementAnnotation[];
   instruction: string;
   proposal: ProposalResponse | null;
@@ -634,6 +591,7 @@ function RefinePanel({
   onRemoveAnnotation: (index: number) => void;
   onSend: () => void;
   onResolve: (resolution: "accept" | "reject") => void;
+  onRestore: (version: number) => void;
 }) {
   return (
     <aside className="right-panel">
@@ -677,6 +635,13 @@ function RefinePanel({
           <small>AI changes remain proposals until you accept them.</small>
         </div>
       </> : <div className="activity-list">
+        <div className="version-list">
+          <p className="eyebrow">Draft versions</p>
+          {versions.map((version) => <div className="version-row" key={version.version}>
+            <div><strong>v{version.version}{version.current ? " · Current" : ""}</strong><p>{version.changeSummary}</p><small>{version.actor} · {new Date(version.timestamp).toLocaleString()}</small></div>
+            {!version.current && <button className="secondary" onClick={() => onRestore(version.version)}>Restore</button>}
+          </div>)}
+        </div>
         {activity.length ? activity.map((event) => <div className="activity-row" key={event.id}>
           <span>{event.actorType === "agent" ? "✦" : "FR"}</span>
           <div><strong>{event.summary}</strong><p>{event.actorName}</p><small>{new Date(event.createdAt).toLocaleString()}</small></div>
@@ -691,7 +656,6 @@ export function App() {
   const [draft, setDraft] = useState<DraftResponse | null>(null);
   const [content, setContent] = useState<GeneratedDraft | null>(null);
   const [job, setJob] = useState<JobResponse | null>(null);
-  const [autoReview, setAutoReview] = useState(false);
   const [revealedSections, setRevealedSections] = useState(0);
   const [activeBlockId, setActiveBlockId] = useState<string | null>(null);
   const [activeReviewItemId, setActiveReviewItemId] = useState<string | null>(null);
@@ -700,6 +664,7 @@ export function App() {
   const [activeCitation, setActiveCitation] = useState<{ sourceId: string; page: number; number: number } | null>(null);
   const [tab, setTab] = useState<WorkspaceTab>("review");
   const [activity, setActivity] = useState<ActivityResponse[]>([]);
+  const [versions, setVersions] = useState<VersionResponse[]>([]);
   const [annotations, setAnnotations] = useState<RefinementAnnotation[]>([]);
   const [selection, setSelection] = useState<SelectionPopover | null>(null);
   const [instruction, setInstruction] = useState("");
@@ -709,55 +674,26 @@ export function App() {
   const [notice, setNotice] = useState<string | null>(null);
   const [fieldValues, setFieldValues] = useState<Record<string, string>>({});
   const [addingEvidence, setAddingEvidence] = useState(false);
-  const [confirmingBlock, setConfirmingBlock] = useState<DraftBlock | null>(null);
-  const [confirmingBlockBusy, setConfirmingBlockBusy] = useState(false);
-  const [resolvingTargetId, setResolvingTargetId] = useState<string | null>(null);
   const [confirmingOutcomeId, setConfirmingOutcomeId] = useState<string | null>(null);
+  const [undoVersion, setUndoVersion] = useState<number | null>(null);
+  const [renamingMatter, setRenamingMatter] = useState(false);
+  const [matterName, setMatterName] = useState("");
 
   const loadActivity = useCallback(async (matterId: string) => setActivity(await api(`/api/matters/${matterId}/activity`)), []);
   const refreshMatter = useCallback(async (matterId: string) => {
     const loaded = await api<MatterResponse>(`/api/matters/${matterId}`);
-    setMatter(loaded);
+    setMatter(loaded); setMatterName(loaded.name);
     return loaded;
   }, []);
+  const loadVersions = useCallback(async (draftId: string) => setVersions(await api<VersionResponse[]>(`/api/drafts/${draftId}/versions`)), []);
   const loadDraft = useCallback(async (draftId: string) => {
     const loaded = await api<DraftResponse>(`/api/drafts/${draftId}`);
     setDraft(loaded); setContent(loaded.content); setRevealedSections(0);
-    setTab(loaded.readiness.outcomeIds.length || loaded.readiness.blockIds.length || loaded.readiness.fieldKeys.length || loaded.readiness.staleEvidence ? "review" : "refine");
+    setTab("review");
     setActiveBlockId(loaded.content.sections.flatMap((section) => section.blocks)[0]?.id ?? null);
-    setFieldValues(Object.fromEntries(Object.entries(loaded.content.fields).map(([key, field]) => [key, field.value])));
-  }, []);
-
-  const reviewEvidenceForMatter = useCallback(async (target: MatterResponse) => {
-    setNotice(null);
-    try {
-      const queued = await api<JobResponse>(`/api/matters/${target.id}/evidence-reviews`, { method: "POST", body: "{}" });
-      setJob({ ...queued, jobType: "evidence_review", progress: 0, step: "Queued" });
-      return await new Promise<boolean>((resolve) => {
-        const stream = new EventSource(`/api/jobs/${queued.jobId}/events`);
-        let settled = false;
-        const finish = (result: boolean) => { if (settled) return; settled = true; stream.close(); resolve(result); };
-        const update = (event: MessageEvent<string>) => {
-          const payload = JSON.parse(event.data) as Partial<JobResponse>;
-          const status = event.type === "completed" ? "completed" : event.type === "failed" ? "failed" : event.type === "progress" ? "processing" : "queued";
-          setJob((current) => ({ ...(current ?? queued), ...payload, jobType: "evidence_review", status }) as JobResponse);
-        };
-        stream.addEventListener("queued", update); stream.addEventListener("progress", update);
-        stream.addEventListener("completed", (event) => {
-          update(event as MessageEvent<string>);
-          // Settle before the server closes the SSE connection; EventSource may
-          // otherwise fire `error` first and incorrectly report a completed review as failed.
-          finish(true);
-          void refreshMatter(target.id).then(() => loadActivity(target.id));
-        });
-        stream.addEventListener("failed", (event) => { update(event as MessageEvent<string>); finish(false); });
-        stream.onerror = () => finish(false);
-      });
-    } catch (caught) {
-      setNotice(caught instanceof Error ? caught.message : "Evidence review failed");
-      return false;
-    }
-  }, [loadActivity, refreshMatter]);
+    setFieldValues(Object.fromEntries(Object.entries(loaded.content.fields).map(([key, field]) => [key, field.value ?? ""])));
+    await loadVersions(draftId);
+  }, [loadVersions]);
 
   const generateForMatter = useCallback(async (target: MatterResponse, existingDraft: DraftResponse | null = null) => {
     setNotice(null);
@@ -786,16 +722,12 @@ export function App() {
     } catch (caught) { setNotice(caught instanceof Error ? caught.message : "Generation failed"); }
   }, [loadActivity, loadDraft, refreshMatter]);
 
-  const openMatter = useCallback(async (matterId: string, shouldReview: boolean) => {
+  const openMatter = useCallback(async (matterId: string) => {
     const loaded = await refreshMatter(matterId);
-    setAutoReview(shouldReview);
-    if (!shouldReview && loaded.activeDraft) await loadDraft(loaded.activeDraft.id);
+    if (loaded.activeDraft) await loadDraft(loaded.activeDraft.id);
+    else await generateForMatter(loaded);
     await loadActivity(matterId);
-  }, [loadActivity, loadDraft, refreshMatter]);
-
-  useEffect(() => {
-    if (matter && autoReview) { setAutoReview(false); void reviewEvidenceForMatter(matter); }
-  }, [autoReview, matter, reviewEvidenceForMatter]);
+  }, [generateForMatter, loadActivity, loadDraft, refreshMatter]);
 
   useEffect(() => {
     if (!draft || !content) return;
@@ -845,14 +777,6 @@ export function App() {
     } catch (caught) { setNotice(caught instanceof Error ? caught.message : "Source page could not be loaded"); }
   };
 
-  const focusTemplateParagraph = (paragraphIndex: number) => {
-    const block = content?.sections.flatMap((section) => section.blocks)
-      .find((candidate) => candidate.templateParagraphIndex === paragraphIndex);
-    if (!block) return;
-    setActiveBlockId(block.id);
-    window.setTimeout(() => document.querySelector(`[aria-label="Editable paragraph ${CSS.escape(block.id)}"]`)?.scrollIntoView({ behavior: "smooth", block: "center" }), 0);
-  };
-
   const addEvidence = async (files: File[]) => {
     if (!matter || !files.length) return;
     setAddingEvidence(true); setNotice(null);
@@ -861,8 +785,9 @@ export function App() {
       const refreshed = await refreshMatter(matter.id);
       if (draft) await loadDraft(draft.id);
       setTab("review");
-      setNotice(`Added ${files.length} evidence ${files.length === 1 ? "file" : "files"}. This draft is now stale; review the updated sources, then regenerate.`);
-      await reviewEvidenceForMatter(refreshed);
+      setNotice(`Added ${files.length} evidence ${files.length === 1 ? "file" : "files"}. Regenerating from the complete updated packet.`);
+      if (draft) await generateForMatter(refreshed, draft);
+      else await generateForMatter(refreshed);
       await loadActivity(matter.id);
     } catch (caught) { setNotice(caught instanceof Error ? caught.message : "Evidence could not be added"); }
     finally { setAddingEvidence(false); }
@@ -876,14 +801,6 @@ export function App() {
       sections: current.sections.map((section) => ({
         ...section, blocks: section.blocks.map((block) => block.id === blockId ? { ...block, text } : block),
       })),
-    }) : current);
-    setDraft((current) => current ? ({
-      ...current,
-      readiness: {
-        ...current.readiness,
-        ready: false,
-        blockIds: current.readiness.blockIds.includes(blockId) ? current.readiness.blockIds : [...current.readiness.blockIds, blockId],
-      },
     }) : current);
   };
 
@@ -901,7 +818,8 @@ export function App() {
       const saved = await api<DraftResponse>(`/api/drafts/${draft.id}`, {
         method: "PUT", body: JSON.stringify({ version: draft.version, content: nextContent }),
       });
-      setDraft(saved); setContent(saved.content); setNotice(`Draft v${saved.version} saved`);
+      setUndoVersion(draft.version); setDraft(saved); setContent(saved.content); setNotice(`Draft v${saved.version} saved`);
+      await loadVersions(draft.id);
       if (matter) await loadActivity(matter.id);
     } catch (caught) { setNotice(caught instanceof Error ? caught.message : "Direct edit could not be saved"); }
   };
@@ -916,11 +834,7 @@ export function App() {
 
   const sendRefinement = async () => {
     if (!draft || !content || !instruction.trim() || proposal) return;
-    const context = annotations.length ? annotations : activeBlock && activeBlock.templateRole !== "keep" ? [{ blockId: activeBlock.id, quote: activeBlock.text, start: 0, end: activeBlock.text.length }] : [];
-    if (!context.length && activeBlock?.templateRole === "keep") {
-      setNotice("Keep language is locked to the confirmed template map. Select text in a Replace block to refine it.");
-      return;
-    }
+    const context = annotations.length ? annotations : activeBlock ? [{ blockId: activeBlock.id, quote: activeBlock.text, start: 0, end: activeBlock.text.length }] : [];
     if (!context.length) return;
     const requestText = instruction.trim();
     setMessages((current) => [...current, { role: "user", text: requestText, annotationCount: context.length }]);
@@ -941,8 +855,11 @@ export function App() {
     try {
       const result = await api<{ draft?: DraftResponse }>(`/api/proposals/${proposal.id}/${resolution}`, { method: "POST", body: "{}" });
       if (result.draft) {
+        setUndoVersion(draft?.version ?? null);
         setDraft(result.draft); setContent(result.draft.content);
-        setFieldValues(Object.fromEntries(Object.entries(result.draft.content.fields).map(([key, field]) => [key, field.value])));
+        setFieldValues(Object.fromEntries(Object.entries(result.draft.content.fields).map(([key, field]) => [key, field.value ?? ""])));
+        setNotice(`AI proposal accepted in draft v${result.draft.version}.`);
+        await loadVersions(result.draft.id);
       }
       setMessages((current) => [...current, { role: "assistant", text: resolution === "accept" ? `Applied. The draft is now v${result.draft?.version ?? draft?.version}.` : "Discarded. The draft was not changed." }]);
       setProposal(null); if (matter) await loadActivity(matter.id);
@@ -955,40 +872,10 @@ export function App() {
       const saved = await api<DraftResponse>(`/api/drafts/${draft.id}/fields/confirm`, {
         method: "POST", body: JSON.stringify({ version: draft.version, key, value: fieldValues[key] }),
       });
-      setDraft(saved); setContent(saved.content);
-      setFieldValues(Object.fromEntries(Object.entries(saved.content.fields).map(([fieldKey, field]) => [fieldKey, field.value])));
-      setNotice(`Field confirmed in draft v${saved.version}`); if (matter) await loadActivity(matter.id);
+      setUndoVersion(draft.version); setDraft(saved); setContent(saved.content);
+      setFieldValues(Object.fromEntries(Object.entries(saved.content.fields).map(([fieldKey, field]) => [fieldKey, field.value ?? ""])));
+      setNotice(`Field saved in draft v${saved.version}`); await loadVersions(saved.id); if (matter) await loadActivity(matter.id);
     } catch (caught) { setNotice(caught instanceof Error ? caught.message : "Field could not be confirmed"); }
-  };
-
-  const confirmDraftBlock = async (note: string) => {
-    if (!draft || !confirmingBlock) return;
-    setConfirmingBlockBusy(true);
-    try {
-      const saved = await api<DraftResponse>(`/api/drafts/${draft.id}/blocks/${encodeURIComponent(confirmingBlock.id)}/confirm`, {
-        method: "POST",
-        body: JSON.stringify({ version: draft.version, text: confirmingBlock.text, note }),
-      });
-      setDraft(saved); setContent(saved.content); setConfirmingBlock(null);
-      setNotice(`Paragraph confirmed in draft v${saved.version}`);
-      if (matter) await loadActivity(matter.id);
-    } catch (caught) { setNotice(caught instanceof Error ? caught.message : "Paragraph could not be confirmed"); }
-    finally { setConfirmingBlockBusy(false); }
-  };
-
-  const setPreGenerationOmission = async (targetId: string, action: "omit" | "clear") => {
-    if (!matter) return;
-    setResolvingTargetId(targetId); setNotice(null);
-    try {
-      await api(`/api/matters/${matter.id}/review-resolutions/${encodeURIComponent(targetId)}`, {
-        method: "PUT",
-        body: JSON.stringify({ action, sourceFingerprint: matter.sourceFingerprint }),
-      });
-      await refreshMatter(matter.id);
-      setNotice(action === "omit" ? "Omission approved for this matter and current evidence set." : "Omission approval cleared.");
-      await loadActivity(matter.id);
-    } catch (caught) { setNotice(caught instanceof Error ? caught.message : "The omission decision could not be saved"); }
-    finally { setResolvingTargetId(null); }
   };
 
   const confirmOutcome = async (outcomeId: string) => {
@@ -998,11 +885,35 @@ export function App() {
       const saved = await api<DraftResponse>(`/api/drafts/${draft.id}/outcomes/${encodeURIComponent(outcomeId)}/confirm`, {
         method: "POST", body: JSON.stringify({ version: draft.version }),
       });
-      setDraft(saved); setContent(saved.content); setTab("review");
+      setUndoVersion(draft.version); setDraft(saved); setContent(saved.content); setTab("review");
       setNotice(`Omission confirmed in audited draft v${saved.version}.`);
+      await loadVersions(saved.id);
       await Promise.all([refreshMatter(matter.id), loadActivity(matter.id)]);
     } catch (caught) { setNotice(caught instanceof Error ? caught.message : "The omission could not be confirmed"); }
     finally { setConfirmingOutcomeId(null); }
+  };
+
+  const restoreVersion = async (restoreVersionNumber: number) => {
+    if (!draft) return;
+    try {
+      const saved = await api<DraftResponse>(`/api/drafts/${draft.id}/restore`, {
+        method: "POST", body: JSON.stringify({ currentVersion: draft.version, restoreVersion: restoreVersionNumber }),
+      });
+      setUndoVersion(draft.version); setDraft(saved); setContent(saved.content);
+      setFieldValues(Object.fromEntries(Object.entries(saved.content.fields).map(([key, field]) => [key, field.value ?? ""])));
+      setNotice(`Restored version ${restoreVersionNumber} as draft v${saved.version}.`);
+      await loadVersions(saved.id);
+      if (matter) await loadActivity(matter.id);
+    } catch (caught) { setNotice(caught instanceof Error ? caught.message : "Draft version could not be restored"); }
+  };
+
+  const renameMatter = async () => {
+    if (!matter || !matterName.trim() || matterName.trim() === matter.name) { setRenamingMatter(false); return; }
+    try {
+      const updated = await api<MatterResponse>(`/api/matters/${matter.id}`, { method: "PATCH", body: JSON.stringify({ name: matterName.trim() }) });
+      setMatter((current) => current ? { ...current, name: updated.name } : current);
+      setMatterName(updated.name); setRenamingMatter(false); await loadActivity(matter.id);
+    } catch (caught) { setNotice(caught instanceof Error ? caught.message : "Matter could not be renamed"); }
   };
 
   const focusReviewTarget = (targetId: string, outcomeId?: string) => {
@@ -1022,51 +933,54 @@ export function App() {
   const proposedByBlock = new Map<string, RefinementEdit[]>();
   proposal?.proposal.edits.forEach((edit) => proposedByBlock.set(edit.blockId, [...(proposedByBlock.get(edit.blockId) ?? []), edit]));
   const visibleSections = content?.sections.slice(0, revealedSections) ?? [];
-  const fieldEntries = Object.entries(content?.fields ?? {});
-  const unconfirmedFields = fieldEntries.filter(([, field]) => !field.userConfirmed && (!field.verified || (field.confidence ?? 1) < 0.8));
   const readiness = draft?.readiness ?? null;
   const exportBlocked = !readiness?.ready;
-  const blockingReviewFlagIds = new Set(readiness?.blockingReviewFlagIds ?? []);
   const jobActive = job?.status === "queued" || job?.status === "processing";
   const generationActive = jobActive && job?.jobType === "generation";
-  const reviewActive = jobActive && job?.jobType === "evidence_review";
-  const targetById = new Map(matter.generationTargets.map((target) => [target.id, target]));
-  const resolvedTargetIds = new Set(matter.reviewResolutions.map((resolution) => resolution.targetId));
-  const preflightTargetIds = [...new Set((matter.evidenceReview?.reviewFlags ?? [])
-    .filter((flag) => flag.kind === "missing_evidence" || flag.severity === "blocking")
-    .flatMap((flag) => flag.affectedTargetIds))]
-    .filter((targetId) => targetById.has(targetId));
-  const unresolvedOutcomes = content?.outcomes.filter((outcome) => outcome.status === "omitted_no_evidence" && outcome.resolution === "unresolved") ?? [];
-  const resolvedOutcomes = content?.outcomes.filter((outcome) => outcome.status !== "generated" && outcome.resolution !== "unresolved") ?? [];
-  const verificationFlags = content?.reviewFlags.filter((flag) => flag.severity === "verification") ?? [];
-  const informationalFlags = content?.reviewFlags.filter((flag) => flag.severity === "informational") ?? [];
-  const blockedBlocks = content?.sections.flatMap((section) => section.blocks).filter((block) => readiness?.blockIds.includes(block.id)) ?? [];
-  const blockingCount = (readiness?.blockIds.length ?? 0) + (readiness?.fieldKeys.length ?? 0) + (readiness?.outcomeIds.length ?? 0)
-    + (readiness?.staleEvidence ? 1 : 0) + (readiness?.staleResolutionTargetIds.length ?? 0);
+  const targetById = new Map((draft?.targets ?? []).map((target) => [target.id, target]));
+  const confirmedOmissions = new Set(content?.confirmedOmissionTargetIds ?? []);
+  const unresolvedOutcomes = content?.outcomes.filter((outcome) => outcome.status === "omitted" && !confirmedOmissions.has(outcome.targetId)) ?? [];
+  const blockingCount = (readiness?.fieldKeys.length ?? 0) + (readiness?.omittedTargetIds.length ?? 0)
+    + (readiness?.staleEvidence ? 1 : 0) + (readiness?.duplicateParagraphIndexes.length ?? 0) + (readiness?.imageIssue ? 1 : 0);
+  const blockerDescriptions = [
+    readiness?.omittedTargetIds.length
+      ? `${readiness.omittedTargetIds.length} unresolved ${readiness.omittedTargetIds.length === 1 ? "omission" : "omissions"}`
+      : null,
+    readiness?.fieldKeys.length
+      ? `${readiness.fieldKeys.length} missing ${readiness.fieldKeys.length === 1 ? "field" : "fields"}`
+      : null,
+    readiness?.staleEvidence ? "evidence was added after this version" : null,
+    readiness?.duplicateParagraphIndexes.length
+      ? `${readiness.duplicateParagraphIndexes.length} duplicate template ${readiness.duplicateParagraphIndexes.length === 1 ? "mapping" : "mappings"}`
+      : null,
+    readiness?.imageIssue ?? null,
+  ].filter((description): description is string => Boolean(description));
 
   const reviewContent = content && draft ? <>
     <div className="review-panel-summary">
       <div><p className="eyebrow">Draft readiness</p><strong>{readiness?.ready ? "Ready for export" : `${blockingCount} blocking ${blockingCount === 1 ? "item" : "items"}`}</strong></div>
       <span className={readiness?.ready ? "ready" : "blocked"}>{readiness?.ready ? <Check size={14} /> : <CircleAlert size={14} />}</span>
     </div>
-    <section className="review-card-group blocking-group">
+    {blockingCount > 0 ? <section className="review-card-group blocking-group">
       <div className="review-group-title"><span>Blocking</span><b>{blockingCount}</b></div>
       {readiness?.staleEvidence && <article className="workbench-review-card blocking">
         <div className="review-card-label"><CircleAlert size={14} /><span>Evidence changed</span></div>
         <h3>This draft predates the current source set</h3>
         <p>Review the updated sources and regenerate. Earlier omission approvals are not silently carried forward.</p>
-        <button className="primary" disabled={generationActive || reviewActive} onClick={() => void generateForMatter(matter, draft)}><RotateCcw size={13} /> Regenerate v{draft.version + 1}</button>
+        <button className="primary" disabled={generationActive} onClick={() => void generateForMatter(matter, draft)}><RotateCcw size={13} /> Regenerate v{draft.version + 1}</button>
       </article>}
       {unresolvedOutcomes.map((outcome) => {
         const target = targetById.get(outcome.targetId);
         return <article data-review-item={outcome.id} className={`workbench-review-card blocking ${activeReviewItemId === outcome.id ? "selected" : ""}`} key={outcome.id} onClick={() => focusReviewTarget(outcome.targetId, outcome.id)}>
-          <div className="review-card-label"><CircleAlert size={14} /><span>No supporting evidence</span></div>
-          <h3>{target?.section || `${outcome.targetKind[0]!.toUpperCase()}${outcome.targetKind.slice(1)} content was omitted`}</h3>
+          <div className="review-card-label"><CircleAlert size={14} /><span>Omitted during generation</span></div>
+          <h3>{target?.label || "Unlabeled template section"}</h3>
+          {target?.exemplarExcerpt && <blockquote className="review-exemplar">“{target.exemplarExcerpt}”</blockquote>}
           <p>{outcome.note || "Generation found no support for this mapped target, so no template matter content was copied into the draft."}</p>
+          {outcome.citations.map((citation, index) => <button className="source-link" key={`${citation.sourceId}-${citation.page}-${index}`} onClick={(event) => { event.stopPropagation(); void showReviewCitation(citation); }}>{citation.sourceName} · p. {citation.page}</button>)}
           <div className="review-card-meta"><span>{outcome.exemplarCount} template {outcome.exemplarCount === 1 ? "block" : "blocks"}</span><span>0 generated</span></div>
           <div className="review-card-actions">
-            <label className="secondary file-action"><input type="file" accept=".pdf,image/*" multiple onChange={(event) => { event.stopPropagation(); if (event.target.files) void addEvidence([...event.target.files]); event.currentTarget.value = ""; }} /><Upload size={13} /> Add evidence</label>
-            <button className="primary" disabled={confirmingOutcomeId === outcome.id} onClick={(event) => { event.stopPropagation(); void confirmOutcome(outcome.id); }}>{confirmingOutcomeId === outcome.id ? <LoaderCircle className="spin" size={13} /> : <Check size={13} />} Approve omission</button>
+            <label className="secondary file-action"><input type="file" accept=".pdf,image/*" multiple onChange={(event) => { event.stopPropagation(); if (event.target.files) void addEvidence([...event.target.files]); event.currentTarget.value = ""; }} /><Upload size={13} /> Add evidence and regenerate</label>
+            <button className="primary" disabled={confirmingOutcomeId === outcome.id} onClick={(event) => { event.stopPropagation(); void confirmOutcome(outcome.id); }}>{confirmingOutcomeId === outcome.id ? <LoaderCircle className="spin" size={13} /> : <Check size={13} />} Confirm omission</button>
           </div>
         </article>;
       })}
@@ -1074,41 +988,24 @@ export function App() {
         const field = content.fields[key];
         if (!field) return null;
         return <article data-review-item={`field:${key}`} className={`workbench-review-card blocking ${activeReviewItemId === `field:${key}` ? "selected" : ""}`} key={key} onClick={() => setActiveReviewItemId(`field:${key}`)}>
-          <div className="review-card-label"><CircleAlert size={14} /><span>Field verification</span></div>
+          <div className="review-card-label"><CircleAlert size={14} /><span>Missing field</span></div>
           <h3>{field.label ?? key.replaceAll("_", " ")}</h3>
-          <label className="review-field-input"><input value={fieldValues[key] ?? field.value} onChange={(event) => setFieldValues((current) => ({ ...current, [key]: event.target.value }))} /><small>{field.sourceLabel ?? "No supporting source was found"}</small></label>
-          <button className="primary" onClick={(event) => { event.stopPropagation(); void confirmField(key); }}><Check size={13} /> Confirm field</button>
+          <p>{field.note}</p>
+          {field.citations.map((citation, index) => <button className="source-link" key={`${citation.sourceId}-${citation.page}-${index}`} onClick={(event) => { event.stopPropagation(); void showReviewCitation(citation); }}>{citation.sourceName} · p. {citation.page}</button>)}
+          <label className="review-field-input"><input value={fieldValues[key] ?? ""} onChange={(event) => setFieldValues((current) => ({ ...current, [key]: event.target.value }))} /><small>Entering a value records the attorney's approval.</small></label>
+          <button className="primary" onClick={(event) => { event.stopPropagation(); void confirmField(key); }}><Check size={13} /> Save value</button>
         </article>;
       })}
-      {blockedBlocks.map((block) => <article data-review-item={block.id} className={`workbench-review-card blocking ${activeReviewItemId === block.id ? "selected" : ""}`} key={block.id} onClick={() => { setActiveReviewItemId(block.id); setActiveBlockId(block.id); window.setTimeout(() => document.querySelector(`[data-draft-block="${CSS.escape(block.id)}"]`)?.scrollIntoView({ behavior: "smooth", block: "center" }), 0); }}>
-        <div className="review-card-label"><CircleAlert size={14} /><span>Unverified draft text</span></div>
-        <h3>Review edited content</h3><p>{block.text}</p>
-        <button className="secondary" onClick={(event) => { event.stopPropagation(); setConfirmingBlock(block); }}><Check size={13} /> Confirm reviewed text</button>
-      </article>)}
-      {!blockingCount && <div className="review-clear"><Check size={16} /><span>No unresolved export blockers.</span></div>}
-    </section>
-    <section className="review-card-group">
-      <div className="review-group-title"><span>Needs verification</span><b>{verificationFlags.length + content.warnings.length}</b></div>
-      {content.warnings.map((warning) => <article className="workbench-review-card verification" key={warning}><div className="review-card-label"><CircleAlert size={14} /><span>Generation warning</span></div><p>{warning}</p></article>)}
-      {verificationFlags.map((flag) => <article className="workbench-review-card verification" key={flag.id}><div className="review-card-label"><CircleAlert size={14} /><span>Source check</span></div><h3>{flag.summary}</h3><p>{flag.explanation}</p>{flag.citations.map((citation, index) => <button className="source-link" key={`${citation.sourceId}-${index}`} onClick={() => void showReviewCitation(citation)}>{citation.sourceName} · p. {citation.page}</button>)}</article>)}
-      {!verificationFlags.length && !content.warnings.length && <p className="review-group-empty">No additional verification items.</p>}
-    </section>
-    <section className="review-card-group informational-group">
-      <div className="review-group-title"><span>Informational</span><b>{resolvedOutcomes.length + informationalFlags.length}</b></div>
-      {resolvedOutcomes.map((outcome) => <article data-review-item={outcome.id} className={`workbench-review-card informational ${activeReviewItemId === outcome.id ? "selected" : ""}`} key={outcome.id} onClick={() => focusReviewTarget(outcome.targetId, outcome.id)}>
-        <div className="review-card-label"><Check size={14} /><span>{outcome.resolution === "preapproved" ? "Pre-approved omission" : outcome.resolution === "confirmed" ? "Confirmed omission" : "Not applicable"}</span></div>
-        <h3>{targetById.get(outcome.targetId)?.section || `${outcome.targetKind} target`}</h3><p>{outcome.note || "This outcome does not block export."}</p>
-      </article>)}
-      {informationalFlags.map((flag) => <article className="workbench-review-card informational" key={flag.id}><div className="review-card-label"><Check size={14} /><span>Information</span></div><h3>{flag.summary}</h3><p>{flag.explanation}</p></article>)}
-      {!resolvedOutcomes.length && !informationalFlags.length && <p className="review-group-empty">No informational outcomes.</p>}
-    </section>
+    </section> : <div className="review-clear"><Check size={16} /><span>Ready to export</span></div>}
   </> : <p className="panel-empty">Generate a draft to open the review workbench.</p>;
 
   return (
     <div className="workspace-app">
       <header className="app-header workspace-header">
         <div className="wordmark">Steno <span>Demand Letter Studio</span></div>
-        <div className="matter-breadcrumb"><span>/</span><strong>{matter.name}</strong>{draft && <i>Draft v{draft.version}</i>}</div>
+        <div className="matter-breadcrumb"><span>/</span>{renamingMatter
+          ? <input autoFocus value={matterName} onChange={(event) => setMatterName(event.target.value)} onBlur={() => void renameMatter()} onKeyDown={(event) => { if (event.key === "Enter") void renameMatter(); if (event.key === "Escape") { setMatterName(matter.name); setRenamingMatter(false); } }} />
+          : <button className="matter-name-button" onClick={() => setRenamingMatter(true)} title="Rename matter">{matter.name}</button>}{draft && <i>Draft v{draft.version}</i>}</div>
         <div className="workspace-actions"><span className="single-user"><b>FR</b> Single-user v1</span>{draft && (exportBlocked
           ? <button className="export-button export-blocked" aria-disabled="true" title="Open Review to resolve all server-reported readiness items" onClick={() => { setTab("review"); setNotice(`Word export is blocked by ${blockingCount} review ${blockingCount === 1 ? "item" : "items"}.`); }}><CircleAlert size={15} /> {blockingCount} blocking · Review</button>
           : <a className="export-button" href={`/api/drafts/${draft.id}/export.docx`}><Download size={15} /> Export to Word</a>)}</div>
@@ -1120,7 +1017,7 @@ export function App() {
         </aside>
 
         <main className="letter-workspace">
-          {!content && job?.jobType === "generation" && <section className="generation-state">
+          {!content && <section className="generation-state">
             <div className="generation-glyph"><LoaderCircle className={job?.status !== "failed" ? "spin" : ""} size={28} /></div>
             <p className="eyebrow">{job?.status === "failed" ? "Generation stopped" : "Drafting in progress"}</p>
             <h1>{job?.step ?? "Preparing the drafting job"}</h1>
@@ -1129,51 +1026,18 @@ export function App() {
             {job?.status === "failed" && <button className="secondary" onClick={() => void generateForMatter(matter)}>Try again</button>}
           </section>}
 
-          {!content && job?.jobType !== "generation" && <section className="evidence-review-stage">
-            <div className="review-stage-heading"><span className="generation-glyph">{reviewActive ? <LoaderCircle className="spin" size={27} /> : <Sparkles size={27} />}</span><div><p className="eyebrow">Evidence review</p><h1>{reviewActive ? job?.step ?? "Reviewing source coverage" : "Review the source packet before drafting"}</h1></div></div>
-            {reviewActive && <><p>AI is checking the reviewed template against the uploaded source pages. The result is advisory and non-exhaustive.</p><div className="progress-track"><span style={{ width: `${job?.progress ?? 4}%` }} /></div><strong>{job?.progress ?? 4}%</strong></>}
-            {!reviewActive && job?.status === "failed" && <div className="error-banner"><CircleAlert size={16} />{job.error ?? "Evidence review failed"}</div>}
-            {!reviewActive && matter.evidenceReview && !matter.evidenceReviewStale && <>
-              <div className="review-disclaimer"><CircleAlert size={16} /><span>This AI-assisted review proposes grounded fields and highlights potential source issues. Warnings do not block generation, and the review does not determine completeness, authenticity, admissibility, or legal validity.</span></div>
-              {(matter.evidenceReview.fieldProposals?.length ?? 0) > 0 && <div className="field-proposal-list">
-                {matter.evidenceReview.fieldProposals!.map((proposal) => <div key={`${proposal.fieldKey}-${proposal.sourceId}-${proposal.page}`}><span>{proposal.fieldKey.replaceAll("_", " ")}</span><strong>{proposal.value}</strong><small>{proposal.sourceName} · p. {proposal.page} · {Math.round(proposal.confidence * 100)}%</small></div>)}
-              </div>}
-              <ReviewFlagList flags={matter.evidenceReview.reviewFlags} onCitation={(citation) => void showReviewCitation(citation)} />
-              {preflightTargetIds.length > 0 && <section className="preflight-targets">
-                <div className="preflight-target-title"><p className="eyebrow">Missing-evidence targets</p><span>Resolve now or continue with export-blocking omissions.</span></div>
-                {preflightTargetIds.map((targetId) => {
-                  const target = targetById.get(targetId)!;
-                  const resolved = resolvedTargetIds.has(targetId);
-                  return <article className={resolved ? "resolved" : ""} key={targetId}>
-                    <div><strong>{target.section || `${target.kind[0]!.toUpperCase()}${target.kind.slice(1)} target`}</strong><small>{target.kind} · {target.exemplarCount} mapped {target.exemplarCount === 1 ? "block" : "blocks"}</small></div>
-                    {resolved
-                      ? <button className="secondary" disabled={resolvingTargetId === targetId} onClick={() => void setPreGenerationOmission(targetId, "clear")}><RotateCcw size={13} /> Undo omission</button>
-                      : <><label className="secondary file-action"><input type="file" accept=".pdf,image/*" multiple onChange={(event) => { if (event.target.files) void addEvidence([...event.target.files]); event.currentTarget.value = ""; }} /><Upload size={13} /> Add evidence</label><button className="secondary" disabled={resolvingTargetId === targetId} onClick={() => void setPreGenerationOmission(targetId, "omit")}>{resolvingTargetId === targetId ? <LoaderCircle className="spin" size={13} /> : <Check size={13} />} Omit for this matter</button><button className="link-action" onClick={() => void generateForMatter(matter)}>Continue unresolved</button></>}
-                  </article>;
-                })}
-              </section>}
-            </>}
-            {!reviewActive && <div className="preflight-actions">
-              <label className="secondary file-action"><input type="file" accept=".pdf,image/*" multiple onChange={(event) => { if (event.target.files) void addEvidence([...event.target.files]); event.currentTarget.value = ""; }} /><Upload size={15} /> Add evidence</label>
-              {matter.evidenceReview && !matter.evidenceReviewStale
-                ? <button className="primary" onClick={() => void generateForMatter(matter)}><Sparkles size={15} /> Generate attorney-review draft</button>
-                : <button className="primary" onClick={() => void reviewEvidenceForMatter(matter)}><RotateCcw size={15} /> {job?.status === "failed" ? "Try review again" : "Review evidence"}</button>}
-            </div>}
-          </section>}
-
           {content && <div className="letter-scroll">
             {generationActive && <div className="job-banner"><LoaderCircle className="spin" size={16} /><span>{job?.step ?? "Regenerating draft"} · {job?.progress ?? 0}%</span></div>}
-            {reviewActive && <div className="job-banner"><LoaderCircle className="spin" size={16} /><span>{job?.step ?? "Reviewing updated evidence"} · {job?.progress ?? 0}%</span></div>}
-            {readiness && !readiness.ready && <div className="confidence-banner"><CircleAlert size={17} /><span>Word export is locked by the server: {blockingCount} blocking {blockingCount === 1 ? "item" : "items"} ({readiness.outcomeIds.length} unresolved {readiness.outcomeIds.length === 1 ? "omission" : "omissions"}, {readiness.blockIds.length} draft {readiness.blockIds.length === 1 ? "region" : "regions"}, {readiness.fieldKeys.length} template {readiness.fieldKeys.length === 1 ? "field" : "fields"}){readiness.staleEvidence ? "; evidence was added after this version" : ""}.</span></div>}
-            {notice && <div className="workspace-notice">{notice}<button onClick={() => setNotice(null)}><X size={13} /></button></div>}
+            {readiness && !readiness.ready && <div className="confidence-banner"><CircleAlert size={17} /><span>Word export is locked by {blockingCount} review {blockingCount === 1 ? "item" : "items"}: {blockerDescriptions.join("; ")}.</span></div>}
+            {notice && <div className="workspace-notice">{notice}{undoVersion !== null && draft && <button className="notice-undo" onClick={() => { const target = undoVersion; setUndoVersion(null); void restoreVersion(target); }}><RotateCcw size={13} /> Undo</button>}<button onClick={() => { setNotice(null); setUndoVersion(null); }}><X size={13} /></button></div>}
             <article className="letter-paper">
               <div className="letterhead"><strong>{content.title}</strong><span>Attorney-review draft · generated from the confirmed template map</span></div>
               {content.outcomes.filter((outcome) => outcome.status !== "generated").map((outcome) => <button
-                className={`document-outcome-marker ${outcome.resolution === "unresolved" ? "blocking" : "resolved"} ${activeReviewItemId === outcome.id ? "selected" : ""}`}
+                className={`document-outcome-marker ${confirmedOmissions.has(outcome.targetId) ? "resolved" : "blocking"} ${activeReviewItemId === outcome.id ? "selected" : ""}`}
                 data-outcome-marker={outcome.id}
                 key={outcome.id}
                 onClick={() => { focusReviewTarget(outcome.targetId, outcome.id); window.setTimeout(() => document.querySelector(`[data-review-item="${CSS.escape(outcome.id)}"]`)?.scrollIntoView({ behavior: "smooth", block: "center" }), 0); }}
-              ><span>{outcome.resolution === "unresolved" ? <CircleAlert size={12} /> : <Check size={12} />}</span>{targetById.get(outcome.targetId)?.section || `${outcome.targetKind} content`} omitted</button>)}
+              ><span>{confirmedOmissions.has(outcome.targetId) ? <Check size={12} /> : <CircleAlert size={12} />}</span>{targetById.get(outcome.targetId)?.label || "Template content"} omitted</button>)}
               {visibleSections.map((section) => <section className="draft-section fade-up" key={section.id}>
                 {section.heading && <h2>{section.heading}</h2>}
                 {section.blocks.map((block) => {
@@ -1184,20 +1048,14 @@ export function App() {
                     active={activeBlockId === block.id}
                     citationNumbers={numbers}
                     edits={proposedByBlock.get(block.id) ?? []}
-                    disabled={generationActive || block.locked === true}
+                    disabled={generationActive}
                     onFocus={() => {
                       setActiveBlockId(block.id);
-                      if (!block.verified || block.outcomeId) {
-                        const reviewId = !block.verified ? block.id : block.outcomeId!;
-                        setActiveReviewItemId(reviewId); setTab("review");
-                        window.setTimeout(() => document.querySelector(`[data-review-item="${CSS.escape(reviewId)}"]`)?.scrollIntoView({ behavior: "smooth", block: "center" }), 0);
-                      }
                     }}
                     onChange={(text) => updateBlock(block.id, text)}
                     onBlur={(text) => void saveBlock(block.id, text)}
                     onCitation={(index) => void showCitation(block.id, index)}
                     onSelect={setSelection}
-                    onConfirm={() => setConfirmingBlock(block)}
                   />;
                 })}
               </section>)}
@@ -1213,11 +1071,12 @@ export function App() {
         <RefinePanel
           tab={tab} setTab={setTab} messages={messages} activity={activity} annotations={annotations}
           instruction={instruction} proposal={proposal} thinking={thinking} activeBlock={activeBlock}
-          reviewContent={reviewContent}
+          reviewContent={reviewContent} versions={versions}
           onInstruction={setInstruction}
           onRemoveAnnotation={(index) => setAnnotations((current) => current.filter((_annotation, candidate) => candidate !== index))}
           onSend={() => void sendRefinement()}
           onResolve={(resolution) => void resolveProposal(resolution)}
+          onRestore={(version) => void restoreVersion(version)}
         />
 
         {sourcesOpen && <>
@@ -1226,10 +1085,10 @@ export function App() {
             <div className="drawer-head"><div><p className="eyebrow">Source materials</p><strong>{matter.sources.length} real documents</strong></div><button className="icon-button" onClick={() => setSourcesOpen(false)}><X size={17} /></button></div>
             <div className="source-template-card"><small>Reviewed template</small><strong>Firm DOCX template</strong></div>
             <div className="drawer-evidence-actions">
-              <label className={`secondary file-action ${addingEvidence || generationActive ? "disabled" : ""}`}><input type="file" accept=".pdf,image/*" multiple disabled={addingEvidence || generationActive} onChange={(event) => { if (event.target.files) void addEvidence([...event.target.files]); event.currentTarget.value = ""; }} />{addingEvidence ? <LoaderCircle className="spin" size={14} /> : <Upload size={14} />} Add evidence</label>
-              {draft && matter.evidenceReview && !matter.evidenceReviewStale && <button className="primary regenerate-button" disabled={generationActive || reviewActive || addingEvidence} onClick={() => void generateForMatter(matter, draft)}>{generationActive ? <LoaderCircle className="spin" size={14} /> : <RotateCcw size={14} />} Regenerate v{draft.version + 1}</button>}
+              <label className={`secondary file-action ${addingEvidence || generationActive ? "disabled" : ""}`}><input type="file" accept=".pdf,image/*" multiple disabled={addingEvidence || generationActive} onChange={(event) => { if (event.target.files) void addEvidence([...event.target.files]); event.currentTarget.value = ""; }} />{addingEvidence ? <LoaderCircle className="spin" size={14} /> : <Upload size={14} />} Add evidence and regenerate</label>
+              {draft && <button className="primary regenerate-button" disabled={generationActive || addingEvidence} onClick={() => void generateForMatter(matter, draft)}>{generationActive ? <LoaderCircle className="spin" size={14} /> : <RotateCcw size={14} />} Regenerate v{draft.version + 1}</button>}
             </div>
-            {draft?.readiness.staleEvidence && <div className="drawer-stale"><CircleAlert size={14} />This draft predates the current source set. Complete the review, then regenerate before export.</div>}
+            {draft?.readiness.staleEvidence && <div className="drawer-stale"><CircleAlert size={14} />This draft predates the current source set. Regenerate before export.</div>}
             <div className="drawer-sources">{matter.sources.map((source) => {
               const active = activeCitation?.sourceId === source.id;
               return <button className={`drawer-source ${active ? "active" : ""}`} key={source.id} onClick={() => {
@@ -1251,7 +1110,6 @@ export function App() {
         </>}
       </div>
       {selection && <button className="add-to-chat" style={{ left: selection.x, top: selection.y }} onMouseDown={(event) => event.preventDefault()} onClick={addAnnotation}>Add to chat ↗</button>}
-      {confirmingBlock && <ConfirmBlockModal block={confirmingBlock} busy={confirmingBlockBusy} onCancel={() => setConfirmingBlock(null)} onConfirm={(note) => void confirmDraftBlock(note)} />}
     </div>
   );
 }

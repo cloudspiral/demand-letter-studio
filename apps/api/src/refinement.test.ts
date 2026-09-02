@@ -1,98 +1,99 @@
 import { describe, expect, it } from "vitest";
 import { RefinementProposalSchema, type GeneratedDraft } from "@steno/contracts";
-import { applyDirectDraftEdits, applyRefinementProposal, confirmDraftBlock, validateProposalTargets } from "./refinement";
+import { applyDirectDraftEdits, applyRefinementProposal, validateProposalTargets } from "./refinement";
 
 const content: GeneratedDraft = {
-  title: "Demand", matterName: "Canary", fields: {}, warnings: [], reviewFlags: [], outcomes: [],
+  title: "Demand",
+  fields: {},
+  outcomes: [],
+  confirmedOmissionTargetIds: [],
   sections: [{ id: "facts", heading: null, blocks: [
-    { id: "one", kind: "paragraph", text: "This is very clear.", templateParagraphIndex: 1, citations: [], verified: true },
-    { id: "two", kind: "paragraph", text: "This is very concise.", templateParagraphIndex: 2, citations: [], verified: true },
+    { id: "one", kind: "heading", text: "DAMAGES", templateParagraphIndex: 1, templateBlockId: "word/document.xml:p:1", citations: [], attorneyEdited: false },
+    { id: "two", kind: "paragraph", text: "This is very concise.", templateParagraphIndex: 2, templateBlockId: "word/document.xml:p:2", citations: [], attorneyEdited: false },
   ] }],
 };
 
-describe("atomic refinement proposals", () => {
-  it("applies multiple exact ranges in one immutable draft update", () => {
+describe("attorney-controlled editing", () => {
+  it("applies exact AI ranges to Keep or generated text and treats acceptance as approval", () => {
     const proposal = RefinementProposalSchema.parse({
       edits: [
-        { blockId: "one", targetText: "very ", replacementText: "", start: 8, end: 13 },
+        { blockId: "one", targetText: "DAMAGES", replacementText: "INJURIES AND DAMAGES", start: 0, end: 7 },
         { blockId: "two", targetText: "very ", replacementText: "", start: 8, end: 13 },
       ],
-      summary: "Tightened", citedSourceIds: [],
+      summary: "Tightened the selected text",
+      citedSourceIds: [],
     });
     validateProposalTargets(proposal, [
-      { blockId: "one", quote: "very ", start: 8, end: 13 },
+      { blockId: "one", quote: "DAMAGES", start: 0, end: 7 },
       { blockId: "two", quote: "very ", start: 8, end: 13 },
     ]);
     const result = applyRefinementProposal(content, proposal);
-    expect(result.sections[0]?.blocks.map((block) => block.text)).toEqual(["This is clear.", "This is concise."]);
-    expect(result.sections[0]?.blocks[0]).toMatchObject({ verified: false, userConfirmed: false });
-    expect(content.sections[0]?.blocks[0]?.text).toBe("This is very clear.");
+    expect(result.sections[0]?.blocks).toMatchObject([
+      { text: "INJURIES AND DAMAGES", attorneyEdited: true },
+      { text: "This is concise.", attorneyEdited: true },
+    ]);
+    expect(content.sections[0]?.blocks[0]?.text).toBe("DAMAGES");
   });
 
-  it("rejects a proposal whose range no longer matches", () => {
+  it("rejects an AI proposal whose range no longer matches", () => {
     const proposal = RefinementProposalSchema.parse({
-      edits: [{ blockId: "one", targetText: "wrong", replacementText: "new", start: 8, end: 13 }],
-      summary: "Invalid", citedSourceIds: [],
+      edits: [{ blockId: "two", targetText: "wrong", replacementText: "new", start: 8, end: 13 }],
+      summary: "Invalid",
+      citedSourceIds: [],
     });
     expect(() => applyRefinementProposal(content, proposal)).toThrow(/no longer matches/i);
   });
 
-  it("keeps a direct edit unresolved until explicit attorney confirmation", () => {
+  it("saves direct edits to all existing text without a second confirmation", () => {
     const candidate: GeneratedDraft = {
       ...content,
       sections: [{ ...content.sections[0]!, blocks: content.sections[0]!.blocks.map((block) => (
-        block.id === "one" ? { ...block, text: "Attorney-edited text.", verified: true } : block
+        block.id === "one" ? { ...block, text: "ATTORNEY-EDITED HEADING" } : block
       )) }],
     };
-    const result = applyDirectDraftEdits(content, candidate);
-    expect(result.sections[0]?.blocks[0]).toMatchObject({
-      text: "Attorney-edited text.",
-      verified: false,
-      userConfirmed: false,
+    expect(applyDirectDraftEdits(content, candidate).sections[0]?.blocks[0]).toMatchObject({
+      text: "ATTORNEY-EDITED HEADING",
+      attorneyEdited: true,
     });
   });
 
-  it("rejects structural changes submitted through the direct edit endpoint", () => {
+  it("rejects insertion, deletion, and reordering through direct edits", () => {
     expect(() => applyDirectDraftEdits(content, { ...content, sections: [] })).toThrow(/template structure/i);
-  });
-
-  it("never permits direct or AI edits to confirmed Keep language", () => {
-    const locked: GeneratedDraft = {
+    expect(() => applyDirectDraftEdits(content, {
       ...content,
-      sections: [{ ...content.sections[0]!, blocks: content.sections[0]!.blocks.map((block, index) => index === 0
-        ? { ...block, templateParagraphIndex: null, templateRole: "keep" as const, locked: true }
-        : block) }],
-    };
-    const directCandidate: GeneratedDraft = {
-      ...locked,
-      sections: [{ ...locked.sections[0]!, blocks: locked.sections[0]!.blocks.map((block, index) => index === 0 ? { ...block, text: "Changed keep text." } : block) }],
-    };
-    expect(() => applyDirectDraftEdits(locked, directCandidate)).toThrow(/Keep language/i);
-    const proposal = RefinementProposalSchema.parse({
-      edits: [{ blockId: "one", targetText: "This", replacementText: "That", start: 0, end: 4 }],
-      summary: "Attempted Keep edit", citedSourceIds: [],
-    });
-    expect(() => applyRefinementProposal(locked, proposal)).toThrow(/Keep language/i);
-    expect(() => confirmDraftBlock(locked, "one", "Changed keep text.")).toThrow(/Keep language/i);
+      sections: [{ ...content.sections[0]!, blocks: [...content.sections[0]!.blocks].reverse() }],
+    })).toThrow(/template structure/i);
+    expect(() => applyDirectDraftEdits(content, {
+      ...content,
+      sections: [{ ...content.sections[0]!, blocks: [
+        ...content.sections[0]!.blocks,
+        { ...content.sections[0]!.blocks[1]!, id: "three" },
+      ] }],
+    })).toThrow(/template structure/i);
   });
 
-  it("never resolves a warning merely because its text was edited", () => {
-    const warning: GeneratedDraft = {
+  it("keeps structured row cells synchronized with attorney edits", () => {
+    const structured: GeneratedDraft = {
       ...content,
       sections: [{ ...content.sections[0]!, blocks: [{
-        ...content.sections[0]!.blocks[0]!, kind: "warning", verified: false,
+        ...content.sections[0]!.blocks[1]!,
+        id: "row",
+        kind: "table-row",
+        text: "Hospital · $10.00",
+        structuredCells: ["Hospital", "$10.00"],
+        structuredRowRole: "body",
       }] }],
     };
-    const candidate = {
-      ...warning,
-      sections: [{ ...warning.sections[0]!, blocks: [{ ...warning.sections[0]!.blocks[0]!, text: "Attorney supplied replacement." }] }],
+    const candidate: GeneratedDraft = {
+      ...structured,
+      sections: [{ ...structured.sections[0]!, blocks: [{ ...structured.sections[0]!.blocks[0]!, text: "Clinic · $20.00" }] }],
     };
-    expect(applyDirectDraftEdits(warning, candidate).sections[0]?.blocks[0]).toMatchObject({
-      kind: "warning", verified: false, userConfirmed: false,
+    expect(applyDirectDraftEdits(structured, candidate).sections[0]?.blocks[0]).toMatchObject({
+      text: "Clinic · $20.00",
+      structuredCells: ["Clinic", "$20.00"],
+      attorneyEdited: true,
     });
-    expect(confirmDraftBlock(warning, "one", "Attorney reviewed replacement.").sections[0]?.blocks[0]).toMatchObject({
-      kind: "paragraph", text: "Attorney reviewed replacement.", verified: false, userConfirmed: true,
-    });
-    expect(() => confirmDraftBlock(warning, "missing", "Reviewed.")).toThrow(/not found/i);
+    candidate.sections[0]!.blocks[0]!.text = "Malformed row";
+    expect(() => applyDirectDraftEdits(structured, candidate)).toThrow(/preserve 2 cells/i);
   });
 });

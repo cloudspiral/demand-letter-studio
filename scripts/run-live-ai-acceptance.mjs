@@ -22,9 +22,10 @@ Options:
   --template PATH     DOCX template (required unless --demo)
   --sources DIR       Directory containing 1-10 PDF/image sources (required unless --demo)
   --manifest PATH     Expected facts and forbidden markers JSON
-  --supplemental PATH Add one source after the initial draft, review again, and regenerate the same draft
-  --name LABEL        Matter/case label
+  --supplemental PATH Add one source after the initial draft and regenerate the same draft
+  --name LABEL        Output/report label
   --output DIR        Report, draft, and export directory
+  --job-timeout-ms N  Maximum wait for each queued model job (default: 600000)
   --expect-ready      Require Word export to succeed; otherwise require it to be blocked
   --refine            Run and accept one streamed refinement
   --demo              Use the server's deterministic demo bootstrap`);
@@ -37,7 +38,9 @@ const caseName = option("--name", "Steno live acceptance");
 const demo = has("--demo");
 const expectedReady = has("--expect-ready");
 const runRefinement = has("--refine");
+const jobTimeoutMs = Number(option("--job-timeout-ms", process.env.LIVE_AI_JOB_TIMEOUT_MS ?? "600000"));
 if (!baseUrl) throw new Error("--base-url is required");
+if (!Number.isFinite(jobTimeoutMs) || jobTimeoutMs < 1_000) throw new Error("--job-timeout-ms must be at least 1000");
 if (!demo && (!option("--template") || !option("--sources"))) {
   throw new Error("--template and --sources are required unless --demo is used");
 }
@@ -105,10 +108,12 @@ async function setupMatter() {
   }, [201]);
   const confirmed = await jsonRequest(
     `/api/templates/${uploaded.data.id}/confirm`,
-    jsonInit("POST", { regions: uploaded.data.analysis.regions }),
+    jsonInit("POST", {
+      schemaVersion: 2,
+      blocks: uploaded.data.analysis.blocks?.length ? uploaded.data.analysis.blocks : uploaded.data.analysis.regions,
+    }),
   );
   const matter = await jsonRequest("/api/matters", jsonInit("POST", {
-    name: caseName,
     templateId: confirmed.data.id,
   }), [201]);
   const sourceDir = path.resolve(option("--sources"));
@@ -151,12 +156,12 @@ async function queueAndWait(relative, body, label) {
   const queued = await jsonRequest(relative, jsonInit("POST", body), [202]);
   const firstEventPromise = firstJobEvent(queued.data.jobId);
   let job;
-  for (let attempt = 0; attempt < 360; attempt += 1) {
+  for (let attempt = 0; attempt < Math.ceil(jobTimeoutMs / 500); attempt += 1) {
     job = (await jsonRequest(`/api/jobs/${queued.data.jobId}`)).data;
     if (["completed", "failed"].includes(job.status)) break;
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
-  if (!job || !["completed", "failed"].includes(job.status)) throw new Error(`${label} did not finish within 180 seconds`);
+  if (!job || !["completed", "failed"].includes(job.status)) throw new Error(`${label} did not finish within ${Math.round(jobTimeoutMs / 1_000)} seconds`);
   if (job.status !== "completed") throw new Error(`${label} failed: ${job.error ?? "unknown error"}`);
   return {
     job,
@@ -164,10 +169,6 @@ async function queueAndWait(relative, body, label) {
     firstEventMs: await firstEventPromise,
     totalMs: performance.now() - started,
   };
-}
-
-async function reviewEvidence(matterId) {
-  return queueAndWait(`/api/matters/${matterId}/evidence-reviews`, {}, "Evidence review");
 }
 
 async function generate(matterId, draft = null) {
@@ -189,23 +190,26 @@ function normalize(value) {
 
 async function auditDraft(draft, template) {
   const blocks = draft.content.sections.flatMap((section) => section.blocks);
-  const editable = template.analysis.regions
-    .filter((region) => region.role === "editable")
-    .map((region) => region.paragraphIndex);
   const mapped = blocks.filter((block) => block.templateParagraphIndex !== null);
-  const counts = new Map();
-  for (const block of mapped) counts.set(block.templateParagraphIndex, (counts.get(block.templateParagraphIndex) ?? 0) + 1);
+  const expectedTargets = draft.targets?.map((target) => target.id) ?? [];
+  const outcomeCounts = new Map();
+  for (const outcome of draft.content.outcomes) outcomeCounts.set(outcome.targetId, (outcomeCounts.get(outcome.targetId) ?? 0) + 1);
   const pageCache = new Map();
   const invalidCitations = [];
-  for (const block of blocks) {
-    for (const citation of block.citations) {
+  const citedOwners = [
+    ...blocks.map((block) => ({ id: `block:${block.id}`, citations: block.citations })),
+    ...draft.content.outcomes.map((outcome) => ({ id: `outcome:${outcome.targetId}`, citations: outcome.citations })),
+    ...Object.entries(draft.content.fields).map(([key, field]) => ({ id: `field:${key}`, citations: field.citations })),
+  ];
+  for (const owner of citedOwners) {
+    for (const citation of owner.citations) {
       const key = `${citation.sourceId}:${citation.page}`;
       if (!pageCache.has(key)) {
         const page = await jsonRequest(`/api/sources/${citation.sourceId}/pages/${citation.page}`);
         pageCache.set(key, page.data.text);
       }
-      if (!normalize(pageCache.get(key)).includes(normalize(citation.quote))) {
-        invalidCitations.push({ blockId: block.id, sourceId: citation.sourceId, page: citation.page });
+      if (citation.evidenceType !== "visual" && !normalize(pageCache.get(key)).includes(normalize(citation.quote))) {
+        invalidCitations.push({ ownerId: owner.id, sourceId: citation.sourceId, page: citation.page });
       }
     }
   }
@@ -215,18 +219,18 @@ async function auditDraft(draft, template) {
   return {
     blockCount: blocks.length,
     templateBackedBlocks: mapped.length,
-    editableRegionCount: editable.length,
-    missingParagraphIndexes: editable.filter((index) => !counts.has(index)),
-    duplicateParagraphIndexes: [...counts.entries()].filter(([, count]) => count > 1).map(([index]) => index),
-    warningBlockIds: blocks.filter((block) => block.kind === "warning").map((block) => block.id),
-    unverifiedTemplateBlockIds: mapped.filter((block) => !block.verified && !block.userConfirmed).map((block) => block.id),
+    targetCount: expectedTargets.length,
+    missingTargetIds: expectedTargets.filter((targetId) => !outcomeCounts.has(targetId)),
+    duplicateTargetIds: [...outcomeCounts.entries()].filter(([, count]) => count > 1).map(([targetId]) => targetId),
+    unknownTargetIds: [...outcomeCounts.keys()].filter((targetId) => !expectedTargets.includes(targetId)),
+    invalidOutcomeStatuses: draft.content.outcomes.filter((outcome) => !["generated", "omitted"].includes(outcome.status)).map((outcome) => outcome.targetId),
+    unresolvedOmissionTargetIds: draft.readiness.omittedTargetIds,
     fieldCount: Object.keys(draft.content.fields).length,
     unresolvedFieldKeys: Object.entries(draft.content.fields)
-      .filter(([, field]) => !field.verified && !field.userConfirmed)
+      .filter(([, field]) => field.value === null)
       .map(([key]) => key),
     citationCount: blocks.reduce((total, block) => total + block.citations.length, 0),
     invalidCitations,
-    topLevelWarnings: draft.content.warnings,
     expectedFactsPresent: manifest
       ? Object.fromEntries(Object.entries(manifest.expected).map(([key, value]) => [key, normalize(allText).includes(normalize(value))]))
       : null,
@@ -238,8 +242,8 @@ async function auditDraft(draft, template) {
 
 async function streamRefinement(draft) {
   const block = draft.content.sections.flatMap((section) => section.blocks)
-    .find((candidate) => candidate.verified && candidate.kind === "paragraph" && candidate.text.length >= 40);
-  if (!block) throw new Error("No verified paragraph is available for refinement");
+    .find((candidate) => candidate.kind === "paragraph" && candidate.text.length >= 40);
+  if (!block) throw new Error("No paragraph is available for refinement");
   const sentenceEnd = block.text.indexOf(".");
   const end = sentenceEnd >= 39 ? sentenceEnd + 1 : Math.min(block.text.length, 180);
   const quote = block.text.slice(0, end);
@@ -266,48 +270,27 @@ async function streamRefinement(draft) {
   if (!proposalMatch) throw new Error(`Refinement stream had no proposal event: ${raw.slice(0, 500)}`);
   const proposal = JSON.parse(proposalMatch[1]);
   const accepted = await jsonRequest(`/api/proposals/${proposal.id}/accept`, jsonInit("POST", {}));
-  let confirmedDraft = accepted.data.draft;
-  const editedBlockIds = [...new Set(proposal.proposal.edits.map((edit) => edit.blockId))];
-  for (const blockId of editedBlockIds) {
-    const editedBlock = confirmedDraft.content.sections
-      .flatMap((section) => section.blocks)
-      .find((candidate) => candidate.id === blockId);
-    if (!editedBlock) throw new Error(`Accepted refinement block ${blockId} was not found`);
-    const confirmation = await jsonRequest(
-      `/api/drafts/${confirmedDraft.id}/blocks/${blockId}/confirm`,
-      jsonInit("POST", {
-        version: confirmedDraft.version,
-        text: editedBlock.text,
-        note: "Live acceptance reviewer checked the AI revision against its cited source material.",
-      }),
-    );
-    confirmedDraft = confirmation.data;
-  }
   return {
     firstEventMs,
     totalMs: performance.now() - started,
     proposalId: proposal.id,
     editCount: proposal.proposal.edits.length,
-    confirmationCount: editedBlockIds.length,
-    draft: confirmedDraft,
+    draft: accepted.data.draft,
   };
 }
 
 const health = await jsonRequest("/api/health");
 const ready = await jsonRequest("/api/ready");
 const setup = await setupMatter();
-const initialReview = await reviewEvidence(setup.matterId);
 const generation = await generate(setup.matterId);
 let draft = (await jsonRequest(`/api/drafts/${generation.job.draftId}`)).data;
 const initialDraft = draft;
 const initialAudit = await auditDraft(draft, setup.template);
 let supplemental = null;
-let refreshedReview = null;
 let regeneration = null;
 if (option("--supplemental")) {
   const uploaded = await addSupplementalEvidence(setup.matterId, option("--supplemental"));
   const staleReadiness = (await jsonRequest(`/api/drafts/${draft.id}`)).data.readiness;
-  refreshedReview = await reviewEvidence(setup.matterId);
   regeneration = await generate(setup.matterId, draft);
   draft = (await jsonRequest(`/api/drafts/${draft.id}`)).data;
   supplemental = {
@@ -320,7 +303,7 @@ if (option("--supplemental")) {
 }
 const beforeRefinement = await auditDraft(draft, setup.template);
 let refinement = null;
-if (runRefinement && beforeRefinement.warningBlockIds.length === 0) {
+if (runRefinement && beforeRefinement.unresolvedOmissionTargetIds.length === 0) {
   refinement = await streamRefinement(draft);
   draft = refinement.draft;
 }
@@ -339,8 +322,7 @@ if (exportReady) {
 const expectedFactsSatisfied = !expectedReady || afterRefinement.expectedFactsPresent === null
   || Object.values(afterRefinement.expectedFactsPresent).every(Boolean);
 const readyStateSatisfied = expectedReady
-  ? afterRefinement.warningBlockIds.length === 0
-    && afterRefinement.unverifiedTemplateBlockIds.length === 0
+  ? afterRefinement.unresolvedOmissionTargetIds.length === 0
     && afterRefinement.unresolvedFieldKeys.length === 0
   : true;
 const incrementalTransitionSatisfied = supplemental === null
@@ -350,8 +332,10 @@ const incrementalTransitionSatisfied = supplemental === null
 const report = {
   passed: exportReady === expectedReady
     && afterRefinement.invalidCitations.length === 0
-    && afterRefinement.missingParagraphIndexes.length === 0
-    && afterRefinement.duplicateParagraphIndexes.length === 0
+    && afterRefinement.missingTargetIds.length === 0
+    && afterRefinement.duplicateTargetIds.length === 0
+    && afterRefinement.unknownTargetIds.length === 0
+    && afterRefinement.invalidOutcomeStatuses.length === 0
     && (!expectedReady || afterRefinement.forbiddenMarkersPresent.length === 0)
     && expectedFactsSatisfied
     && readyStateSatisfied
@@ -368,24 +352,16 @@ const report = {
     health: health.durationMs,
     ready: ready.durationMs,
     setup: setup.setupTimingsMs,
-    evidenceReviewQueueResponse: initialReview.queueResponseMs,
-    evidenceReviewFirstEvent: initialReview.firstEventMs,
-    evidenceReviewTotal: initialReview.totalMs,
     generationQueueResponse: generation.queueResponseMs,
     generationFirstEvent: generation.firstEventMs,
     generationTotal: generation.totalMs,
     supplementalUploadExtraction: supplemental?.uploadExtractionMs ?? null,
-    refreshedEvidenceReviewQueueResponse: refreshedReview?.queueResponseMs ?? null,
-    refreshedEvidenceReviewFirstEvent: refreshedReview?.firstEventMs ?? null,
-    refreshedEvidenceReviewTotal: refreshedReview?.totalMs ?? null,
     regenerationQueueResponse: regeneration?.queueResponseMs ?? null,
     regenerationFirstEvent: regeneration?.firstEventMs ?? null,
     regenerationTotal: regeneration?.totalMs ?? null,
     export: exportResult.durationMs,
   },
   readyResponse: ready.data,
-  initialEvidenceReview: initialReview.job.result,
-  refreshedEvidenceReview: refreshedReview?.job.result ?? null,
   initialAudit,
   supplemental,
   beforeRefinement,
@@ -394,7 +370,6 @@ const report = {
     totalMs: refinement.totalMs,
     proposalId: refinement.proposalId,
     editCount: refinement.editCount,
-    confirmationCount: refinement.confirmationCount,
   },
   afterRefinement,
   exportPath,
@@ -407,7 +382,7 @@ console.log(JSON.stringify({
   caseName,
   sourceCount: report.sourceCount,
   exportReady,
-  warningBlocks: afterRefinement.warningBlockIds.length,
+  unresolvedOmissions: afterRefinement.unresolvedOmissionTargetIds.length,
   unresolvedFields: afterRefinement.unresolvedFieldKeys.length,
   invalidCitations: afterRefinement.invalidCitations.length,
   generationMs: Math.round(report.timingsMs.generationTotal),

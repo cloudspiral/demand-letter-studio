@@ -40,7 +40,9 @@ CREATE TABLE IF NOT EXISTS matters (
   name text NOT NULL,
   template_id uuid REFERENCES templates(id),
   template_map_version integer,
-  created_at timestamptz NOT NULL DEFAULT now()
+  name_manually_edited boolean NOT NULL DEFAULT false,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS source_documents (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -120,6 +122,7 @@ CREATE TABLE IF NOT EXISTS draft_versions (
   version integer NOT NULL,
   content jsonb NOT NULL,
   actor_id uuid REFERENCES actors(id),
+  change_summary text NOT NULL DEFAULT 'Draft updated',
   created_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (draft_id, version)
 );
@@ -207,7 +210,10 @@ ALTER TABLE templates ADD COLUMN IF NOT EXISTS display_name text;
 ALTER TABLE templates ADD COLUMN IF NOT EXISTS is_test boolean NOT NULL DEFAULT false;
 ALTER TABLE templates ADD COLUMN IF NOT EXISTS current_map_version integer;
 ALTER TABLE matters ADD COLUMN IF NOT EXISTS template_map_version integer;
+ALTER TABLE matters ADD COLUMN IF NOT EXISTS name_manually_edited boolean NOT NULL DEFAULT false;
+ALTER TABLE matters ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();
 ALTER TABLE draft_versions ADD COLUMN IF NOT EXISTS template_map_version integer;
+ALTER TABLE draft_versions ADD COLUMN IF NOT EXISTS change_summary text NOT NULL DEFAULT 'Draft updated';
 ALTER TABLE source_pages ADD COLUMN IF NOT EXISTS extraction_method text NOT NULL DEFAULT 'native';
 ALTER TABLE source_pages ADD COLUMN IF NOT EXISTS extraction_status text NOT NULL DEFAULT 'ready';
 ALTER TABLE source_pages ADD COLUMN IF NOT EXISTS extraction_confidence numeric(5,4);
@@ -293,9 +299,11 @@ export async function persistCitations(
   content: {
     sections: Array<{ blocks: Array<{ id: string; citations: Array<{ sourceId: string; page: number | null; quote: string; evidenceType?: "text" | "visual" | undefined; visualDescription?: string | null | undefined }> }> }>;
     outcomes?: Array<{ id: string; citations: Array<{ sourceId: string; page: number | null; quote: string; evidenceType?: "text" | "visual" | undefined; visualDescription?: string | null | undefined }> }>;
+    fields?: Record<string, { citations: Array<{ sourceId: string; page: number | null; quote: string; evidenceType?: "text" | "visual" | undefined; visualDescription?: string | null | undefined }> }>;
   },
 ): Promise<void> {
-  for (const block of [...content.sections.flatMap((section) => section.blocks), ...(content.outcomes ?? [])]) {
+  const fieldCitationOwners = Object.entries(content.fields ?? {}).map(([key, field]) => ({ id: `field:${key}`, citations: field.citations }));
+  for (const block of [...content.sections.flatMap((section) => section.blocks), ...(content.outcomes ?? []), ...fieldCitationOwners]) {
     for (const citation of block.citations) {
       if (citation.page !== null) {
         await client.query(`

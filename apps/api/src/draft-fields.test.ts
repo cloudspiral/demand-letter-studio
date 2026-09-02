@@ -4,41 +4,58 @@ import { confirmDraftField, exportableFieldKeys, exportableFieldReplacements } f
 
 const draft: GeneratedDraft = {
   title: "Demand",
-  matterName: "Example",
-  warnings: [],
-  reviewFlags: [],
   outcomes: [],
+  confirmedOmissionTargetIds: [],
   sections: [],
   fields: {
-    legacy: { value: "LEGACY", verified: true, confidence: null, userConfirmed: false, sourceId: null, page: null, sourceLabel: null },
-    strong: { value: "STRONG", verified: true, confidence: 0.92, userConfirmed: false, sourceId: null, page: null, sourceLabel: "declarations.pdf · p. 1" },
-    weak: { value: "WEAK", verified: true, confidence: 0.55, userConfirmed: false, sourceId: null, page: null, sourceLabel: "scan.pdf · p. 2" },
-    missing: { value: "[ATTORNEY REVIEW REQUIRED]", verified: false, confidence: null, userConfirmed: false, sourceId: null, page: null, sourceLabel: null },
+    grounded: {
+      fieldKey: "grounded",
+      oldValue: "OLD-123",
+      value: "NEW-456",
+      label: "Claim number",
+      citations: [{
+        sourceId: "10000000-0000-4000-8000-000000000001",
+        sourceName: "claim.pdf",
+        page: 1,
+        quote: "Claim number: NEW-456",
+        evidenceType: "text",
+        visualDescription: null,
+      }],
+      note: null,
+      attorneyEdited: false,
+    },
+    missing: {
+      fieldKey: "missing",
+      oldValue: "OLD CLIENT",
+      value: null,
+      label: "Client name",
+      citations: [],
+      note: "No unambiguous client name was found.",
+      attorneyEdited: false,
+    },
   },
 };
 
-describe("draft field safety", () => {
-  it("preserves provenance while marking a correction explicitly confirmed", () => {
-    const result = confirmDraftField(draft, "weak", "CORRECTED");
+describe("draft fields", () => {
+  it("treats an attorney-supplied value as approval without another confirmation", () => {
+    const result = confirmDraftField(draft, "missing", "Naomi Carter");
     expect(result.corrected).toBe(true);
-    expect(result.content.fields.weak).toMatchObject({
-      value: "CORRECTED", userConfirmed: true, confidence: 0.55, sourceLabel: "scan.pdf · p. 2",
+    expect(result.content.fields.missing).toMatchObject({
+      value: "Naomi Carter",
+      note: null,
+      attorneyEdited: true,
     });
-    expect(draft.fields.weak?.value).toBe("WEAK");
+    expect(result.content.fields.missing?.citations).toEqual([]);
+    expect(draft.fields.missing?.value).toBeNull();
   });
 
-  it("exports only sufficiently grounded or explicitly confirmed non-placeholder fields", () => {
-    const corrected = confirmDraftField(draft, "weak", "CORRECTED").content;
+  it("rejects a blank correction and exports only non-null values", () => {
+    expect(() => confirmDraftField(draft, "missing", "   ")).toThrow(/cannot be blank/i);
+    const corrected = confirmDraftField(draft, "missing", "Naomi Carter").content;
     expect(exportableFieldReplacements(corrected.fields)).toEqual({
-      legacy: "LEGACY",
-      strong: "STRONG",
-      weak: "CORRECTED",
+      "OLD-123": "NEW-456",
+      "OLD CLIENT": "Naomi Carter",
     });
-    expect(exportableFieldKeys({
-      semantic_claim_number: {
-        value: "NEW-123", templateValue: "OLD-999", verified: true, confidence: 1,
-        userConfirmed: false, sourceId: null, page: null, sourceLabel: null,
-      },
-    })).toEqual(["semantic_claim_number"]);
+    expect(exportableFieldKeys(draft.fields)).toEqual(["grounded"]);
   });
 });

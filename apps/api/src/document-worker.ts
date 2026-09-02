@@ -76,7 +76,7 @@ export async function exportDocx(payload: {
   targetOperations?: Array<{
     targetId: string;
     kind: "narrative" | "structured" | "figure";
-    status: "generated" | "omitted_no_evidence" | "omitted_not_applicable";
+    status: "generated" | "omitted";
     anchors: Array<{
       blockId: string;
       partName: string;

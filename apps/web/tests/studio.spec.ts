@@ -123,9 +123,23 @@ test("map v2 keeps the full letter visible while its queue filters and synchroni
       imageCandidates: [{ blockId: "word/document.xml:p:4", paragraphIndex: 4, relationshipId: "rId9", partName: "word/media/image1.png", contentType: "image/png", captionBlockId: "word/document.xml:p:5" }],
     },
   };
+  let generationRequests = 0;
   await page.route("**/api/demo/status", (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ available: false }) }));
   await page.route("**/api/templates", (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify([template]) }));
   await page.route("**/api/intakes", (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ caseWorkspace: { id: "20000000-0000-4000-8000-000000000020" }, template }) }));
+  await page.route(`**/api/templates/${templateId}/confirm`, (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ ...template, status: "confirmed" }) }));
+  await page.route("**/api/matters/20000000-0000-4000-8000-000000000020/template-map", (route) => route.fulfill({ contentType: "application/json", body: "{}" }));
+  await page.route("**/api/matters/20000000-0000-4000-8000-000000000020", (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({
+    id: "20000000-0000-4000-8000-000000000020", name: "New matter", templateId, templateMapVersion: 1,
+    sources: [{ id: "40000000-0000-4000-8000-000000000040", matterId: "20000000-0000-4000-8000-000000000020", name: "case.pdf", mimeType: "application/pdf", pageCount: 1, status: "ready" }],
+    sourceFingerprint: "a".repeat(64), activeDraft: null, generationTargets: [],
+  }) }));
+  await page.route("**/api/matters/20000000-0000-4000-8000-000000000020/generations", (route) => {
+    generationRequests += 1;
+    return route.fulfill({ status: 202, contentType: "application/json", body: JSON.stringify({ jobId: "new-template-generation", status: "queued" }) });
+  });
+  await page.route("**/api/matters/20000000-0000-4000-8000-000000000020/activity", (route) => route.fulfill({ contentType: "application/json", body: "[]" }));
+  await page.route("**/api/jobs/new-template-generation/events", (route) => route.fulfill({ contentType: "text/event-stream", body: "event: progress\ndata: {\"progress\":30,\"step\":\"Grounding draft in source pages\"}\n\n" }));
 
   await page.goto("/");
   await page.getByTitle("Map v2 fixture").click();
@@ -166,35 +180,64 @@ test("map v2 keeps the full letter visible while its queue filters and synchroni
   await expect(page.locator('[data-review-card="block:word/document.xml:p:6"]')).toContainText("Reusable");
   await page.setViewportSize({ width: 1100, height: 720 });
   await expect(page).toHaveScreenshot("map-v2-1100x720.png", { animations: "disabled" });
+
+  await page.locator(".map-filters").getByRole("button", { name: "attention" }).click();
+  await page.locator(".map-recommendation").getByRole("button", { name: "Accept" }).click();
+  await page.getByRole("button", { name: "Confirm map" }).click();
+  await expect(page.getByRole("dialog")).toBeHidden();
+  await expect(page.getByText("Drafting in progress", { exact: true })).toBeVisible();
+  expect(generationRequests).toBe(1);
 });
 
-test("generated workbench defaults to Review and resolves one omission into an exportable version", async ({ page }) => {
+test("saved template auto-generates one review card per blocker and supports editing, undo, versions, and rename", async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 720 });
   const matterId = "20000000-0000-4000-8000-000000000020";
   const draftId = "30000000-0000-4000-8000-000000000030";
   const outcomeId = "outcome:narrative-fixture";
-  let reviewReady = false;
-  let outcomeConfirmed = false;
+  const fixedTimestamp = "2026-09-02T12:00:00.000Z";
+  let matterName = "Naomi Carter - PPC-2026-0417";
+  let generationComplete = false;
+  let generationRequests = 0;
+  let version = 1;
+  let confirmedOmissions: string[] = [];
+  let fieldValue: string | null = null;
+  let keepText = "Reusable verified letter language.";
+  const snapshots = new Map<number, { confirmedOmissions: string[]; fieldValue: string | null; keepText: string }>();
+  const saveSnapshot = () => snapshots.set(version, { confirmedOmissions: [...confirmedOmissions], fieldValue, keepText });
+  saveSnapshot();
   const outcome = {
-    id: outcomeId, targetId: "narrative-fixture", targetKind: "narrative", status: "omitted_no_evidence",
-    resolution: outcomeConfirmed ? "confirmed" : "unresolved", citations: [], note: "No treatment records support this section.",
+    id: outcomeId, targetId: "narrative-fixture", targetKind: "narrative", status: "omitted",
+    citations: [], note: "No treatment records support this section.",
     sourceId: null, page: null, sourceName: null, mediaType: null, caption: null, exemplarCount: 2, generatedCount: 0,
   };
   const content = () => ({
-    title: "Time-Limited Policy Limits Demand", matterName: "Synthetic matter", fields: {}, warnings: [], reviewFlags: [], outcomes: [{ ...outcome, resolution: outcomeConfirmed ? "confirmed" : "unresolved" }],
-    sections: [{ id: "letter", heading: null, blocks: [{ id: "keep-1", kind: "paragraph", text: "Reusable verified letter language.", templateParagraphIndex: 0, templateBlockId: "word/document.xml:p:0", citations: [], verified: true, userConfirmed: true, templateRole: "keep", locked: true, targetId: null, outcomeId: null }] }],
+    title: "Time-Limited Policy Limits Demand",
+    confirmedOmissionTargetIds: confirmedOmissions,
+    fields: {
+      recipient_email: {
+        fieldKey: "recipient_email", oldValue: "old@example.test", value: fieldValue, label: "Delivery recipient email",
+        citations: [], note: fieldValue === null ? "No recipient email was found." : null, attorneyEdited: fieldValue !== null,
+      },
+    },
+    outcomes: [outcome],
+    sections: [{ id: "letter", heading: null, blocks: [{ id: "keep-1", kind: "paragraph", text: keepText, templateParagraphIndex: 0, templateBlockId: "word/document.xml:p:0", citations: [], attorneyEdited: keepText !== "Reusable verified letter language.", targetId: null, outcomeId: null }] }],
   });
   const readiness = () => ({
-    ready: outcomeConfirmed, blockIds: [], fieldKeys: [], outcomeIds: outcomeConfirmed ? [] : [outcomeId], duplicateParagraphIndexes: [], imageIssue: null,
-    staleEvidence: false, staleResolutionTargetIds: [], blockingReviewFlagIds: [],
+    ready: confirmedOmissions.includes("narrative-fixture") && fieldValue !== null,
+    fieldKeys: fieldValue === null ? ["recipient_email"] : [],
+    omittedTargetIds: confirmedOmissions.includes("narrative-fixture") ? [] : ["narrative-fixture"],
+    duplicateParagraphIndexes: [], imageIssue: null, staleEvidence: false,
   });
   const matter = () => ({
-    id: matterId, name: "Synthetic matter", templateId: "10000000-0000-4000-8000-000000000010", templateMapVersion: 1,
+    id: matterId, name: matterName, templateId: "10000000-0000-4000-8000-000000000010", templateMapVersion: 1,
     sources: [{ id: "40000000-0000-4000-8000-000000000040", matterId, name: "synthetic.pdf", mimeType: "application/pdf", pageCount: 1, status: "ready" }],
-    sourceFingerprint: "a".repeat(64),
-    evidenceReview: reviewReady ? { sourceFingerprint: "a".repeat(64), fieldProposals: [], reviewFlags: [], createdAt: new Date().toISOString() } : null,
-    evidenceReviewStale: false, activeDraft: null, reviewResolutions: [],
+    sourceFingerprint: "a".repeat(64), activeDraft: generationComplete ? { id: draftId, version } : null,
     generationTargets: [{ id: "narrative-fixture", kind: "narrative", section: "Treatment history", blockIds: ["word/document.xml:p:1", "word/document.xml:p:2"], partName: "word/document.xml", exemplarCount: 2, minItems: 1, maxItems: 12, structuredGroupId: null, figure: null }],
+  });
+  const draftResponse = () => ({
+    id: draftId, matterId, version, content: content(), readiness: readiness(),
+    targets: [{ ...matter().generationTargets[0], label: "Treatment history", exemplarExcerpt: "Prior treatment narrative." }],
+    sourceFingerprint: "a".repeat(64), createdAt: fixedTimestamp, updatedAt: fixedTimestamp,
   });
   await page.route("**/api/**", async (route) => {
     const url = new URL(route.request().url());
@@ -202,38 +245,76 @@ test("generated workbench defaults to Review and resolves one omission into an e
     if (url.pathname === "/api/templates") return route.fulfill({ contentType: "application/json", body: "[]" });
     if (url.pathname === "/api/demo/status") return route.fulfill({ contentType: "application/json", body: JSON.stringify({ available: true }) });
     if (url.pathname === "/api/demo/bootstrap") return route.fulfill({ contentType: "application/json", body: JSON.stringify({ matterId }) });
-    if (url.pathname === `/api/matters/${matterId}`) return route.fulfill({ contentType: "application/json", body: JSON.stringify(matter()) });
+    if (url.pathname === `/api/matters/${matterId}` && method === "GET") return route.fulfill({ contentType: "application/json", body: JSON.stringify(matter()) });
     if (url.pathname === `/api/matters/${matterId}/activity`) return route.fulfill({ contentType: "application/json", body: "[]" });
-    if (url.pathname === `/api/matters/${matterId}/evidence-reviews` && method === "POST") return route.fulfill({ status: 202, contentType: "application/json", body: JSON.stringify({ jobId: "review-job", status: "queued" }) });
-    if (url.pathname === "/api/jobs/review-job/events") {
-      reviewReady = true;
-      return route.fulfill({ contentType: "text/event-stream", body: "event: completed\ndata: {\"progress\":100,\"step\":\"Evidence review ready\"}\n\n" });
+    if (url.pathname === `/api/matters/${matterId}/generations` && method === "POST") {
+      generationRequests += 1;
+      return route.fulfill({ status: 202, contentType: "application/json", body: JSON.stringify({ jobId: "generation-job", status: "queued" }) });
     }
-    if (url.pathname === `/api/matters/${matterId}/generations` && method === "POST") return route.fulfill({ status: 202, contentType: "application/json", body: JSON.stringify({ jobId: "generation-job", status: "queued" }) });
-    if (url.pathname === "/api/jobs/generation-job/events") return route.fulfill({ contentType: "text/event-stream", body: `event: completed\ndata: {\"progress\":100,\"step\":\"Draft ready\",\"draftId\":\"${draftId}\"}\n\n` });
-    if (url.pathname === `/api/drafts/${draftId}`) return route.fulfill({ contentType: "application/json", body: JSON.stringify({ id: draftId, matterId, version: outcomeConfirmed ? 2 : 1, content: content(), readiness: readiness(), sourceFingerprint: "a".repeat(64), createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }) });
+    if (url.pathname === "/api/jobs/generation-job/events") {
+      generationComplete = true;
+      return route.fulfill({ contentType: "text/event-stream", body: `event: completed\ndata: {\"progress\":100,\"step\":\"Draft ready\",\"draftId\":\"${draftId}\"}\n\n` });
+    }
+    if (url.pathname === `/api/drafts/${draftId}` && method === "GET") return route.fulfill({ contentType: "application/json", body: JSON.stringify(draftResponse()) });
+    if (url.pathname === `/api/drafts/${draftId}/versions`) return route.fulfill({ contentType: "application/json", body: JSON.stringify([...snapshots.keys()].sort((a, b) => b - a).map((item) => ({ version: item, actor: "Faby Rivera", timestamp: fixedTimestamp, changeSummary: item === 1 ? "Generated initial grounded draft" : "Attorney update", current: item === version }))) });
     if (url.pathname === `/api/drafts/${draftId}/outcomes/${encodeURIComponent(outcomeId)}/confirm` && method === "POST") {
-      outcomeConfirmed = true;
-      return route.fulfill({ contentType: "application/json", body: JSON.stringify({ id: draftId, matterId, version: 2, content: content(), readiness: readiness(), sourceFingerprint: "a".repeat(64), createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }) });
+      confirmedOmissions = ["narrative-fixture"]; version += 1; saveSnapshot();
+      return route.fulfill({ contentType: "application/json", body: JSON.stringify(draftResponse()) });
+    }
+    if (url.pathname === `/api/drafts/${draftId}/fields/confirm` && method === "POST") {
+      fieldValue = (route.request().postDataJSON() as { value: string }).value; version += 1; saveSnapshot();
+      return route.fulfill({ contentType: "application/json", body: JSON.stringify(draftResponse()) });
+    }
+    if (url.pathname === `/api/drafts/${draftId}` && method === "PUT") {
+      keepText = (route.request().postDataJSON() as { content: ReturnType<typeof content> }).content.sections[0]!.blocks[0]!.text;
+      version += 1; saveSnapshot();
+      return route.fulfill({ contentType: "application/json", body: JSON.stringify(draftResponse()) });
+    }
+    if (url.pathname === `/api/drafts/${draftId}/restore` && method === "POST") {
+      const restored = snapshots.get((route.request().postDataJSON() as { restoreVersion: number }).restoreVersion)!;
+      confirmedOmissions = [...restored.confirmedOmissions]; fieldValue = restored.fieldValue; keepText = restored.keepText;
+      version += 1; saveSnapshot();
+      return route.fulfill({ contentType: "application/json", body: JSON.stringify(draftResponse()) });
+    }
+    if (url.pathname === `/api/matters/${matterId}` && method === "PATCH") {
+      matterName = (route.request().postDataJSON() as { name: string }).name;
+      return route.fulfill({ contentType: "application/json", body: JSON.stringify({ id: matterId, name: matterName }) });
     }
     return route.fulfill({ status: 404, contentType: "application/json", body: JSON.stringify({ error: `Unhandled ${method} ${url.pathname}` }) });
   });
 
   await page.goto("/");
   await page.getByRole("button", { name: /Use the supplied Steno sample packet/ }).click();
-  await expect(page.getByRole("button", { name: "Generate attorney-review draft" })).toBeVisible();
-  await page.getByRole("button", { name: "Generate attorney-review draft" }).click();
   await expect(page.locator(".letter-paper")).toBeVisible();
+  expect(generationRequests).toBe(1);
   await expect(page.locator(".panel-tabs button.active")).toHaveText("Review");
-  await expect(page.getByRole("button", { name: "1 blocking · Review" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "2 blocking · Review" })).toBeVisible();
+  await expect(page.locator("[data-review-item]")).toHaveCount(2);
   await expect(page).toHaveScreenshot("generated-review-1280x720.png", { animations: "disabled" });
   const marker = page.locator(`[data-outcome-marker="${outcomeId}"]`);
   await marker.click();
   await expect(page.locator(`[data-review-item="${outcomeId}"]`)).toHaveClass(/selected/);
-  await page.getByRole("button", { name: "Approve omission" }).click();
+  await page.getByRole("button", { name: "Confirm omission" }).click();
   await expect(page.locator(".matter-breadcrumb")).toContainText("Draft v2");
+  await page.locator(".review-field-input input").fill("dana.kim@example.test");
+  await page.getByRole("button", { name: "Save value" }).click();
+  await expect(page.locator(".matter-breadcrumb")).toContainText("Draft v3");
   await expect(page.getByRole("link", { name: "Export to Word" })).toBeVisible();
-  await expect(page.locator(`[data-review-item="${outcomeId}"]`)).toContainText("Confirmed omission");
+  const editor = page.getByLabel("Editable paragraph keep-1");
+  await editor.fill("Attorney edited reusable language.");
+  await page.locator(".letterhead").click();
+  await expect(page.locator(".matter-breadcrumb")).toContainText("Draft v4");
+  await expect(page.getByText(/Attorney edited · citations not revalidated/i)).toBeVisible();
+  await page.getByRole("button", { name: "Undo" }).click();
+  await expect(page.locator(".matter-breadcrumb")).toContainText("Draft v5");
+  await expect(editor).toHaveText("Reusable verified letter language.");
+  await page.getByTitle("Rename matter").click();
+  await page.locator(".matter-breadcrumb input").fill("Carter demand");
+  await page.locator(".matter-breadcrumb input").press("Enter");
+  await expect(page.getByTitle("Rename matter")).toHaveText("Carter demand");
+  await page.getByRole("button", { name: "Activity" }).click();
+  await expect(page.getByText("Draft versions")).toBeVisible();
+  await expect(page.getByText("v5 · Current")).toBeVisible();
   await page.setViewportSize({ width: 1100, height: 720 });
   await expect(page).toHaveScreenshot("generated-review-1100x720.png", { animations: "disabled" });
 });
@@ -243,7 +324,8 @@ test("complete high-fidelity evidence-grounded schema-v2 workflow", async ({ pag
   let sourcePaths: string[] = [];
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Create an evidence-grounded demand letter" })).toBeVisible();
-  if (!process.env.E2E_SOURCE_DIR) await expect(page.getByText(/real case files/i)).toBeVisible();
+  if (!process.env.E2E_SOURCE_DIR) await expect(page.getByText(/fictional case files/i)).toBeVisible();
+  const generationResponsePromise = page.waitForResponse((response) => response.url().endsWith("/generations") && response.request().method() === "POST");
 
   const templatePath = process.env.E2E_TEMPLATE_PATH
     ? path.resolve(process.env.E2E_TEMPLATE_PATH)
@@ -260,8 +342,8 @@ test("complete high-fidelity evidence-grounded schema-v2 workflow", async ({ pag
     await expect(page.getByText(`${sourcePaths.length} selected`, { exact: true })).toBeVisible();
     await page.getByRole("button", { name: "Continue to template map" }).click();
     const mapHeading = page.getByRole("heading", { name: "Review template structure" });
-    const evidenceHeading = page.getByRole("heading", { name: /Reviewing source coverage|Review the source packet before drafting/ });
-    await expect(mapHeading.or(evidenceHeading)).toBeVisible({ timeout: generationTimeout });
+    const draftingHeading = page.getByText("Drafting in progress", { exact: true });
+    await expect(mapHeading.or(draftingHeading)).toBeVisible({ timeout: generationTimeout });
     if (await mapHeading.isVisible()) {
       await expect(page.getByText(/complete original letter stays visible/i)).toBeVisible();
       await expect(page.locator(".map-document-block").first()).toBeVisible();
@@ -274,11 +356,6 @@ test("complete high-fidelity evidence-grounded schema-v2 workflow", async ({ pag
   } else {
     await page.getByRole("button", { name: /Use the supplied Steno sample packet/ }).click();
   }
-  await expect(page.getByRole("heading", { name: /Reviewing source coverage|Review the source packet before drafting/ })).toBeVisible({ timeout: 30_000 });
-  await expect(page.getByRole("button", { name: "Generate attorney-review draft" })).toBeVisible({ timeout: generationTimeout });
-  await expect(page.getByText(/does not determine completeness, authenticity, admissibility, or legal validity/i)).toBeVisible();
-  const generationResponsePromise = page.waitForResponse((response) => response.url().endsWith("/generations") && response.request().method() === "POST");
-  await page.getByRole("button", { name: "Generate attorney-review draft" }).click();
   const generationResponse = await generationResponsePromise;
   const generationJobId = ((await generationResponse.json()) as { jobId?: string }).jobId;
   if (!generationJobId) throw new Error("Generation response did not contain a job id");
@@ -299,21 +376,16 @@ test("complete high-fidelity evidence-grounded schema-v2 workflow", async ({ pag
 
   const supplementalPdf = sourcePaths.find((sourcePath) => /\.pdf$/i.test(sourcePath));
   if (supplementalPdf) {
+    const regenerationResponsePromise = page.waitForResponse((response) => response.url().endsWith("/generations") && response.request().method() === "POST");
     await page.locator(".drawer-evidence-actions input").setInputFiles(supplementalPdf);
-    await expect(page.locator(".drawer-stale")).toContainText(/predates the current source set/i, { timeout: 30_000 });
+    const regenerationResponse = await regenerationResponsePromise;
+    expect(regenerationResponse.status()).toBe(202);
     const staleDraftResponse = await page.request.get(`/api/drafts/${draftId}`);
     const staleExportResponse = await page.request.get(`/api/drafts/${draftId}/export.docx`);
     expect(staleDraftResponse.ok()).toBe(true);
-    expect(staleExportResponse.status()).toBe(409);
-    expect((await staleExportResponse.json()).issues).toEqual((await staleDraftResponse.json()).readiness);
+    if ((await staleDraftResponse.json()).readiness.staleEvidence) expect(staleExportResponse.status()).toBe(409);
     await expect(page.locator(".drawer-source")).toHaveCount((sourcePaths.length || 5) + 1);
-    const staleRegeneration = await page.request.post(generationResponse.url(), {
-      data: { draftId, baseVersion: 2 },
-    });
-    expect(staleRegeneration.status()).toBe(409);
     await page.locator(".source-drawer .icon-button").click();
-    await page.getByRole("button", { name: "Review", exact: true }).click();
-    await page.getByRole("button", { name: /Regenerate v2/ }).click();
     currentVersion = 2;
     await expect(page.locator(".matter-breadcrumb").getByText("Draft v2", { exact: true })).toBeVisible({ timeout: generationTimeout });
     await page.locator(".source-strip > button").last().click();
@@ -338,23 +410,14 @@ test("complete high-fidelity evidence-grounded schema-v2 workflow", async ({ pag
     fieldKey ??= (await field.locator("xpath=ancestor::article[1]").locator("h3").textContent())?.replaceAll(" ", "_") ?? null;
     confirmedFieldCount += 1;
     await field.locator("input").fill(process.env.E2E_CONFIRMED_FIELD_VALUE ?? `REVIEWED-TEST-${String(confirmedFieldCount).padStart(3, "0")}`);
-    await field.locator("xpath=ancestor::article[1]").getByRole("button", { name: "Confirm field" }).click();
+    await field.locator("xpath=ancestor::article[1]").getByRole("button", { name: "Save value" }).click();
     currentVersion += 1;
     await expect(page.locator(".matter-breadcrumb").getByText(`Draft v${currentVersion}`, { exact: true })).toBeVisible();
   }
 
-  let unresolvedIndex = 0;
-  while (await page.locator(".draft-block.unsupported").count() > 0) {
+  while (await page.getByRole("button", { name: "Confirm omission" }).count() > 0) {
     await expect(page.getByRole("button", { name: /blocking · Review/ })).toBeVisible();
-    const unsupportedEditor = page.locator(".draft-block.unsupported .block-editor").first();
-    await unsupportedEditor.fill(`Attorney-reviewed synthetic replacement ${unresolvedIndex + 1}. This text is for automated verification only.`);
-    await page.locator(".letterhead").click();
-    unresolvedIndex += 1;
-    currentVersion += 1;
-    await expect(page.locator(".matter-breadcrumb").getByText(`Draft v${currentVersion}`, { exact: true })).toBeVisible();
-    await page.locator(".draft-block.unsupported").first().getByRole("button", { name: "Confirm reviewed text" }).click();
-    await page.locator(".confirmation-note textarea").fill("Reviewed against the uploaded test packet for automated acceptance.");
-    await page.getByRole("dialog").getByRole("button", { name: "Confirm reviewed text" }).click();
+    await page.getByRole("button", { name: "Confirm omission" }).first().click();
     currentVersion += 1;
     await expect(page.locator(".matter-breadcrumb").getByText(`Draft v${currentVersion}`, { exact: true })).toBeVisible();
   }
@@ -362,11 +425,6 @@ test("complete high-fidelity evidence-grounded schema-v2 workflow", async ({ pag
   const firstEditor = page.locator(".block-editor[contenteditable='true']").first();
   await firstEditor.fill("The enclosed records very clearly document the charges reflected in the source materials.");
   await page.locator(".letterhead").click();
-  currentVersion += 1;
-  await expect(page.locator(".matter-breadcrumb").getByText(`Draft v${currentVersion}`, { exact: true })).toBeVisible();
-  await firstEditor.locator("xpath=ancestor::div[contains(@class,'draft-block')][1]").getByRole("button", { name: "Confirm reviewed text" }).click();
-  await page.locator(".confirmation-note textarea").fill("Reviewed the direct edit against the cited source material.");
-  await page.getByRole("dialog").getByRole("button", { name: "Confirm reviewed text" }).click();
   currentVersion += 1;
   await expect(page.locator(".matter-breadcrumb").getByText(`Draft v${currentVersion}`, { exact: true })).toBeVisible();
   const exportHref = await page.getByRole("link", { name: "Export to Word" }).getAttribute("href");
@@ -390,13 +448,6 @@ test("complete high-fidelity evidence-grounded schema-v2 workflow", async ({ pag
   await page.getByRole("button", { name: "Accept" }).click();
   currentVersion += 1;
   await expect(page.locator(".matter-breadcrumb").getByText(`Draft v${currentVersion}`, { exact: true })).toBeVisible();
-  while (await page.getByRole("button", { name: "Confirm reviewed text" }).count() > 0) {
-    await page.getByRole("button", { name: "Confirm reviewed text" }).first().click();
-    await page.locator(".confirmation-note textarea").fill("Reviewed the accepted AI revision against the cited source material.");
-    await page.getByRole("dialog").getByRole("button", { name: "Confirm reviewed text" }).click();
-    currentVersion += 1;
-    await expect(page.locator(".matter-breadcrumb").getByText(`Draft v${currentVersion}`, { exact: true })).toBeVisible();
-  }
 
   await page.getByRole("button", { name: "Activity" }).click();
   await expect(page.getByText("Accepted an AI edit proposal")).toBeVisible();

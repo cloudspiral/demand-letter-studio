@@ -1,19 +1,19 @@
 import type { GeneratedDraft } from "@steno/contracts";
 
-const isExportableField = (field: GeneratedDraft["fields"][string]): boolean => (
-  field.userConfirmed || (field.verified && (field.confidence ?? 1) >= 0.8)
-) && field.value !== "[ATTORNEY REVIEW REQUIRED]";
+const isExportableField = (field: GeneratedDraft["fields"][string]): boolean => field.value !== null;
 
 export function confirmDraftField(content: GeneratedDraft, key: string, value: string) {
   const field = content.fields[key];
   if (!field) throw new Error("Draft field not found.");
+  const normalized = value.trim();
+  if (!normalized) throw new Error("Draft field value cannot be blank.");
   return {
-    corrected: field.value !== value,
+    corrected: field.value !== normalized,
     content: {
       ...content,
       fields: {
         ...content.fields,
-        [key]: { ...field, value, userConfirmed: true },
+        [key]: { ...field, value: normalized, note: null, attorneyEdited: true },
       },
     },
   } satisfies { corrected: boolean; content: GeneratedDraft };
@@ -22,7 +22,7 @@ export function confirmDraftField(content: GeneratedDraft, key: string, value: s
 export function exportableFieldReplacements(fields: GeneratedDraft["fields"]): Record<string, string> {
   return Object.fromEntries(Object.entries(fields)
     .filter(([, field]) => isExportableField(field))
-    .map(([key, field]) => [field.templateValue ?? key, field.value]));
+    .map(([, field]) => [field.oldValue, field.value as string]));
 }
 
 export function exportableFieldKeys(fields: GeneratedDraft["fields"]): string[] {

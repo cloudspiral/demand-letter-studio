@@ -25,6 +25,6 @@ describe("completed-letter leakage canary", () => {
     });
     const serialized = JSON.stringify(draft);
     expect(serialized).not.toMatch(/Patrick|Pat Donahue|\$3,500\.00/);
-    expect(draft.matterName).toBe("Jordan Canary matter");
+    expect(draft.title).toBe("Demand letter");
   });
 });

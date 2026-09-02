@@ -7,9 +7,7 @@ import {
 } from "@steno/contracts";
 import {
   createAiProvider,
-  evidenceReviewJsonSchema,
   generatedDraftJsonSchema,
-  parseEvidenceReview,
   parseModelDraft,
   parseTemplateAnalysis,
 } from "./ai";
@@ -63,8 +61,6 @@ const citation = {
 
 function modelOutput(targetId: string, text = "The records document charges of $12,345.67.") {
   return {
-    title: "Demand",
-    matterName: "Canary",
     outcomes: [{
       targetId,
       status: "generated" as const,
@@ -77,8 +73,6 @@ function modelOutput(targetId: string, text = "The records document charges of $
       citations: [],
       note: null,
     }],
-    warnings: [],
-    reviewFlags: [],
     replacements: [],
   };
 }
@@ -147,24 +141,15 @@ describe("AI provider adapter", () => {
       .toEqual(["claim_number", "claim_number_2"]);
   });
 
-  it("keeps provider review constraints aligned with the runtime contract", () => {
-    const item = evidenceReviewJsonSchema.properties.reviewFlags.items as {
-      properties: Record<string, { minLength?: number; maxLength?: number; maxItems?: number }>;
-    };
-    expect(evidenceReviewJsonSchema.properties.reviewFlags.maxItems).toBe(100);
-    expect(item.properties.summary).toMatchObject({ minLength: 1, maxLength: 240 });
-    expect(item.properties.affectedTargetIds).toMatchObject({ maxItems: 100 });
-  });
-
   it("keeps every strict generation-schema property explicitly required", () => {
-    const reviewFlags = (generatedDraftJsonSchema.properties as Record<string, unknown>).reviewFlags as {
-      items: { properties: Record<string, unknown>; required: string[] };
+    const schema = generatedDraftJsonSchema as {
+      properties: Record<string, unknown>;
+      required: string[];
     };
-    const citations = reviewFlags.items.properties.citations as {
-      items: { properties: Record<string, unknown>; required: string[] };
-    };
-    expect(new Set(reviewFlags.items.required)).toEqual(new Set(Object.keys(reviewFlags.items.properties)));
-    expect(new Set(citations.items.required)).toEqual(new Set(Object.keys(citations.items.properties)));
+    expect(new Set(schema.required)).toEqual(new Set(Object.keys(schema.properties)));
+    expect(schema.properties).not.toHaveProperty("title");
+    expect(schema.properties).not.toHaveProperty("warnings");
+    expect(schema.properties).not.toHaveProperty("reviewFlags");
   });
 
   it("configures the Bedrock adapter without static credentials", () => {
@@ -184,21 +169,6 @@ describe("AI provider adapter", () => {
     expect(draft.outcomes).toHaveLength(1);
     expect(draft.outcomes[0]).toMatchObject({ status: "generated", targetKind: "narrative" });
     expect(draft.sections[0]?.blocks[0]?.citations[0]?.sourceId).toBe(sourceId);
-  });
-
-  it("normalizes unsupported review citations to one target-scoped missing-evidence flag", () => {
-    const mapped = template([region({ paragraphIndex: 4, text: "Case-specific treatment", role: "editable", aiRecommendation: "replace" })]);
-    const targetId = deriveGenerationTargets(mapped)[0]!.id;
-    const evidence = [{ sourceId, sourceName: "canary.pdf", page: 1, text: "Service date: January 4, 2026" }];
-    const review = parseEvidenceReview({ fieldProposals: [], reviewFlags: [{
-      id: "missing", kind: "general", severity: "verification",
-      summary: "Treatment requires review", explanation: "Support was not located.", citations: [],
-      affectedTemplateParagraphIndexes: [4], affectedFieldKeys: [], affectedTargetIds: [],
-    }] }, evidence, mapped);
-    expect(review.reviewFlags[0]).toMatchObject({
-      kind: "missing_evidence", severity: "blocking", affectedTargetIds: [targetId],
-      summary: "Supporting evidence not located",
-    });
   });
 
   it("returns bounded refinement proposals without mutating the draft", async () => {
@@ -246,23 +216,19 @@ describe("whole-document generation validation", () => {
     expect(() => parseModelDraft(modelOutput(target.id, "Old claimant remains copied."), evidence, mapped)).toThrow(/previous-case/i);
   });
 
-  it("preserves explicit unresolved and preapproved no-evidence outcomes", () => {
+  it("uses one omitted status with a concise note and optional conflict citations", () => {
     const omitted = {
       ...modelOutput(target.id),
       outcomes: [{
-        targetId: target.id, status: "omitted_no_evidence" as const, paragraphs: [], rows: [],
-        caption: null, sourceId: null, page: null, mediaType: null, citations: [], note: "No records support this section.",
+        targetId: target.id, status: "omitted" as const, paragraphs: [], rows: [],
+        caption: null, sourceId: null, page: null, mediaType: null, citations: [citation], note: "The records conflict about this section.",
       }],
     };
-    expect(parseModelDraft(omitted, evidence, mapped).outcomes[0]?.resolution).toBe("unresolved");
-    const resolution = {
-      id: "30000000-0000-4000-8000-000000000003", matterId: "40000000-0000-4000-8000-000000000004",
-      targetId: target.id, sourceFingerprint: "a".repeat(64), action: "omit" as const,
-      actorId: "50000000-0000-4000-8000-000000000005", actorName: "Attorney",
-      draftId: null, draftVersion: null, createdAt: new Date().toISOString(),
-    };
-    expect(parseModelDraft(omitted, evidence, mapped, [resolution]).outcomes[0]?.resolution).toBe("preapproved");
-    expect(() => parseModelDraft(modelOutput(target.id), evidence, mapped, [resolution])).toThrow(/pre-approved/i);
+    expect(parseModelDraft(omitted, evidence, mapped).outcomes[0]).toMatchObject({
+      status: "omitted",
+      note: "The records conflict about this section.",
+      citations: [citation],
+    });
   });
 
   it("requires an explicit grounded outcome for every replaceable inline field", () => {
@@ -281,16 +247,14 @@ describe("whole-document generation validation", () => {
       }],
       knownCaseSpecificValues: ["OLD CLIENT"],
     });
-    const base = {
-      title: "Demand", matterName: "Canary", outcomes: [], warnings: [], reviewFlags: [], replacements: [],
-    };
+    const base = { outcomes: [], replacements: [] };
     expect(() => parseModelDraft(base, evidence, withField)).toThrow(/omitted 1 required inline-field/i);
     const replacement = {
-      fieldKey: "heading_client", oldValue: "OLD CLIENT", status: "replaced" as const,
-      newValue: "$12,345.67", sourceId, page: 1, citations: [citation], note: null,
+      fieldKey: "heading_client", oldValue: "OLD CLIENT",
+      value: "$12,345.67", citations: [citation], note: null,
     };
     expect(parseModelDraft({ ...base, replacements: [replacement] }, evidence, withField).fields.heading_client)
-      .toMatchObject({ value: "$12,345.67", verified: true, templateValue: "OLD CLIENT" });
+      .toMatchObject({ fieldKey: "heading_client", oldValue: "OLD CLIENT", value: "$12,345.67", attorneyEdited: false });
     expect(() => parseModelDraft({ ...base, replacements: [replacement, replacement] }, evidence, withField)).toThrow(/duplicate/i);
     expect(() => parseModelDraft({
       ...base,
@@ -310,7 +274,7 @@ describe("whole-document generation validation", () => {
       visualInput: true, imageData: { mediaType: "image/png" as const, base64: "AA==" },
     }];
     expect(() => parseModelDraft({
-      title: "Demand", matterName: "Canary", warnings: [], reviewFlags: [], replacements: [],
+      replacements: [],
       outcomes: [{
         targetId, status: "generated", paragraphs: [], rows: [], caption: "Rendered PDF page",
         sourceId, page: 1, mediaType: "image/png", citations: [{

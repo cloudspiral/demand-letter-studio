@@ -1,16 +1,25 @@
 import { describe, expect, it } from "vitest";
-import { EvidenceReviewSchema, ExportReadinessSchema, GeneratedDraftSchema, GenerationOutcomeSchema, RefinementAnnotationSchema, RefinementProposalSchema, ReviewFlagSchema } from "./index";
+import { ExportReadinessSchema, GeneratedDraftSchema, GenerationOutcomeSchema, RefinementAnnotationSchema, RefinementProposalSchema } from "./index";
+
+const citation = {
+  sourceId: "00000000-0000-4000-8000-000000000999",
+  sourceName: "record.pdf",
+  page: 1,
+  quote: "No future care is recommended.",
+  evidenceType: "text" as const,
+  visualDescription: null,
+};
 
 describe("contracts", () => {
-  it("rejects factual blocks without verification state", () => {
-    const result = GeneratedDraftSchema.safeParse({
+  it("accepts editable fixed-structure blocks and defaults attorney-edit state", () => {
+    const parsed = GeneratedDraftSchema.parse({
       title: "Demand",
-      matterName: "Example",
       fields: {},
-      sections: [{ id: "facts", heading: "Facts", blocks: [{ id: "p1", kind: "paragraph", text: "Fact", templateParagraphIndex: 2, citations: [] }] }],
-      warnings: [],
+      sections: [{ id: "facts", heading: "Facts", blocks: [{ id: "p1", kind: "paragraph", text: "Reusable text", templateParagraphIndex: 2, citations: [] }] }],
+      outcomes: [],
     });
-    expect(result.success).toBe(false);
+    expect(parsed.sections[0]?.blocks[0]?.attorneyEdited).toBe(false);
+    expect(parsed.confirmedOmissionTargetIds).toEqual([]);
   });
 
   it("normalizes legacy proposals and validates bounded multi-edit proposals", () => {
@@ -18,7 +27,6 @@ describe("contracts", () => {
       targetText: "Old text", replacementText: "New text", summary: "Tightened", citedSourceIds: [],
     });
     expect(legacy.edits[0]?.targetText).toBe("Old text");
-
     const proposal = RefinementProposalSchema.parse({
       edits: [
         { blockId: "one", targetText: "first", replacementText: "1st", start: 0, end: 5 },
@@ -27,59 +35,39 @@ describe("contracts", () => {
       summary: "Two bounded edits", citedSourceIds: [],
     });
     expect(proposal.edits).toHaveLength(2);
-  });
-
-  it("normalizes legacy stored fields and bounds exact annotations", () => {
-    const parsed = GeneratedDraftSchema.parse({
-      title: "Demand",
-      matterName: "Example",
-      fields: { claim: { value: "123", verified: true } },
-      sections: [],
-      warnings: [],
-    });
-    expect(parsed.fields.claim).toMatchObject({
-      confidence: null, userConfirmed: false, sourceId: null, page: null, sourceLabel: null,
-    });
-    expect(parsed.reviewFlags).toEqual([]);
     expect(RefinementAnnotationSchema.safeParse({ blockId: "one", quote: "exact", start: 2, end: 2 }).success).toBe(false);
   });
 
-  it("keeps source-review flags generic and validates review/readiness transport", () => {
-    const flag = ReviewFlagSchema.parse({
-      id: "source-review-1",
-      summary: "Needs source review",
-      explanation: "Two uploaded pages contain dates that should be reviewed together.",
-      citations: [],
-      affectedTemplateParagraphIndexes: [4],
-      affectedFieldKeys: [],
-    });
-    expect(flag).not.toHaveProperty("type");
-    expect(flag).toMatchObject({ kind: "general", severity: "verification", affectedTargetIds: [] });
-    expect(EvidenceReviewSchema.safeParse({
-      sourceFingerprint: "a".repeat(64), reviewFlags: [flag], createdAt: new Date().toISOString(),
-    }).success).toBe(true);
-    expect(ExportReadinessSchema.parse({
-      ready: false, blockIds: ["block-1"], fieldKeys: [], duplicateParagraphIndexes: [],
-      imageIssue: null, staleEvidence: false, blockingReviewFlagIds: [flag.id],
-    })).toMatchObject({
-      outcomeIds: [], staleResolutionTargetIds: [], blockingReviewFlagIds: [flag.id],
-    });
-  });
-
-  it("keeps omission outcome and approval state independent", () => {
+  it("uses only generated and omitted target outcomes with conditional notes and citations", () => {
     const base = {
       id: "outcome:target-1", targetId: "target-1", targetKind: "narrative" as const,
-      citations: [], note: null, sourceId: null, page: null, sourceName: null,
-      mediaType: null, caption: null, exemplarCount: 2, generatedCount: 0,
+      sourceId: null, page: null, sourceName: null, mediaType: null, caption: null, exemplarCount: 2, generatedCount: 1,
     };
-    expect(GenerationOutcomeSchema.parse({
-      ...base, status: "omitted_no_evidence", resolution: "unresolved",
-    })).toMatchObject({ status: "omitted_no_evidence", resolution: "unresolved" });
-    expect(GenerationOutcomeSchema.safeParse({
-      ...base, status: "omitted_no_evidence", resolution: "not_required",
+    expect(GenerationOutcomeSchema.parse({ ...base, status: "generated", citations: [citation], note: null })).toMatchObject({ status: "generated" });
+    expect(GenerationOutcomeSchema.parse({ ...base, status: "omitted", citations: [], note: "The packet contains no support." })).toMatchObject({ status: "omitted" });
+    expect(GenerationOutcomeSchema.safeParse({ ...base, status: "omitted", citations: [], note: null }).success).toBe(false);
+    expect(GenerationOutcomeSchema.safeParse({ ...base, status: "omitted_no_evidence", citations: [], note: "Missing" }).success).toBe(false);
+  });
+
+  it("uses nullable field values without a field status enum", () => {
+    const generated = GeneratedDraftSchema.parse({
+      title: "Demand", sections: [], outcomes: [],
+      fields: { claim: { fieldKey: "claim", oldValue: "OLD", value: "NEW", citations: [citation], note: null } },
+    });
+    expect(generated.fields.claim?.value).toBe("NEW");
+    expect(GeneratedDraftSchema.safeParse({
+      title: "Demand", sections: [], outcomes: [],
+      fields: { claim: { fieldKey: "claim", oldValue: "OLD", value: null, citations: [], note: null } },
     }).success).toBe(false);
-    expect(GenerationOutcomeSchema.safeParse({
-      ...base, status: "omitted_not_applicable", resolution: "not_required",
-    }).success).toBe(false);
+  });
+
+  it("exposes only concrete server-derived readiness blockers", () => {
+    expect(ExportReadinessSchema.parse({
+      ready: false, fieldKeys: ["claim"], omittedTargetIds: ["target-1"], duplicateParagraphIndexes: [],
+      imageIssue: null, staleEvidence: false,
+    })).toEqual({
+      ready: false, fieldKeys: ["claim"], omittedTargetIds: ["target-1"], duplicateParagraphIndexes: [],
+      imageIssue: null, staleEvidence: false,
+    });
   });
 });

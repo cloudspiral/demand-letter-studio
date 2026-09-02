@@ -405,6 +405,39 @@ class DocumentWorkerTests(unittest.TestCase):
                 text = ["".join(p.xpath(".//w:t/text()", namespaces=namespaces)) for p in root.xpath("//w:body/w:p", namespaces=namespaces)]
                 self.assertEqual(text, ["FACTS", "Only supported paragraph.", "Reusable tail."])
 
+    def test_confirmed_narrative_omission_blanks_the_anchored_orphan_heading(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "narrative-template.docx"
+            output = Path(directory) / "narrative-omitted.docx"
+            make_docx(source, NARRATIVE_DOCUMENT)
+            analysis = analyze_template(str(source))
+            heading = analysis["regions"][0]
+            narrative_blocks = analysis["regions"][1:3]
+            export_docx({
+                "templatePath": str(source),
+                "outputPath": str(output),
+                "patches": [{
+                    "partName": heading["anchor"]["partName"],
+                    "paragraphIndex": heading["paragraphIndex"],
+                    "text": "",
+                }],
+                "fieldReplacements": {},
+                "targetOperations": [{
+                    "targetId": "narrative-1",
+                    "kind": "narrative",
+                    "status": "omitted",
+                    "anchors": [self.operation_anchor(block) for block in narrative_blocks],
+                }],
+            })
+            with zipfile.ZipFile(output) as package:
+                root = etree.fromstring(package.read("word/document.xml"))
+                namespaces = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+                paragraphs = root.xpath("//w:body/w:p", namespaces=namespaces)
+                self.assertEqual(["".join(p.xpath(".//w:t/text()", namespaces=namespaces)) for p in paragraphs], ["", "Reusable tail."])
+                self.assertTrue(paragraphs[0].xpath("./w:pPr/w:pStyle[@w:val='Heading1']", namespaces=namespaces))
+                self.assertEqual(package.read("word/header1.xml"), HEADER)
+                self.assertEqual(package.read("word/styles.xml"), STYLES)
+
     def test_target_operations_rebuild_paragraph_expense_rows_and_remove_the_optional_group(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "paragraph-expenses.docx"
@@ -425,7 +458,7 @@ class DocumentWorkerTests(unittest.TestCase):
                 ],
             }]})
             export_docx({**base, "outputPath": str(omitted), "targetOperations": [{
-                "targetId": "structured-1", "kind": "structured", "status": "omitted_no_evidence", "anchors": anchors,
+                "targetId": "structured-1", "kind": "structured", "status": "omitted", "anchors": anchors,
             }]})
             namespaces = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
             with zipfile.ZipFile(generated) as package:
@@ -461,7 +494,7 @@ class DocumentWorkerTests(unittest.TestCase):
                 ],
             }]})
             export_docx({**base, "outputPath": str(omitted), "targetOperations": [{
-                "targetId": "table-1", "kind": "structured", "status": "omitted_not_applicable", "anchors": anchors,
+                "targetId": "table-1", "kind": "structured", "status": "omitted", "anchors": anchors,
             }]})
             namespaces = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
             with zipfile.ZipFile(generated) as package:
@@ -494,7 +527,7 @@ class DocumentWorkerTests(unittest.TestCase):
                 "sourcePath": str(replacement), "caption": "Photograph: documented rear-impact damage.",
             }]})
             export_docx({**base, "outputPath": str(omitted), "targetOperations": [{
-                "targetId": "figure-1", "kind": "figure", "status": "omitted_no_evidence", "anchors": [anchor],
+                "targetId": "figure-1", "kind": "figure", "status": "omitted", "anchors": [anchor],
             }]})
             with zipfile.ZipFile(generated) as package:
                 with Image.open(io.BytesIO(package.read("word/media/immutable.png"))) as image:

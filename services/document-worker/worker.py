@@ -811,7 +811,7 @@ def extract_source(path: str, mime_type: str | None = None, ocr_provider: OcrPro
         "mimeType": mime,
         "pageCount": len(pages),
         "pages": pages,
-        # Values are proposed by the evidence-review model with provenance.
+        # Values are returned by grounded generation with provenance.
         # Regex extraction is intentionally not an authoritative fact source.
         "facts": [],
         "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
