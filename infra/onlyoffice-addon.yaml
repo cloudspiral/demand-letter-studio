@@ -1,0 +1,73 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Steno live ONLYOFFICE credentials - generates a dedicated JWT secret and grants the existing demo host read-only runtime access
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@2
+  com.aws.cloudformation.Context:
+    arch: dedicated generated JWT secret -> existing EC2 role -> asm-exec runtime injection into app and editor containers
+    must:
+      - never place the JWT value in parameters, source, SSM commands, or logs
+      - grant access only to the existing Steno live host role
+    ref:
+      - at: docs/ARCHITECTURE.md
+        has: live demo trust boundaries and ONLYOFFICE integration
+        scope: repository
+
+Parameters:
+  AppRoleName:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9+=,.@_-]{1,64}$'
+    Description: Existing Steno EC2 role that receives read-only access to the editor JWT secret
+
+Resources:
+  OnlyOfficeJwtSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: isolates the document-server signing key from app source and the unrelated AI provider credential
+        must:
+          - generate the value inside Secrets Manager
+          - retain the value across stack replacement or deletion
+          - resolve only at runtime through asm-exec
+        mutable: change-with-constraints
+    Properties:
+      Description: Steno live ONLYOFFICE JWT signing key
+      GenerateSecretString:
+        SecretStringTemplate: '{}'
+        GenerateStringKey: jwt
+        PasswordLength: 64
+        ExcludePunctuation: true
+
+  OnlyOfficeSecretReadPolicy:
+    Type: AWS::IAM::Policy
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: lets the existing demo host inject the editor JWT at runtime without exposing it to deployment tooling
+        must:
+          - keep access read-only and scoped to OnlyOfficeJwtSecret
+          - require TLS for Secrets Manager calls
+        mutable: change-with-constraints
+    Properties:
+      PolicyName: !Sub '${AWS::StackName}-secret-read'
+      Roles:
+        - !Ref AppRoleName
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - secretsmanager:DescribeSecret
+              - secretsmanager:GetSecretValue
+            Resource: !Ref OnlyOfficeJwtSecret
+            Condition:
+              Bool:
+                aws:SecureTransport: 'true'
+
+Outputs:
+  OnlyOfficeJwtSecretArn:
+    Description: ARN used by asm-exec to resolve the generated editor JWT at runtime
+    Value: !Ref OnlyOfficeJwtSecret

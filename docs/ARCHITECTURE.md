@@ -39,7 +39,7 @@
 
 ## Deployment shape
 
-The SAM template in `infra/template.yaml` maps the serverless interfaces to API Gateway/Lambda, SQS with a DLQ, and encrypted/versioned/private S3. The current live demo uses the deployable `infra/live-demo.yaml` CloudFormation stack: Caddy HTTPS fronts one encrypted Graviton EC2 host running isolated app and PostgreSQL containers, with a retained encrypted data volume and private versioned release bucket. Runtime OpenAI credentials resolve from one scoped Secrets Manager ARN through the AWS Workload Credentials Provider and `asm-exec`. This bounded demo keeps the local filesystem/PostgreSQL adapters intact; a larger production deployment should move PostgreSQL to a managed private database and document storage to S3.
+The SAM template in `infra/template.yaml` maps the serverless interfaces to API Gateway/Lambda, SQS with a DLQ, and encrypted/versioned/private S3. The current live demo uses the deployable `infra/live-demo.yaml` CloudFormation stack: Caddy HTTPS fronts one encrypted Graviton EC2 host running isolated app, PostgreSQL, and ONLYOFFICE containers, with a retained encrypted data volume and private versioned release bucket. Caddy publishes the app and editor on separate IP-derived HTTPS hostnames while their origin ports stay loopback-only; the app and editor communicate over the private `steno-internal` Docker network. Runtime OpenAI and dedicated ONLYOFFICE JWT credentials resolve from scoped Secrets Manager ARNs through the AWS Workload Credentials Provider and `asm-exec`. This bounded demo keeps the local filesystem/PostgreSQL adapters intact; a larger production deployment should move PostgreSQL to a managed private database and document storage to S3.
 
 ## Current local scope boundary
 

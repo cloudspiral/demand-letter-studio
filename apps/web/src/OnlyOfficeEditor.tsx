@@ -28,7 +28,11 @@ function loadDocumentServerScript(baseUrl: string): Promise<void> {
     script.src = url;
     script.async = true;
     script.onload = () => resolve();
-    script.onerror = () => reject(new Error("The local Word editor service could not be reached."));
+    script.onerror = () => {
+      scriptLoads.delete(url);
+      script.remove();
+      reject(new Error("The Word editor service could not be reached."));
+    };
     document.head.appendChild(script);
   });
   scriptLoads.set(url, load);
@@ -62,7 +66,10 @@ export function OnlyOfficeEditor({ draftId, version, disabled, onSaved }: {
       .then(async (response) => {
         await loadDocumentServerScript(response.documentServerUrl);
         if (cancelled) return;
-        if (!window.DocsAPI) throw new Error("The Word editor loaded without its document API.");
+        if (!window.DocsAPI) {
+          scriptLoads.delete(`${response.documentServerUrl.replace(/\/$/, "")}/web-apps/apps/api/documents/api.js`);
+          throw new Error("The Word editor loaded without its document API.");
+        }
         editorRef.current = new window.DocsAPI.DocEditor(elementId, {
           ...response.config,
           events: {

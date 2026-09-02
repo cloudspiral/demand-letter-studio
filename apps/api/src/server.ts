@@ -1463,7 +1463,7 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
     if (!onlyOfficeEnabled()) {
       return reply.status(503).send({
         error: "The Word editor is unavailable.",
-        detail: "Start the local ONLYOFFICE service and configure its public, internal, callback, and JWT settings.",
+        detail: "The ONLYOFFICE service is not configured for this deployment.",
       });
     }
     const artifact = await materializeDraftDocument(id);

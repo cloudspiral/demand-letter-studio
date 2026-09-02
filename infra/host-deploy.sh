@@ -9,6 +9,7 @@ ai_provider="${STENO_AI_PROVIDER:-mock}"
 openai_secret_arn="${STENO_OPENAI_SECRET_ARN:-}"
 openai_model="${STENO_OPENAI_MODEL:-gpt-5.6-sol}"
 bedrock_model="${STENO_BEDROCK_MODEL:-us.anthropic.claude-sonnet-4-6}"
+onlyoffice_secret_arn="${STENO_ONLYOFFICE_SECRET_ARN:-}"
 aws_region="${STENO_AWS_REGION:-us-east-1}"
 
 install -d -m 0755 "$release_root" "$data_root/postgres" "$data_root/storage"
@@ -39,6 +40,51 @@ for _ in $(seq 1 60); do
 done
 docker exec steno-postgres pg_isready -U steno -d steno
 
+imds_token=$(curl --fail --silent --show-error --request PUT \
+  --header 'X-aws-ec2-metadata-token-ttl-seconds: 60' \
+  http://169.254.169.254/latest/api/token)
+public_ip=$(curl --fail --silent --show-error \
+  --header "X-aws-ec2-metadata-token: $imds_token" \
+  http://169.254.169.254/latest/meta-data/public-ipv4)
+live_hostname="steno-demo.$public_ip.sslip.io"
+onlyoffice_hostname="word-steno-demo.$public_ip.sslip.io"
+
+wcp_token=''
+if [ "$ai_provider" = openai ] || [ -n "$onlyoffice_secret_arn" ]; then
+  command -v asm-exec >/dev/null
+  test -s /var/run/awssmatoken
+  wcp_token=$(< /var/run/awssmatoken)
+fi
+
+onlyoffice_ready=false
+onlyoffice_key_ref=''
+if [ -n "$onlyoffice_secret_arn" ]; then
+  onlyoffice_key_ref="{{resolve:secretsmanager:$onlyoffice_secret_arn:SecretString:jwt}}"
+  docker rm --force steno-onlyoffice >/dev/null 2>&1 || true
+  AWS_TOKEN="$wcp_token" JWT_SECRET="$onlyoffice_key_ref" AWS_REGION="$aws_region" \
+    asm-exec -- docker run --detach \
+      --name steno-onlyoffice \
+      --network steno-internal \
+      --restart unless-stopped \
+      --env JWT_ENABLED=true \
+      --env JWT_SECRET \
+      --env JWT_IN_BODY=true \
+      --env ALLOW_PRIVATE_IP_ADDRESS=true \
+      --shm-size 512m \
+      --publish 127.0.0.1:8088:80 \
+      --volume steno-onlyoffice-data:/var/www/onlyoffice/Data \
+      --volume steno-onlyoffice-lib:/var/lib/onlyoffice \
+      onlyoffice/documentserver:latest-arm64
+  for _ in $(seq 1 180); do
+    if curl --fail --silent http://127.0.0.1:8088/healthcheck >/dev/null; then
+      onlyoffice_ready=true
+      break
+    fi
+    sleep 5
+  done
+  [ "$onlyoffice_ready" = true ]
+fi
+
 docker rm --force steno-app >/dev/null 2>&1 || true
 app_command=(
   docker run --detach
@@ -58,11 +104,17 @@ app_command=(
   --publish 127.0.0.1:3002:3001
 )
 
+if [ "$onlyoffice_ready" = true ]; then
+  app_command+=(
+    --env "ONLYOFFICE_PUBLIC_URL=https://$onlyoffice_hostname"
+    --env ONLYOFFICE_INTERNAL_URL=http://steno-onlyoffice
+    --env ONLYOFFICE_APP_URL=http://steno-app:3001
+    --env ONLYOFFICE_JWT_SECRET
+  )
+fi
+
 if [ "$ai_provider" = openai ]; then
   test -n "$openai_secret_arn"
-  command -v asm-exec >/dev/null
-  test -s /var/run/awssmatoken
-  wcp_token=$(< /var/run/awssmatoken)
   openai_key_ref="{{resolve:secretsmanager:$openai_secret_arn:SecretString:apiKey}}"
   openai_ready=false
   for _ in $(seq 1 180); do
@@ -74,8 +126,11 @@ if [ "$ai_provider" = openai ]; then
     sleep 10
   done
   [ "$openai_ready" = true ]
-  AWS_TOKEN="$wcp_token" OPENAI_API_KEY="$openai_key_ref" AWS_REGION="$aws_region" \
+  AWS_TOKEN="$wcp_token" OPENAI_API_KEY="$openai_key_ref" ONLYOFFICE_JWT_SECRET="$onlyoffice_key_ref" AWS_REGION="$aws_region" \
     asm-exec -- "${app_command[@]}" --env OPENAI_API_KEY "steno-app:$release_id"
+elif [ "$onlyoffice_ready" = true ]; then
+  AWS_TOKEN="$wcp_token" ONLYOFFICE_JWT_SECRET="$onlyoffice_key_ref" AWS_REGION="$aws_region" \
+    asm-exec -- "${app_command[@]}" "steno-app:$release_id"
 else
   "${app_command[@]}" "steno-app:$release_id"
 fi
@@ -87,14 +142,6 @@ for _ in $(seq 1 60); do
   sleep 2
 done
 curl --fail --silent http://127.0.0.1:3002/api/ready
-
-imds_token=$(curl --fail --silent --show-error --request PUT \
-  --header 'X-aws-ec2-metadata-token-ttl-seconds: 60' \
-  http://169.254.169.254/latest/api/token)
-public_ip=$(curl --fail --silent --show-error \
-  --header "X-aws-ec2-metadata-token: $imds_token" \
-  http://169.254.169.254/latest/meta-data/public-ipv4)
-live_hostname="steno-demo.$public_ip.sslip.io"
 
 install -d -m 0755 /opt/steno/caddy
 printf '%s\n' \
@@ -108,6 +155,20 @@ printf '%s\n' \
   '    X-Frame-Options "DENY"' \
   '  }' \
   '}' > /opt/steno/caddy/Caddyfile
+
+if [ "$onlyoffice_ready" = true ]; then
+  printf '%s\n' \
+    '' \
+    "$onlyoffice_hostname {" \
+    '  reverse_proxy 127.0.0.1:8088' \
+    '  header {' \
+    '    Cache-Control "no-store"' \
+    '    Referrer-Policy "same-origin"' \
+    '    Strict-Transport-Security "max-age=31536000"' \
+    '    X-Content-Type-Options "nosniff"' \
+    '  }' \
+    '}' >> /opt/steno/caddy/Caddyfile
+fi
 
 docker rm --force steno-router >/dev/null 2>&1 || true
 docker run --detach \
@@ -125,6 +186,16 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 curl --fail --silent --resolve "$live_hostname:443:127.0.0.1" "https://$live_hostname/api/ready"
+
+if [ "$onlyoffice_ready" = true ]; then
+  for _ in $(seq 1 60); do
+    if curl --fail --silent --resolve "$onlyoffice_hostname:443:127.0.0.1" "https://$onlyoffice_hostname/healthcheck" >/dev/null; then
+      break
+    fi
+    sleep 1
+  done
+  curl --fail --silent --resolve "$onlyoffice_hostname:443:127.0.0.1" "https://$onlyoffice_hostname/healthcheck"
+fi
 
 ln -sfn "$release_root" /opt/steno/current
 docker image prune --force --filter "until=168h" >/dev/null
