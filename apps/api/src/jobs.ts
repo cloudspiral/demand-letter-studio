@@ -40,6 +40,41 @@ export async function appendJobEvent(
   );
 }
 
+export function terminalEventForJob(job: {
+  status: string;
+  progress?: number | null;
+  step?: string | null;
+  draftId?: string | null;
+  error?: string | null;
+  result?: unknown;
+}): { eventType: "completed" | "failed"; payload: Record<string, unknown> } | null {
+  if (job.status === "failed") {
+    return {
+      eventType: "failed",
+      payload: {
+        progress: job.progress ?? 0,
+        step: job.step ?? "Generation failed",
+        error: job.error ?? "Generation failed",
+      },
+    };
+  }
+  if (job.status !== "completed") return null;
+  const result = job.result && typeof job.result === "object"
+    ? job.result as Record<string, unknown>
+    : {};
+  const draftId = job.draftId ?? (typeof result.draftId === "string" ? result.draftId : null);
+  const version = typeof result.version === "number" ? result.version : null;
+  return {
+    eventType: "completed",
+    payload: {
+      progress: job.progress ?? 100,
+      step: job.step ?? "Draft ready",
+      ...(draftId ? { draftId } : {}),
+      ...(version !== null ? { version } : {}),
+    },
+  };
+}
+
 async function setJobProgress(jobId: string, progress: number, step: string): Promise<void> {
   await pool.query(
     "UPDATE jobs SET status = 'processing', progress = $2, step = $3, updated_at = now() WHERE id = $1",

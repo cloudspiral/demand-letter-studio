@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { streamEvent } from "./api";
+import { api, streamEvent } from "./api";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -27,5 +27,17 @@ describe("SSE client", () => {
     )));
     await expect(streamEvent("/refine", "proposal", { method: "POST", body: "{}" }))
       .rejects.toThrow("Refinement failed");
+  });
+});
+
+describe("JSON client", () => {
+  it("does not declare a JSON content type for a bodyless request", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (_path: string, init?: RequestInit) => {
+      expect(new Headers(init?.headers).has("Content-Type")).toBe(false);
+      return new Response('{"removed":true}', { status: 200, headers: { "Content-Type": "application/json" } });
+    }));
+
+    await expect(api<{ removed: boolean }>("/templates/template-1", { method: "DELETE" }))
+      .resolves.toEqual({ removed: true });
   });
 });

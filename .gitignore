@@ -53,6 +53,12 @@ test-results/
 .cache/
 .turbo/
 
+# Local demo and screen recordings
+*.mov
+*.mp4
+*.m4v
+*.webm
+
 # AWS / infrastructure build output
 .aws-sam/
 .serverless/

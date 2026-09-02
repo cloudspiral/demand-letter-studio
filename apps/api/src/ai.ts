@@ -72,6 +72,8 @@ export function safeAiDiagnostic(error: unknown): string {
   return error instanceof Error ? error.message.slice(0, 300) : "Unknown provider error";
 }
 
+export const CURRENT_TEMPLATE_ANALYSIS_VERSION = 7;
+
 function strictJsonSchema(schema: z.ZodType): Record<string, unknown> {
   const { $schema: _metaSchema, ...jsonSchema } = z.toJSONSchema(schema, { target: "draft-7" }) as Record<string, unknown>;
   return jsonSchema;
@@ -81,6 +83,7 @@ const TemplateDecisionOutputSchema = z.object({
   decisions: z.array(z.object({
     blockId: z.string().min(1),
     role: z.enum(["keep", "replace", "heading"]),
+    caseIndependentRemainder: z.boolean(),
     confidence: z.number().min(0).max(1),
     explanation: z.string().min(1).max(1_000),
     inlineFields: z.array(z.object({
@@ -100,7 +103,7 @@ const TemplateDecisionOutputSchema = z.object({
 
 const templateAnalysisJsonSchema = strictJsonSchema(TemplateDecisionOutputSchema);
 
-function promptForTemplateAnalysis(input: AnalyzeTemplateInput): string {
+export function promptForTemplateAnalysis(input: AnalyzeTemplateInput): string {
   const blocks = (input.structuralAnalysis.blocks?.length
     ? input.structuralAnalysis.blocks
     : input.structuralAnalysis.regions).map((block) => ({
@@ -123,6 +126,11 @@ Return exactly one decision for every supplied blockId and no other blockIds.
 - Figure blocks are fixed 1:1 evidence slots. Choose keep for firm branding or replace for a case-specific evidentiary image; never classify a figure as a heading.
 - Every member of one structuredGroup must receive the same keep or replace recommendation.
 - When only a span inside an otherwise-kept block is case-specific, choose keep and identify every exact inline field span.
+- Parent and child decisions are hierarchical: block keep preserves the surrounding block while each inline field can independently be keep or replace. A block replace replaces the complete block, so every inline field inside it must also be replace.
+- Prefer block keep plus precise replace fields when the surrounding wording is reusable. For example, "Claim Number: 017204635" should normally be block keep with only "017204635" marked as an inline replace field.
+- Keep is a strict invariant: after every replace field takes any valid future-case value, every word and grammatical relationship left outside those fields must still be correct.
+- Set caseIndependentRemainder true only when that invariant holds. Case dependence includes surrounding references, titles, party roles, singular/plural agreement, defined terms, and any other wording whose correctness can change with a field.
+- If any surrounding wording depends on a replace field, either identify every dependent span as its own replace field or choose replace for the entire block. When unsure or when the dependencies are scattered, choose replace. For example, replacing a person's name while leaving "he" or "his" outside the fields is not a valid keep decision.
 - start and end are zero-based JavaScript string offsets into the exact block text. originalText must equal text.slice(start, end).
 - Every inline field needs role keep or replace; default genuine case values to replace and false positives such as a statute number to keep.
 - Every inline field key must be unique across the complete document. When the same logical value appears more than once, qualify the keys by location, for example header_claim_number and body_claim_number.
@@ -155,6 +163,27 @@ function uniqueInlineFieldKey(requestedKey: string, usedKeys: Set<string>): stri
   }
 }
 
+function repairExactSpan(text: string, field: { start: number; end: number; originalText: string }) {
+  if (field.end > field.start && text.slice(field.start, field.end) === field.originalText) {
+    return { start: field.start, end: field.end };
+  }
+  const matches: number[] = [];
+  let cursor = 0;
+  while (cursor <= text.length - field.originalText.length) {
+    const match = text.indexOf(field.originalText, cursor);
+    if (match === -1) break;
+    matches.push(match);
+    cursor = match + Math.max(1, field.originalText.length);
+  }
+  if (!matches.length) return null;
+  const ranked = matches
+    .map((start) => ({ start, distance: Math.abs(start - field.start) }))
+    .sort((left, right) => left.distance - right.distance);
+  if (ranked.length > 1 && ranked[0]!.distance === ranked[1]!.distance) return null;
+  const start = ranked[0]!.start;
+  return { start, end: start + field.originalText.length };
+}
+
 export function parseTemplateAnalysis(raw: unknown, input: AnalyzeTemplateInput): TemplateAnalysis {
   const output = TemplateDecisionOutputSchema.parse(raw);
   const structuralBlocks = input.structuralAnalysis.blocks?.length
@@ -176,14 +205,20 @@ export function parseTemplateAnalysis(raw: unknown, input: AnalyzeTemplateInput)
   const blocks = structuralBlocks.map((block) => {
     const id = block.id ?? `word/document.xml:p:${block.paragraphIndex}`;
     const decision = decisions.get(id)!;
+    if (decision.role === "keep" && !decision.caseIndependentRemainder) {
+      throw new Error(`Template analysis cannot keep a block whose remaining text is case-dependent: ${id}`);
+    }
     const inlineFields = decision.inlineFields.map((field) => {
-      if (field.end <= field.start || block.text.slice(field.start, field.end) !== field.originalText) {
+      const span = repairExactSpan(block.text, field);
+      if (!span) {
         throw new Error(`Template analysis returned an invalid exact span for ${id}:${field.key}`);
       }
       return {
         ...field,
+        ...span,
         key: uniqueInlineFieldKey(field.key, usedInlineFieldKeys),
         source: "model" as const,
+        role: decision.role === "replace" ? "replace" as const : field.role,
       };
     });
     const role = block.semanticKind === "figure"
@@ -248,7 +283,7 @@ export function parseTemplateAnalysis(raw: unknown, input: AnalyzeTemplateInput)
   })));
   return TemplateAnalysisSchema.parse({
     ...input.structuralAnalysis,
-    analysisVersion: Math.max(5, input.structuralAnalysis.analysisVersion),
+    analysisVersion: Math.max(CURRENT_TEMPLATE_ANALYSIS_VERSION, input.structuralAnalysis.analysisVersion),
     blocks: normalizedBlocks,
     regions: bodyBlocks,
     replacementCandidates,
@@ -760,6 +795,7 @@ class MockProvider implements AiProvider {
       decisions: blocks.map((block, index) => ({
         blockId: block.id ?? `word/document.xml:p:${block.paragraphIndex}`,
         role: blocks.length === 1 ? "replace" : index === 0 ? "heading" : index === blocks.length - 1 ? "keep" : "replace",
+        caseIndependentRemainder: blocks.length > 1 && (index === 0 || index === blocks.length - 1),
         confidence: 0.95,
         explanation: blocks.length === 1 ? "The fixture replaces the only case narrative block." : index === 0 ? "The fixture treats the first block as a heading." : index === blocks.length - 1 ? "The fixture keeps the final reusable block." : "The fixture replaces the case narrative block.",
         inlineFields: [],

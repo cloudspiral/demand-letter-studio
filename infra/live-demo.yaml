@@ -370,8 +370,8 @@ Resources:
 
 Outputs:
   LiveUrl:
-    Description: HTTPS URL for the Steno V1 live demo using IP-derived DNS
-    Value: !Sub 'https://${AppInstance.PublicIp}.sslip.io'
+    Description: HTTPS URL for the Steno V1 live demo using readable IP-derived DNS
+    Value: !Sub 'https://steno-demo.${AppInstance.PublicIp}.sslip.io'
   ArtifactBucketName:
     Description: Private bucket that receives the packaged working tree
     Value: !Ref ArtifactBucket

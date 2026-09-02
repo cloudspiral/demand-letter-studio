@@ -46,7 +46,7 @@ For a no-cost deterministic run, set `AI_PROVIDER=mock`. The normal configuratio
 
 The live AWS demo uses direct OpenAI rather than routing through Bedrock. Its API key remains in AWS Secrets Manager and is resolved only at container startup through the AWS Workload Credentials Provider and AWS Agent Toolkit `asm-exec` wrapper; the key is never stored in the source archive, CloudFormation parameters, EC2 user data, or deployment logs.
 
-Live demo: [https://13.219.250.195.sslip.io](https://13.219.250.195.sslip.io). Documented release: `steno-template-library-final-20260901T215022Z` in stack `steno-v1-live-direct` (`us-east-1`).
+Live demo: [https://steno-demo.13.219.250.195.sslip.io](https://steno-demo.13.219.250.195.sslip.io). Documented release: `steno-template-library-final-20260901T215022Z` in stack `steno-v1-live-direct` (`us-east-1`).
 
 ## Verification
 

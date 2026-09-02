@@ -77,6 +77,23 @@ describe("schema-v2 template maps", () => {
     }])).toThrow(/exact original template text/i);
   });
 
+  it("rejects a child Keep field when its complete parent block is Replace", () => {
+    const sourceBlock = region({
+      paragraphIndex: 1,
+      text: "Claim Number: OLD-123",
+      inlineFields: [{
+        key: "claim_number", label: "Claim number", start: 14, end: 21, originalText: "OLD-123",
+        kind: "claim-number", confidence: 1, explanation: "Previous matter identifier.", source: "model", role: "replace",
+      }],
+    });
+    expect(() => validateConfirmedBlocks(analysis([sourceBlock]), [{
+      ...sourceBlock,
+      role: "editable",
+      aiRecommendation: "replace",
+      inlineFields: sourceBlock.inlineFields?.map((field) => ({ ...field, role: "keep" as const })),
+    }])).toThrow(/requires every inline field to be Replace/i);
+  });
+
   it("derives elastic prose runs and breaks them at headings, Keep blocks, and style changes", () => {
     const blocks = [
       region({ paragraphIndex: 0, text: "Facts", role: "heading", semanticKind: "heading", section: "Facts" }),

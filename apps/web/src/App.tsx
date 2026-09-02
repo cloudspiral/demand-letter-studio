@@ -45,6 +45,14 @@ type TemplateReviewUnit = {
   title: string;
 };
 
+function normalizeTemplateBlockHierarchy(block: TemplateRegion): TemplateRegion {
+  if (block.role !== "editable") return block;
+  return {
+    ...block,
+    inlineFields: (block.inlineFields ?? []).map((field) => ({ ...field, role: "replace" })),
+  };
+}
+
 function RegionReviewModal({ template, onCancel, onConfirmed }: {
   template: TemplateResponse;
   onCancel: () => void;
@@ -53,7 +61,7 @@ function RegionReviewModal({ template, onCancel, onConfirmed }: {
   const storageKey = `steno-template-map-v2:${template.id}`;
   const sourceBlocks = template.confirmedMap?.blocks
     ?? (template.analysis.blocks?.length ? template.analysis.blocks : template.confirmedRegions ?? template.analysis.regions);
-  const normalized = sourceBlocks.map((block) => ({
+  const normalized = sourceBlocks.map((block) => normalizeTemplateBlockHierarchy({
     ...block,
     inlineFields: block.inlineFields ?? [],
     id: block.id ?? `${block.anchor?.partName ?? "word/document.xml"}:p:${block.paragraphIndex}`,
@@ -61,7 +69,9 @@ function RegionReviewModal({ template, onCancel, onConfirmed }: {
   const [blocks, setBlocks] = useState<TemplateRegion[]>(() => {
     try {
       const saved = window.localStorage.getItem(storageKey);
-      return saved ? JSON.parse(saved) as TemplateRegion[] : normalized;
+      return saved
+        ? (JSON.parse(saved) as TemplateRegion[]).map(normalizeTemplateBlockHierarchy)
+        : normalized;
     } catch {
       return normalized;
     }
@@ -112,11 +122,7 @@ function RegionReviewModal({ template, onCancel, onConfirmed }: {
   const unitNeedsAttention = (unit: TemplateReviewUnit) => unitBlocks(unit).some((block) => (
     block.needsAttention || (block.inlineFields ?? []).some((field) => field.confidence < 0.8)
   ));
-  const orderedUnits = useMemo(() => [...units].sort((left, right) => {
-    const rank = (unit: TemplateReviewUnit) => unitNeedsAttention(unit) ? 0 : unitRole(unit) === "editable" ? 1 : 2;
-    return rank(left) - rank(right);
-  }), [units, blockById]);
-  const visibleUnits = orderedUnits.filter((unit) => (
+  const visibleUnits = units.filter((unit) => (
     filter === "all"
     || (filter === "attention" && unitNeedsAttention(unit))
     || (filter === "replace" && unitRole(unit) === "editable")
@@ -138,7 +144,7 @@ function RegionReviewModal({ template, onCancel, onConfirmed }: {
 
   const updateIds = (ids: string[], update: (block: TemplateRegion) => TemplateRegion) => {
     const selected = new Set(ids);
-    setBlocks((current) => current.map((block) => selected.has(block.id!) ? update(block) : block));
+    setBlocks((current) => current.map((block) => selected.has(block.id!) ? normalizeTemplateBlockHierarchy(update(block)) : block));
   };
   const selectUnit = (unit: TemplateReviewUnit, origin: "document" | "queue") => {
     setActiveId(unit.id);
@@ -220,9 +226,9 @@ function RegionReviewModal({ template, onCancel, onConfirmed }: {
     <header className="map-header">
       <button className="map-back" onClick={onCancel}><ArrowLeft size={16} /> Back</button>
       <div className="map-title"><p className="eyebrow">Template map</p><h1 id="map-title">Review template structure</h1><span>{templateDisplayName(template)}</span></div>
-      <div className="map-progress" aria-label={`${attentionCount} items need attention`}>
+      <div className="map-progress" aria-label={`${attentionCount} items marked unsure`}>
         <div><strong>{replaceCount + keepCount}</strong><span>mapped</span></div>
-        <div><strong className={attentionCount ? "amber" : "green"}>{attentionCount}</strong><span>attention</span></div>
+        <div><strong className={attentionCount ? "amber" : "green"}>{attentionCount}</strong><span>unsure</span></div>
         <small>{saveState}</small>
       </div>
       <button className="primary map-confirm" onClick={() => void confirm()} disabled={busy || attentionCount > 0}>
@@ -243,7 +249,6 @@ function RegionReviewModal({ template, onCancel, onConfirmed }: {
               key={block.id}
               onClick={() => unit && selectUnit(unit, "document")}
             >
-              {unit && <span className="map-block-pill">{unit.kind === "structured" ? "Group" : unit.kind === "figure" ? "Figure" : role}</span>}
               {block.semanticKind === "figure"
                 ? <div className="map-figure-placeholder"><FileText size={22} /><strong>Mapped evidence figure</strong><span>{block.figure?.partName}</span></div>
                 : <p
@@ -262,7 +267,7 @@ function RegionReviewModal({ template, onCancel, onConfirmed }: {
         <div className="map-queue-sticky">
           <div><p className="eyebrow">Review queue</p><strong>{visibleUnits.length} {visibleUnits.length === 1 ? "item" : "items"}</strong></div>
           <div className="map-filters">
-            {(["all", "attention", "replace", "keep"] as const).map((value) => <button className={filter === value ? "active" : ""} key={value} onClick={() => setFilter(value)}>{value}</button>)}
+            {(["all", "attention", "replace", "keep"] as const).map((value) => <button className={filter === value ? "active" : ""} key={value} onClick={() => setFilter(value)}>{value === "attention" ? "unsure" : value}</button>)}
           </div>
         </div>
         {selectedSpan && <div className="map-selection-card"><small>Selected text</small><q>{selectedSpan.text}</q><button onClick={addInlineField}><Plus size={13} /> Add replacement field</button></div>}
@@ -281,7 +286,6 @@ function RegionReviewModal({ template, onCancel, onConfirmed }: {
             >
               <div className="map-card-heading">
                 <span>{unit.kind === "structured" ? "Structured group" : unit.kind === "figure" ? "Evidence figure" : unit.kind === "heading" ? "Locked heading" : "Content block"}</span>
-                <i>{attention ? "Attention" : role === "editable" ? "Replace" : unit.kind === "heading" ? "Heading" : "Keep"}</i>
               </div>
               <h2>{unit.title}</h2>
               <p>{unit.kind === "structured" ? `${members.length} mapped rows are handled as one 0-N group, including total-row formatting.` : unit.kind === "figure" ? "Replace only with an uploaded evidence image and a source-grounded caption, or omit the figure and caption together." : first.text}</p>
@@ -289,18 +293,18 @@ function RegionReviewModal({ template, onCancel, onConfirmed }: {
                 <button className={role === "preserve" ? "active keep" : ""} onClick={(event) => { event.stopPropagation(); setUnitRole(unit, "preserve"); }}><Check size={12} /> Keep</button>
                 <button className={role === "editable" ? "active replace" : ""} onClick={(event) => { event.stopPropagation(); setUnitRole(unit, "editable"); }}><Sparkles size={12} /> Replace</button>
               </div>}
-              {attention && <div className="map-recommendation"><CircleAlert size={14} /><span><strong>Review recommendation · {Math.round(first.confidence * 100)}%</strong>{first.explanation || "Confirm the appropriate map decision."}</span><button onClick={(event) => { event.stopPropagation(); acceptRecommendation(unit); }}>Accept</button></div>}
-              {fields.length > 0 && <div className={`map-field-list ${role === "preserve" && unit.kind !== "heading" ? "parent-kept" : ""}`}>
+              {attention && <div className="map-recommendation"><CircleAlert size={14} /><span><strong>AI is unsure · {Math.round(first.confidence * 100)}% confidence</strong>{first.explanation || "Choose Keep or Replace for this block."}</span><button onClick={(event) => { event.stopPropagation(); acceptRecommendation(unit); }}>Use recommendation</button></div>}
+              {fields.length > 0 && <div className={`map-field-list ${role === "editable" ? "parent-replaced" : ""}`}>
                 <strong>Inline fields</strong>
                 {fields.map(({ block, field }) => <div className="map-field-row" key={field.key}>
                   <span><b>{field.label}</b><code>{field.originalText}</code></span>
                   <div>
-                    <button disabled={role === "preserve" && unit.kind !== "heading"} className={field.role === "keep" ? "active" : ""} onClick={(event) => { event.stopPropagation(); updateIds([block.id!], (candidate) => ({ ...candidate, inlineFields: candidate.inlineFields?.map((item) => item.key === field.key ? { ...item, role: "keep" } : item) })); }}>Keep</button>
-                    <button disabled={role === "preserve" && unit.kind !== "heading"} className={field.role === "replace" ? "active" : ""} onClick={(event) => { event.stopPropagation(); updateIds([block.id!], (candidate) => ({ ...candidate, inlineFields: candidate.inlineFields?.map((item) => item.key === field.key ? { ...item, role: "replace" } : item) })); }}>Replace</button>
+                    <button disabled={role === "editable"} className={field.role === "keep" ? "active" : ""} onClick={(event) => { event.stopPropagation(); updateIds([block.id!], (candidate) => ({ ...candidate, inlineFields: candidate.inlineFields?.map((item) => item.key === field.key ? { ...item, role: "keep" } : item) })); }}>Keep</button>
+                    <button disabled={role === "editable"} className={field.role === "replace" ? "active" : ""} onClick={(event) => { event.stopPropagation(); updateIds([block.id!], (candidate) => ({ ...candidate, inlineFields: candidate.inlineFields?.map((item) => item.key === field.key ? { ...item, role: "replace" } : item) })); }}>Replace</button>
                     {field.source === "user" && <button aria-label={`Remove ${field.label}`} onClick={(event) => { event.stopPropagation(); updateIds([block.id!], (candidate) => ({ ...candidate, inlineFields: candidate.inlineFields?.filter((item) => item.key !== field.key) })); }}><X size={11} /></button>}
                   </div>
                 </div>)}
-                {role === "preserve" && unit.kind !== "heading" && <small>Child field choices are saved but inactive while the parent block is Keep.</small>}
+                {role === "editable" && <small>The whole block will be replaced, so its inline fields are locked to Replace.</small>}
               </div>}
             </article>;
           })}
@@ -322,6 +326,7 @@ function Setup({ onReady }: { onReady: (matterId: string) => Promise<void> }) {
   const [files, setFiles] = useState<File[]>([]);
   const [busy, setBusy] = useState(false);
   const [busyLabel, setBusyLabel] = useState("");
+  const [removingTemplateId, setRemovingTemplateId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [sampleAvailable, setSampleAvailable] = useState(false);
 
@@ -340,6 +345,26 @@ function Setup({ onReady }: { onReady: (matterId: string) => Promise<void> }) {
     setSelected(null);
     setPendingTemplate(file);
     setError(null);
+  };
+
+  const removeTemplate = async (template: TemplateResponse) => {
+    setRemovingTemplateId(template.id);
+    setError(null);
+    try {
+      const result = await api<{ removedTemplateIds: string[] }>(`/api/templates/${template.id}`, { method: "DELETE" });
+      const removedIds = new Set(result.removedTemplateIds);
+      setTemplates((current) => current.filter((candidate) => !removedIds.has(candidate.id)));
+      if (selected && removedIds.has(selected.id)) {
+        setSelected(null);
+        setPendingCaseWorkspaceId(null);
+      }
+      if (review && removedIds.has(review.id)) setReview(null);
+      result.removedTemplateIds.forEach((id) => window.localStorage.removeItem(`steno-template-map-v2:${id}`));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Template could not be removed");
+    } finally {
+      setRemovingTemplateId(null);
+    }
   };
 
   const addFiles = (incoming: File[]) => setFiles((current) => {
@@ -413,16 +438,25 @@ function Setup({ onReady }: { onReady: (matterId: string) => Promise<void> }) {
               const displayName = templateDisplayName(template);
               const createdLabel = template.isTest ? templateCreatedLabel(template.createdAt) : null;
               return (
-                <button className={`template-card ${selected?.id === template.id ? "selected" : ""}`} key={template.id} onClick={() => chooseTemplate(template)}>
-                  <div className="template-tag"><span>{template.isTest ? "Test template" : template.status === "confirmed" ? "Firm template" : "Review needed"}</span>{template.status === "confirmed" && <span
-                    className="edit-map-link" role="button" tabIndex={0}
-                    onClick={(event) => { event.stopPropagation(); setSelected(template); setReview(template); }}
-                    onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); event.stopPropagation(); setSelected(template); setReview(template); } }}
-                  >Edit map</span>}<i /></div>
-                  <strong title={displayName}>{displayName}</strong>
-                  <small>{template.analysis.paragraphCount} paragraphs · {template.analysis.regions.filter((region) => region.role === "editable").length} Replace blocks</small>
-                  {createdLabel && <small className="template-created">Test run · {createdLabel}</small>}
-                </button>
+                <div className="template-card-shell" key={template.id}>
+                  <button className={`template-card ${selected?.id === template.id ? "selected" : ""}`} onClick={() => chooseTemplate(template)}>
+                    <div className="template-tag"><span>{template.isTest ? "Test template" : template.status === "confirmed" ? "Firm template" : "Review needed"}</span>{template.status === "confirmed" && <span
+                      className="edit-map-link" role="button" tabIndex={0}
+                      onClick={(event) => { event.stopPropagation(); setSelected(template); setReview(template); }}
+                      onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); event.stopPropagation(); setSelected(template); setReview(template); } }}
+                    >Edit map</span>}<i /></div>
+                    <strong title={displayName}>{displayName}</strong>
+                    <small>{template.analysis.paragraphCount} paragraphs · {template.analysis.regions.filter((region) => region.role === "editable").length} Replace blocks</small>
+                    {createdLabel && <small className="template-created">Test run · {createdLabel}</small>}
+                  </button>
+                  <button
+                    aria-label={`Remove ${displayName} from template library`}
+                    className="template-remove"
+                    disabled={removingTemplateId === template.id || busy}
+                    onClick={() => void removeTemplate(template)}
+                    title="Remove from template library"
+                  >{removingTemplateId === template.id ? <LoaderCircle className="spin" size={12} /> : <X size={12} />}</button>
+                </div>
               );
             })}
             {query && filtered.length === 0 && <p className="template-empty">No real templates match “{query}”. Clear the search or upload a DOCX.</p>}
@@ -567,6 +601,8 @@ function RefinePanel({
 
 export function App() {
   const [matter, setMatter] = useState<MatterResponse | null>(null);
+  const [resumeMatterId] = useState(() => new URLSearchParams(window.location.search).get("matter"));
+  const [resumingMatter, setResumingMatter] = useState(Boolean(resumeMatterId));
   const [draft, setDraft] = useState<DraftResponse | null>(null);
   const [content, setContent] = useState<GeneratedDraft | null>(null);
   const [job, setJob] = useState<JobResponse | null>(null);
@@ -617,31 +653,77 @@ export function App() {
         method: "POST",
         body: JSON.stringify(existingDraft ? { draftId: existingDraft.id, baseVersion: existingDraft.version } : {}),
       });
+      const jobId = queued.jobId ?? queued.id;
+      if (!jobId) throw new Error("Generation response did not include a job id.");
       setJob({ ...queued, jobType: "generation", progress: 0, step: "Queued" });
-      const stream = new EventSource(`/api/jobs/${queued.jobId}/events`);
+      const stream = new EventSource(`/api/jobs/${jobId}/events`);
+      let terminalHandled = false;
+      let reconciling = false;
       const update = (event: MessageEvent<string>) => {
         const payload = JSON.parse(event.data) as { progress?: number; step?: string; draftId?: string; error?: string };
         const status = event.type === "completed" ? "completed" : event.type === "failed" ? "failed" : event.type === "progress" ? "processing" : "queued";
         setJob((current) => ({ ...(current ?? queued), jobType: "generation", ...payload, status }));
       };
+      const revealDraft = (draftId: string) => {
+        if (terminalHandled) return;
+        terminalHandled = true;
+        stream.close();
+        void loadDraft(draftId)
+          .then(() => Promise.all([loadActivity(target.id), refreshMatter(target.id)]))
+          .catch((caught) => setNotice(caught instanceof Error ? caught.message : "Completed draft could not be loaded"));
+      };
       stream.addEventListener("queued", update); stream.addEventListener("progress", update);
       stream.addEventListener("completed", (event) => {
         update(event as MessageEvent<string>);
-        const payload = JSON.parse((event as MessageEvent<string>).data) as { draftId: string };
-        stream.close();
-        void loadDraft(payload.draftId).then(() => Promise.all([loadActivity(target.id), refreshMatter(target.id)]));
+        const payload = JSON.parse((event as MessageEvent<string>).data) as { draftId?: string };
+        if (payload.draftId) revealDraft(payload.draftId);
+        else {
+          terminalHandled = true;
+          stream.close();
+          setNotice("Generation completed without a saved draft reference.");
+        }
       });
-      stream.addEventListener("failed", (event) => { update(event as MessageEvent<string>); stream.close(); });
-      stream.onerror = () => stream.close();
+      stream.addEventListener("failed", (event) => { terminalHandled = true; update(event as MessageEvent<string>); stream.close(); });
+      stream.onerror = () => {
+        if (terminalHandled || reconciling) return;
+        reconciling = true;
+        void api<JobResponse>(`/api/jobs/${jobId}`).then((latest) => {
+          setJob((current) => ({ ...(current ?? queued), ...latest, jobType: "generation" }));
+          if (latest.status === "completed") {
+            const draftId = latest.draftId ?? latest.result?.draftId;
+            if (draftId) revealDraft(draftId);
+            else {
+              terminalHandled = true;
+              stream.close();
+              setNotice("Generation completed without a saved draft reference.");
+            }
+          } else if (latest.status === "failed") {
+            terminalHandled = true;
+            stream.close();
+          }
+        }).catch(() => {
+          // Leave EventSource open so its native reconnect can recover a transient interruption.
+        }).finally(() => { reconciling = false; });
+      };
     } catch (caught) { setNotice(caught instanceof Error ? caught.message : "Generation failed"); }
   }, [loadActivity, loadDraft, refreshMatter]);
 
   const openMatter = useCallback(async (matterId: string) => {
+    const url = new URL(window.location.href);
+    url.searchParams.set("matter", matterId);
+    window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
     const loaded = await refreshMatter(matterId);
     if (loaded.activeDraft) await loadDraft(loaded.activeDraft.id);
     else await generateForMatter(loaded);
     await loadActivity(matterId);
   }, [generateForMatter, loadActivity, loadDraft, refreshMatter]);
+
+  useEffect(() => {
+    if (!resumeMatterId) return;
+    void openMatter(resumeMatterId)
+      .catch((caught) => setNotice(caught instanceof Error ? caught.message : "Saved draft could not be reopened"))
+      .finally(() => setResumingMatter(false));
+  }, [openMatter, resumeMatterId]);
 
   const citationEntries = useMemo(() => {
     if (!content) return [];
@@ -831,7 +913,15 @@ export function App() {
     if (block) setActiveBlockId(block.id);
   };
 
-  if (!matter) return <Setup onReady={openMatter} />;
+  if (!matter) {
+    if (resumingMatter) return <div className="workspace-app"><main className="letter-workspace"><section className="generation-state">
+      <div className="generation-glyph"><LoaderCircle className="spin" size={28} /></div>
+      <p className="eyebrow">Restoring workspace</p>
+      <h1>Reopening saved draft</h1>
+      <p>Loading the latest durable matter and draft version.</p>
+    </section></main></div>;
+    return <Setup onReady={openMatter} />;
+  }
 
   const readiness = draft?.readiness ?? null;
   const exportBlocked = !readiness?.ready;
@@ -930,7 +1020,12 @@ export function App() {
       </header>
       <div className="workspace-grid">
         <aside className="source-strip">
-          <button className="back-to-setup" onClick={() => { setMatter(null); setDraft(null); setContent(null); setJob(null); }} title="Start a new draft"><ArrowLeft size={17} /></button>
+          <button className="back-to-setup" onClick={() => {
+            const url = new URL(window.location.href);
+            url.searchParams.delete("matter");
+            window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+            setMatter(null); setDraft(null); setContent(null); setJob(null);
+          }} title="Start a new draft"><ArrowLeft size={17} /></button>
           <button className={sourcesOpen ? "active" : ""} onClick={() => setSourcesOpen((current) => !current)}><FileText size={15} /><span>Sources · {matter.sources.length}</span></button>
         </aside>
 

@@ -94,7 +94,7 @@ imds_token=$(curl --fail --silent --show-error --request PUT \
 public_ip=$(curl --fail --silent --show-error \
   --header "X-aws-ec2-metadata-token: $imds_token" \
   http://169.254.169.254/latest/meta-data/public-ipv4)
-live_hostname="$public_ip.sslip.io"
+live_hostname="steno-demo.$public_ip.sslip.io"
 
 install -d -m 0755 /opt/steno/caddy
 printf '%s\n' \

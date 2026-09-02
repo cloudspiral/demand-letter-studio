@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS templates (
   sha256 text NOT NULL,
   analysis jsonb NOT NULL,
   confirmed_regions jsonb,
+  removed_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS matters (
@@ -217,6 +218,7 @@ ALTER TABLE draft_versions ADD COLUMN IF NOT EXISTS source_fingerprint text;
 ALTER TABLE templates ADD COLUMN IF NOT EXISTS display_name text;
 ALTER TABLE templates ADD COLUMN IF NOT EXISTS is_test boolean NOT NULL DEFAULT false;
 ALTER TABLE templates ADD COLUMN IF NOT EXISTS current_map_version integer;
+ALTER TABLE templates ADD COLUMN IF NOT EXISTS removed_at timestamptz;
 ALTER TABLE matters ADD COLUMN IF NOT EXISTS template_map_version integer;
 ALTER TABLE matters ADD COLUMN IF NOT EXISTS name_manually_edited boolean NOT NULL DEFAULT false;
 ALTER TABLE matters ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();
@@ -236,6 +238,9 @@ DROP INDEX IF EXISTS jobs_one_active_type_per_matter;
 CREATE UNIQUE INDEX IF NOT EXISTS jobs_one_active_generation_per_matter
   ON jobs (matter_id)
   WHERE job_type = 'generation' AND status IN ('queued', 'processing');
+CREATE INDEX IF NOT EXISTS templates_active_by_workspace_hash
+  ON templates (workspace_id, sha256, created_at DESC)
+  WHERE removed_at IS NULL;
 `;
 
 export async function migrate(): Promise<void> {

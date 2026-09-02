@@ -48,6 +48,9 @@ export function validateConfirmedBlocks(
     if (block.semanticKind === "heading" && block.role !== "heading") {
       throw new Error(`Template heading structure cannot be changed: ${id}`);
     }
+    if (block.role === "editable" && (block.inlineFields ?? []).some((field) => field.role !== "replace")) {
+      throw new Error(`A Replace block requires every inline field to be Replace: ${id}`);
+    }
     return TemplateRegionSchema.parse({ ...block, id, needsAttention: false });
   });
   if (seen.size !== analyzedById.size) {

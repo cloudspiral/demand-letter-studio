@@ -15,14 +15,14 @@ import {
   TemplateMapSchema,
   TemplateRegionSchema,
 } from "@steno/contracts";
-import { createAiProvider, type EvidencePage } from "./ai";
+import { createAiProvider, CURRENT_TEMPLATE_ANALYSIS_VERSION, type EvidencePage } from "./ai";
 import { config } from "./config";
 import { ACTOR_ID, migrate, persistCitations, pool, sourceFingerprintForMatter, WORKSPACE_ID } from "./db";
 import { analyzeTemplate, extractSource } from "./document-worker";
 import { draftExportIssues, isDraftExportReady } from "./draft-export";
 import { confirmDraftField } from "./draft-fields";
 import { ingestEditedDraftDocument, materializeDraftDocument } from "./draft-document";
-import { appendJobEvent, ensureEditableCoverage, processGenerationJob, recordAiRun, resumeQueuedJobs } from "./jobs";
+import { appendJobEvent, ensureEditableCoverage, processGenerationJob, recordAiRun, resumeQueuedJobs, terminalEventForJob } from "./jobs";
 import { normalizeDraftContent } from "./draft-compat";
 import { confirmOmission, supplyOmission } from "./draft-omissions";
 import {
@@ -182,7 +182,9 @@ async function insertTemplate(buffer: Buffer, filename: string, options: { isTes
            confirmed_regions AS "confirmedRegions", current_map_version AS "currentMapVersion",
            (SELECT map FROM template_map_versions WHERE template_id = templates.id AND map_version = templates.current_map_version) AS "confirmedMap",
            created_at AS "createdAt"
-    FROM templates WHERE workspace_id = $1 AND sha256 = $2 ORDER BY created_at DESC LIMIT 1
+    FROM templates
+    WHERE workspace_id = $1 AND sha256 = $2 AND removed_at IS NULL
+    ORDER BY created_at DESC LIMIT 1
   `, [WORKSPACE_ID, stored.sha256]);
   if (existing.rowCount) {
     const current = requiredRow(existing.rows, "Existing template lookup failed.");
@@ -193,7 +195,7 @@ async function insertTemplate(buffer: Buffer, filename: string, options: { isTes
     const analyzedBlockIds = new Set(analyzedBlocks.map((block) => block.id ?? `word/document.xml:p:${block.paragraphIndex}`));
     const confirmedMapIsComplete = current.status === "confirmed"
       && current.currentMapVersion
-      && currentAnalysis.analysisVersion >= 5
+      && currentAnalysis.analysisVersion >= CURRENT_TEMPLATE_ANALYSIS_VERSION
       && analyzedBlocks.length > 0
       && parsedMap.success
       && parsedMap.data.templateHash === stored.sha256
@@ -202,7 +204,7 @@ async function insertTemplate(buffer: Buffer, filename: string, options: { isTes
     if (confirmedMapIsComplete) {
       return current;
     }
-    if (current.status === "analyzed" && currentAnalysis.analysisVersion >= 5 && analyzedBlocks.length) {
+    if (current.status === "analyzed" && currentAnalysis.analysisVersion >= CURRENT_TEMPLATE_ANALYSIS_VERSION && analyzedBlocks.length) {
       return current;
     }
     const structuralAnalysis = TemplateAnalysisSchema.parse({
@@ -451,9 +453,28 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
              confirmed_regions AS "confirmedRegions", current_map_version AS "currentMapVersion",
              (SELECT map FROM template_map_versions WHERE template_id = templates.id AND map_version = templates.current_map_version) AS "confirmedMap",
              created_at AS "createdAt", sha256
-      FROM templates WHERE workspace_id = $1 ORDER BY sha256, created_at DESC
+      FROM templates
+      WHERE workspace_id = $1 AND removed_at IS NULL
+      ORDER BY sha256, created_at DESC
     `, [WORKSPACE_ID]);
     return result.rows.sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime());
+  });
+
+  app.delete("/api/templates/:id", async (request, reply) => {
+    const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+    const template = await pool.query<{ sha256: string }>(`
+      SELECT sha256
+      FROM templates
+      WHERE id = $1 AND workspace_id = $2 AND removed_at IS NULL
+    `, [id, WORKSPACE_ID]);
+    if (!template.rowCount) return reply.status(404).send({ error: "Template not found." });
+    const removed = await pool.query<{ id: string }>(`
+      UPDATE templates
+      SET removed_at = now()
+      WHERE workspace_id = $1 AND sha256 = $2 AND removed_at IS NULL
+      RETURNING id
+    `, [WORKSPACE_ID, template.rows[0]!.sha256]);
+    return reply.send({ removedTemplateIds: removed.rows.map((row) => row.id) });
   });
 
   app.post("/api/templates", async (request, reply) => {
@@ -582,7 +603,7 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
                  (SELECT map FROM template_map_versions WHERE template_id = templates.id AND map_version = templates.current_map_version) AS "confirmedMap",
                  storage_key AS "storageKey",
                  created_at AS "createdAt"
-          FROM templates WHERE id = $1 AND workspace_id = $2
+          FROM templates WHERE id = $1 AND workspace_id = $2 AND removed_at IS NULL
         `, [templateId, WORKSPACE_ID]).then(async (result) => {
           const existingTemplate = requiredRow(result.rows, "Template not found.");
           if (!existingTemplate.storageKey) throw new Error("Stored template original is unavailable.");
@@ -650,7 +671,7 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
 
   app.post("/api/matters", async (request, reply) => {
     const body = CreateMatterSchema.parse(request.body);
-    const confirmed = await pool.query<{ current_map_version: number | null }>("SELECT current_map_version FROM templates WHERE id = $1 AND status = 'confirmed'", [body.templateId]);
+    const confirmed = await pool.query<{ current_map_version: number | null }>("SELECT current_map_version FROM templates WHERE id = $1 AND status = 'confirmed' AND removed_at IS NULL", [body.templateId]);
     if (!confirmed.rowCount) return reply.status(409).send({ error: "Confirm the template map before creating a case workspace." });
     const mapVersion = confirmed.rows[0]?.current_map_version;
     if (!mapVersion) return reply.status(409).send({ error: "Confirm the versioned template map before creating a case workspace." });
@@ -859,6 +880,7 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
     });
     let lastId = Number(request.headers["last-event-id"] ?? 0);
     let lastWriteAt = Date.now();
+    let terminalEventDelivered = false;
     const sendPending = async () => {
       const events = await pool.query<{ id: string; event_type: string; payload: unknown }>(`
         SELECT id::text, event_type, payload FROM job_events WHERE job_id = $1 AND id > $2 ORDER BY id
@@ -867,16 +889,39 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
         lastId = Number(event.id);
         reply.raw.write(`id: ${event.id}\nevent: ${event.event_type}\ndata: ${JSON.stringify(event.payload)}\n\n`);
         lastWriteAt = Date.now();
+        if (["completed", "failed"].includes(event.event_type)) terminalEventDelivered = true;
       }
       if (Date.now() - lastWriteAt >= 15_000) {
         reply.raw.write(": keepalive\n\n");
         lastWriteAt = Date.now();
       }
-      const status = await pool.query<{ status: string }>("SELECT status FROM jobs WHERE id = $1", [id]);
-      return status.rows[0]?.status;
+      const status = await pool.query<{
+        status: string;
+        progress: number;
+        step: string;
+        draftId: string | null;
+        error: string | null;
+        result: unknown;
+      }>(`
+        SELECT status, progress, step, draft_id AS "draftId", error, result
+        FROM jobs WHERE id = $1
+      `, [id]);
+      const job = status.rows[0];
+      if (!job) return null;
+      const terminalEvent = terminalEventForJob(job);
+      if (terminalEvent && !terminalEventDelivered) {
+        reply.raw.write(`event: ${terminalEvent.eventType}\ndata: ${JSON.stringify(terminalEvent.payload)}\n\n`);
+        terminalEventDelivered = true;
+      }
+      return job.status;
     };
+    const initialStatus = await sendPending();
+    if (["completed", "failed"].includes(initialStatus ?? "") && terminalEventDelivered) {
+      reply.raw.end();
+      return;
+    }
     const timer = setInterval(() => void sendPending().then((status) => {
-      if (["completed", "failed"].includes(status ?? "")) {
+      if (["completed", "failed"].includes(status ?? "") && terminalEventDelivered) {
         clearInterval(timer);
         reply.raw.end();
       }
@@ -885,7 +930,6 @@ export async function buildApp(options: { runMigrations?: boolean } = {}): Promi
       reply.raw.end();
     }), 500);
     request.raw.on("close", () => clearInterval(timer));
-    await sendPending();
   });
 
   app.get("/api/drafts/:id", async (request, reply) => {

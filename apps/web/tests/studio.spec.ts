@@ -22,28 +22,35 @@ async function expectTitleContained(card: Locator) {
 
 test("template picker presents clean provenance and contains long names", async ({ page }) => {
   const longName = "x".repeat(180);
+  let templates = [{
+    id: "10000000-0000-4000-8000-000000000001",
+    name: `${"a".repeat(64)}-${longName}.docx`,
+    displayName: longName,
+    isTest: true,
+    status: "confirmed",
+    analysis: { paragraphCount: 13, regions: [] },
+    createdAt: "2026-09-01T07:43:03.519Z",
+  }, {
+    id: "10000000-0000-4000-8000-000000000002",
+    name: `${"b".repeat(64)}-AAA-Insurance---Time-Limited-Policy-Limits-Demand---Pat-Donahue.docx`,
+    displayName: "AAA Insurance - Time Limited Policy Limits Demand - Pat Donahue",
+    isTest: false,
+    status: "confirmed",
+    analysis: { paragraphCount: 152, regions: [] },
+    createdAt: "2026-09-01T07:28:28.328Z",
+  }];
   await page.route("**/api/templates", async (route) => {
     if (route.request().method() !== "GET") return route.continue();
     return route.fulfill({
       contentType: "application/json",
-      body: JSON.stringify([{
-        id: "10000000-0000-4000-8000-000000000001",
-        name: `${"a".repeat(64)}-${longName}.docx`,
-        displayName: longName,
-        isTest: true,
-        status: "confirmed",
-        analysis: { paragraphCount: 13, regions: [] },
-        createdAt: "2026-09-01T07:43:03.519Z",
-      }, {
-        id: "10000000-0000-4000-8000-000000000002",
-        name: `${"b".repeat(64)}-AAA-Insurance---Time-Limited-Policy-Limits-Demand---Pat-Donahue.docx`,
-        displayName: "AAA Insurance - Time Limited Policy Limits Demand - Pat Donahue",
-        isTest: false,
-        status: "confirmed",
-        analysis: { paragraphCount: 152, regions: [] },
-        createdAt: "2026-09-01T07:28:28.328Z",
-      }]),
+      body: JSON.stringify(templates),
     });
+  });
+  await page.route("**/api/templates/*", async (route) => {
+    if (route.request().method() !== "DELETE") return route.continue();
+    const id = route.request().url().split("/").pop()!;
+    templates = templates.filter((template) => template.id !== id);
+    return route.fulfill({ contentType: "application/json", body: JSON.stringify({ removedTemplateIds: [id] }) });
   });
 
   await page.goto("/");
@@ -60,6 +67,9 @@ test("template picker presents clean provenance and contains long names", async 
   await expect(longTitle).toBeHidden();
 
   await page.getByPlaceholder("Search templates…").fill("");
+  await page.getByRole("button", { name: "Remove AAA Insurance - Time Limited Policy Limits Demand - Pat Donahue from template library" }).click();
+  await expect(firmTitle).toBeHidden();
+  await expect(page.getByText("1 template", { exact: true })).toBeVisible();
   await page.setViewportSize({ width: 700, height: 900 });
   await expect(longTitle).toBeVisible();
   await expectTitleContained(testCard);
@@ -96,7 +106,9 @@ test("map v2 keeps the full letter visible while its queue filters and synchroni
     makeBlock(3, "Old Hospital:\t$9,000", { role: "editable", aiRecommendation: "replace", structuredGroup: { id: "expenses", representation: "paragraph-rows", rowRole: "body", tableIndex: null, rowIndex: 0, cellIndex: null, columnCount: 2, columnWidths: [] } }),
     makeBlock(4, "[figure]", { role: "editable", semanticKind: "figure", aiRecommendation: "replace", figure: { relationshipId: "rId9", partName: "word/media/image1.png", contentType: "image/png", captionBlockId: "word/document.xml:p:5" } }),
     makeBlock(5, "Photograph 1: old damage."),
-    makeBlock(6, "Reusable settlement boilerplate."),
+    makeBlock(6, "Reusable settlement boilerplate OLD-123.", {
+      inlineFields: [{ key: "body_claim", label: "Claim number", start: 32, end: 39, originalText: "OLD-123", kind: "claim-number", confidence: 1, explanation: "Old matter identifier.", source: "model", role: "replace" }],
+    }),
   ];
   const template = {
     id: templateId, name: "map-v2-fixture.docx", displayName: "Map v2 fixture", isTest: true, status: "analyzed",
@@ -123,6 +135,7 @@ test("map v2 keeps the full letter visible while its queue filters and synchroni
     return route.fulfill({ status: 202, contentType: "application/json", body: JSON.stringify({ jobId: "new-template-generation", status: "queued" }) });
   });
   await page.route("**/api/matters/20000000-0000-4000-8000-000000000020/activity", (route) => route.fulfill({ contentType: "application/json", body: "[]" }));
+  await page.route("**/api/jobs/new-template-generation", (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ id: "new-template-generation", jobType: "generation", status: "processing", progress: 30, step: "Grounding draft in source pages" }) }));
   await page.route("**/api/jobs/new-template-generation/events", (route) => route.fulfill({ contentType: "text/event-stream", body: "event: progress\ndata: {\"progress\":30,\"step\":\"Grounding draft in source pages\"}\n\n" }));
 
   await page.goto("/");
@@ -131,13 +144,39 @@ test("map v2 keeps the full letter visible while its queue filters and synchroni
   await page.getByRole("button", { name: "Continue to template map" }).click();
   await expect(page.getByRole("heading", { name: "Review template structure" })).toBeVisible();
   await expect(page.locator(".map-document-block")).toHaveCount(7);
+  await expect(page.locator(".map-block-pill")).toHaveCount(0);
   await expect(page.locator(".map-review-card")).toHaveCount(5);
+  await expect(page.locator(".map-card-heading > i")).toHaveCount(0);
   await expect(page.locator(".map-review-card").filter({ hasText: "Structured group" })).toHaveCount(1);
   await expect(page.locator(".map-review-card").filter({ hasText: "Evidence figure" })).toHaveCount(1);
   const headingCard = page.locator(".map-review-card").filter({ hasText: "Locked heading" });
   await expect(headingCard).toContainText("Client name");
   await expect(headingCard.locator(".map-role-toggle")).toHaveCount(0);
   await expect(page.getByText("All changes saved locally")).toBeVisible();
+  const unsureDocumentBlock = page.locator('[data-review-unit="block:word/document.xml:p:1"]');
+  await expect(unsureDocumentBlock).toHaveClass(/attention/);
+  expect(await unsureDocumentBlock.evaluate((block) => getComputedStyle(block).borderLeftColor)).toBe("rgb(230, 164, 84)");
+  const reviewOrder = () => page.locator(".map-review-card").evaluateAll((cards) => cards.map((card) => card.getAttribute("data-review-card")));
+  const originalOrder = await reviewOrder();
+  const groupCard = page.locator('[data-review-card="group:expenses"]');
+  await groupCard.getByRole("button", { name: "Keep" }).click();
+  expect(await reviewOrder()).toEqual(originalOrder);
+  await groupCard.getByRole("button", { name: "Replace" }).click();
+  expect(await reviewOrder()).toEqual(originalOrder);
+  const reusableCard = page.locator('[data-review-card="block:word/document.xml:p:6"]');
+  const reusableField = reusableCard.locator(".map-field-row");
+  await expect(reusableField.getByRole("button", { name: "Keep" })).toBeEnabled();
+  await expect(reusableField.getByRole("button", { name: "Replace" })).toBeEnabled();
+  await reusableField.getByRole("button", { name: "Keep" }).click();
+  await reusableCard.locator(".map-role-toggle").getByRole("button", { name: "Replace" }).click();
+  await expect(reusableField.getByRole("button", { name: "Keep" })).toBeDisabled();
+  await expect(reusableField.getByRole("button", { name: "Replace" })).toBeDisabled();
+  await expect(reusableField.getByRole("button", { name: "Replace" })).toHaveClass(/active/);
+  await expect(reusableCard).toContainText("whole block will be replaced");
+  await reusableCard.locator(".map-role-toggle").getByRole("button", { name: "Keep" }).click();
+  await expect(reusableField.getByRole("button", { name: "Keep" })).toBeEnabled();
+  await expect(reusableField.getByRole("button", { name: "Replace" })).toBeEnabled();
+  await expect(reusableField.getByRole("button", { name: "Replace" })).toHaveClass(/active/);
   await expect(page).toHaveScreenshot("map-v2-1280x720.png", { animations: "disabled" });
 
   await page.locator(".map-filters").getByRole("button", { name: "replace" }).click();
@@ -152,7 +191,7 @@ test("map v2 keeps the full letter visible while its queue filters and synchroni
   await page.locator(".map-filters").getByRole("button", { name: "keep" }).click();
   const reusable = page.locator('[data-review-unit="block:word/document.xml:p:6"] p');
   await reusable.evaluate((node) => {
-    const text = node.firstChild;
+    const text = node.firstChild?.firstChild ?? node.firstChild;
     if (!text) throw new Error("No text node");
     const range = document.createRange();
     range.setStart(text, 0); range.setEnd(text, 8);
@@ -165,8 +204,8 @@ test("map v2 keeps the full letter visible while its queue filters and synchroni
   await page.setViewportSize({ width: 1100, height: 720 });
   await expect(page).toHaveScreenshot("map-v2-1100x720.png", { animations: "disabled" });
 
-  await page.locator(".map-filters").getByRole("button", { name: "attention" }).click();
-  await page.locator(".map-recommendation").getByRole("button", { name: "Accept" }).click();
+  await page.locator(".map-filters").getByRole("button", { name: "unsure" }).click();
+  await page.locator(".map-recommendation").getByRole("button", { name: "Use recommendation" }).click();
   await page.getByRole("button", { name: "Confirm map" }).click();
   await expect(page.getByRole("dialog")).toBeHidden();
   await expect(page.getByText("Drafting in progress", { exact: true })).toBeVisible();
@@ -182,6 +221,7 @@ test("saved template auto-generates one review card per blocker and supports edi
   let matterName = "Naomi Carter - PPC-2026-0417";
   let generationComplete = false;
   let generationRequests = 0;
+  let generationStatusRequests = 0;
   let version = 1;
   let confirmedOmissions: string[] = [];
   let outcomeStatus: "omitted" | "attorney-supplied" = "omitted";
@@ -244,7 +284,14 @@ test("saved template auto-generates one review card per blocker and supports edi
     }
     if (url.pathname === "/api/jobs/generation-job/events") {
       generationComplete = true;
-      return route.fulfill({ contentType: "text/event-stream", body: `event: completed\ndata: {\"progress\":100,\"step\":\"Draft ready\",\"draftId\":\"${draftId}\"}\n\n` });
+      return route.fulfill({ contentType: "text/event-stream", body: "event: progress\ndata: {\"progress\":80,\"step\":\"Saving versioned draft\"}\n\n" });
+    }
+    if (url.pathname === "/api/jobs/generation-job" && method === "GET") {
+      generationStatusRequests += 1;
+      return route.fulfill({ contentType: "application/json", body: JSON.stringify({
+        id: "generation-job", jobType: "generation", status: "completed", progress: 100, step: "Draft ready", draftId,
+        result: { draftId, version, sourceFingerprint: "a".repeat(64) },
+      }) });
     }
     if (url.pathname === `/api/drafts/${draftId}` && method === "GET") return route.fulfill({ contentType: "application/json", body: JSON.stringify(draftResponse()) });
     if (url.pathname === `/api/drafts/${draftId}/editor-config`) return route.fulfill({ contentType: "application/json", body: JSON.stringify({ documentServerUrl: "http://onlyoffice.test", config: {} }) });
@@ -282,6 +329,12 @@ test("saved template auto-generates one review card per blocker and supports edi
 
   await page.goto("/");
   await page.getByRole("button", { name: /Use the supplied Steno sample packet/ }).click();
+  await expect(page.locator(".word-editor-shell")).toBeVisible();
+  await expect(page.getByText("Original formatted DOCX")).toBeVisible();
+  expect(generationRequests).toBe(1);
+  expect(generationStatusRequests).toBeGreaterThan(0);
+  await expect(page).toHaveURL(new RegExp(`matter=${matterId}`));
+  await page.reload();
   await expect(page.locator(".word-editor-shell")).toBeVisible();
   await expect(page.getByText("Original formatted DOCX")).toBeVisible();
   expect(generationRequests).toBe(1);

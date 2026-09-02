@@ -48,7 +48,7 @@
 .map-document-scroll { min-height: 0; padding: 16px 28px 42px; overflow-y: auto; scroll-padding: 90px; }
 .map-guidance { position: sticky; z-index: 6; top: 0; display: flex; align-items: center; gap: 8px; width: min(720px, 100%); margin: 0 auto 10px; padding: 8px 11px; border: 1px solid var(--navy-line); border-radius: 6px; color: #53617b; background: rgba(247,249,253,.96); box-shadow: 0 3px 12px rgba(29,37,35,.05); font-size: 9px; line-height: 1.4; }
 .map-paper { width: min(720px, 100%); min-height: 1000px; margin: 0 auto; padding: 62px 68px 82px; border: 1px solid #e3e1dc; color: var(--letter-ink); background: #fffefc; box-shadow: 0 12px 38px rgba(29,37,35,.10); }
-.map-document-block { position: relative; margin: 0 -15px 3px; padding: 6px 48px 6px 15px; border: 1px solid transparent; border-left-width: 3px; border-radius: 4px; cursor: pointer; transition: background .12s, border-color .12s; }
+.map-document-block { position: relative; margin: 0 -15px 3px; padding: 6px 15px; border: 1px solid transparent; border-left-width: 3px; border-radius: 4px; cursor: pointer; transition: background .12s, border-color .12s; }
 .map-document-block:hover { background: #fafbfa; }
 .map-document-block.keep { border-left-color: var(--green-line); }
 .map-document-block.replace { border-left-color: var(--navy-line); background: rgba(244,246,252,.44); }
@@ -56,10 +56,6 @@
 .map-document-block.attention { border-left-color: #e6a454; background: var(--amber-soft); }
 .map-document-block.selected { border-color: #8a938f; box-shadow: 0 0 0 1px rgba(138,147,143,.14); }
 .map-document-block p { margin: 0; font-family: "Spectral", Georgia, serif; font-size: 12px; line-height: 1.64; white-space: pre-wrap; }
-.map-block-pill { position: absolute; top: 7px; right: 6px; padding: 2px 5px; border-radius: 99px; color: var(--muted); background: #f0f2f1; font-family: "Public Sans", sans-serif; font-size: 6.5px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; }
-.map-document-block.replace .map-block-pill { color: var(--navy); background: var(--navy-soft); }
-.map-document-block.keep .map-block-pill { color: var(--green); background: var(--green-soft); }
-.map-document-block.attention .map-block-pill { color: var(--amber); background: #fff; }
 .template-inline-field { padding: 0 2px; border-radius: 2px; color: inherit; }
 .template-inline-field.replace { border-bottom: 1px solid var(--navy); background: var(--navy-soft); }
 .template-inline-field.keep { border-bottom: 1px solid var(--green); background: var(--green-soft); }
@@ -85,9 +81,6 @@
 .map-review-card.selected { border-color: #8a938f; box-shadow: 0 0 0 1px rgba(138,147,143,.18); }
 .map-card-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .map-card-heading span { color: var(--muted); font-size: 7px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; }
-.map-card-heading i { padding: 2px 5px; border-radius: 99px; color: var(--navy); background: var(--navy-soft); font-size: 6.5px; font-style: normal; font-weight: 700; text-transform: uppercase; }
-.map-review-card.keep .map-card-heading i { color: var(--green); background: var(--green-soft); }
-.map-review-card.attention .map-card-heading i { color: var(--amber); background: var(--amber-soft); }
 .map-review-card h2 { margin: 7px 0 4px; overflow: hidden; font-family: "Public Sans", sans-serif; font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
 .map-review-card > p { display: -webkit-box; margin: 0; overflow: hidden; color: var(--muted); font-family: "Spectral", Georgia, serif; font-size: 9.5px; line-height: 1.45; -webkit-box-orient: vertical; -webkit-line-clamp: 3; }
 .map-role-toggle { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; margin-top: 10px; }
@@ -101,7 +94,7 @@
 .map-field-list { display: grid; gap: 6px; margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--line-soft); }
 .map-field-list > strong { font-size: 8px; }
 .map-field-list > small { color: var(--muted); font-size: 7px; line-height: 1.4; }
-.map-field-list.parent-kept { opacity: .68; }
+.map-field-list.parent-replaced { opacity: .68; }
 .map-field-row { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 6px; align-items: center; }
 .map-field-row > span { min-width: 0; }
 .map-field-row b, .map-field-row code { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -110,6 +103,7 @@
 .map-field-row > div { display: flex; gap: 2px; }
 .map-field-row button { display: grid; place-items: center; min-width: 24px; min-height: 22px; padding: 0 4px; border: 1px solid var(--line); border-radius: 4px; color: var(--muted); background: #fafbfa; cursor: pointer; font-size: 6.5px; font-weight: 700; }
 .map-field-row button.active { border-color: var(--navy-line); color: var(--navy); background: var(--navy-soft); }
+.map-field-row button:disabled { cursor: default; }
 .map-empty { display: flex; align-items: center; gap: 8px; padding: 20px 12px; color: var(--muted); font-size: 9px; line-height: 1.5; }
 .map-error { position: sticky; z-index: 9; bottom: 10px; margin: 0 12px 12px; }
 
@@ -207,10 +201,12 @@ button:disabled { cursor: not-allowed; opacity: .52; }
 .template-search:focus-within { border-color: var(--navy); box-shadow: 0 0 0 2px rgba(30,58,138,.07); }
 .template-search input { width: 100%; padding: 0; border: 0; outline: 0; color: var(--ink); background: transparent; font-size: 12px; }
 .template-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; max-height: 296px; padding: 3px; overflow-y: auto; }
+.template-card-shell { position: relative; min-width: 0; }
+.template-card-shell > .template-card { width: 100%; height: 100%; }
 .template-card { min-width: 0; min-height: 132px; overflow: hidden; padding: 15px; border: 1.5px solid var(--line); border-radius: 10px; color: var(--ink); background: white; cursor: pointer; text-align: left; transition: border .15s, box-shadow .15s, transform .15s; }
 .template-card:hover { border-color: var(--navy); transform: translateY(-1px); }
 .template-card.selected { border-color: var(--navy); box-shadow: 0 0 0 3px var(--navy-soft); }
-.template-tag { display: flex; align-items: center; justify-content: space-between; min-height: 18px; margin-bottom: 12px; color: var(--muted); font-size: 9.5px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+.template-tag { display: flex; align-items: center; justify-content: space-between; min-height: 18px; margin-bottom: 12px; padding-right: 21px; color: var(--muted); font-size: 9.5px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
 .template-tag .edit-map-link { margin-left: auto; margin-right: 7px; padding: 2px 4px; border-radius: 3px; color: var(--navy); font-size: 7px; letter-spacing: .02em; text-transform: none; }
 .template-tag .edit-map-link:hover { background: var(--navy-soft); }
 .template-tag i { width: 14px; height: 14px; border: 1.5px solid var(--faint); border-radius: 50%; }
@@ -218,6 +214,10 @@ button:disabled { cursor: not-allowed; opacity: .52; }
 .template-card > strong { display: -webkit-box; min-width: 0; margin-bottom: 8px; overflow: hidden; overflow-wrap: anywhere; font-size: 13px; font-weight: 600; line-height: 1.35; line-clamp: 3; -webkit-box-orient: vertical; -webkit-line-clamp: 3; }
 .template-card > small { display: block; color: var(--muted); font-size: 10.5px; line-height: 1.45; }
 .template-card > .template-created { margin-top: 7px; color: var(--tertiary); font-size: 9px; }
+.template-remove { position: absolute; z-index: 2; top: 8px; right: 8px; display: grid; width: 21px; height: 21px; padding: 0; place-items: center; border: 0; border-radius: 50%; color: var(--tertiary); background: transparent; cursor: pointer; }
+.template-remove:hover:not(:disabled) { color: #9f312c; background: #faecea; }
+.template-remove:focus-visible { outline: 2px solid var(--navy); outline-offset: 1px; }
+.template-remove:disabled { cursor: wait; opacity: .55; }
 .upload-template-card { border-style: dashed; cursor: pointer; }
 .upload-template-card input, .source-drop-zone input { display: none; }
 .upload-template-card .template-tag { color: var(--navy); }

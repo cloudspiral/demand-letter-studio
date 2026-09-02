@@ -10,6 +10,7 @@ import {
   generatedDraftJsonSchema,
   parseModelDraft,
   parseTemplateAnalysis,
+  promptForTemplateAnalysis,
 } from "./ai";
 import { deriveGenerationTargets } from "./template-map";
 
@@ -89,6 +90,7 @@ describe("AI provider adapter", () => {
         {
           blockId: "word/document.xml:p:0",
           role: "heading",
+          caseIndependentRemainder: true,
           confidence: 0.99,
           explanation: "Document heading with a matter-specific name.",
           inlineFields: [{
@@ -100,6 +102,7 @@ describe("AI provider adapter", () => {
         {
           blockId: "word/document.xml:p:1",
           role: "keep",
+          caseIndependentRemainder: true,
           confidence: 0.96,
           explanation: "Keep the label and replace the identifier.",
           inlineFields: [{
@@ -113,6 +116,7 @@ describe("AI provider adapter", () => {
     }, input);
 
     expect(result.regions.map((block) => block.role)).toEqual(["heading", "preserve"]);
+    expect(result.analysisVersion).toBe(7);
     expect(result.regions[0]?.inlineFields?.[0]).toMatchObject({ key: "heading_client_name", role: "replace" });
     expect(result.replacementCandidates.map((field) => field.fieldKey)).toEqual(["heading_client_name", "claim_number"]);
     expect(() => parseTemplateAnalysis({ decisions: [], knownCaseSpecificValues: [] }, input)).toThrow();
@@ -128,6 +132,7 @@ describe("AI provider adapter", () => {
     const result = parseTemplateAnalysis({
       decisions: [first, second].map((block) => ({
         blockId: block.id!, role: "keep" as const, confidence: 0.99,
+        caseIndependentRemainder: true,
         explanation: "Keep the label and replace the identifier.",
         inlineFields: [{
           key: "claim_number", label: "Claim number", start: 14, end: 21,
@@ -139,6 +144,81 @@ describe("AI provider adapter", () => {
     }, { filename: structural.filename, templateHash: "b".repeat(64), structuralAnalysis: structural });
     expect(result.blocks?.flatMap((block) => block.inlineFields?.map((field) => field.key) ?? []))
       .toEqual(["claim_number", "claim_number_2"]);
+  });
+
+  it("rejects Keep when a replaced person leaves case-dependent surrounding language", () => {
+    const text = "Mr. Donahue's claim is compensable because he suffered harm affecting his life.";
+    const structural = template([region({ paragraphIndex: 0, text })]);
+    const input = { filename: structural.filename, templateHash: "c".repeat(64), structuralAnalysis: structural };
+    const decision = {
+      blockId: "word/document.xml:p:0",
+      role: "keep" as const,
+      caseIndependentRemainder: false,
+      confidence: 0.99,
+      explanation: "The name is replaceable, but surrounding references still depend on that person.",
+      inlineFields: [{
+        key: "client_name", label: "Client name", start: 0, end: 11,
+        originalText: "Mr. Donahue", kind: "person" as const, confidence: 0.99,
+        explanation: "Previous matter name.", role: "replace" as const,
+      }],
+    };
+
+    expect(() => parseTemplateAnalysis({ decisions: [decision], knownCaseSpecificValues: ["Mr. Donahue"] }, input))
+      .toThrow(/remaining text is case-dependent/i);
+    expect(promptForTemplateAnalysis(input)).toContain("choose replace for the entire block");
+  });
+
+  it("keeps child fields independent under Keep and forces them to Replace under a replaced parent", () => {
+    const kept = region({ paragraphIndex: 0, text: "Claim Number: OLD-123" });
+    const replaced = region({ paragraphIndex: 1, text: "Old narrative OLD-456" });
+    const structural = template([kept, replaced]);
+    const input = { filename: structural.filename, templateHash: "d".repeat(64), structuralAnalysis: structural };
+    const field = (key: string, originalText: string, start: number) => ({
+      key, label: "Identifier", start, end: start + originalText.length, originalText,
+      kind: "claim-number" as const, confidence: 0.99,
+      explanation: "Previous matter identifier.", role: "keep" as const,
+    });
+    const result = parseTemplateAnalysis({
+      decisions: [
+        {
+          blockId: kept.id!, role: "keep" as const, caseIndependentRemainder: true, confidence: 0.99,
+          explanation: "Reusable label.", inlineFields: [field("kept_claim", "OLD-123", 14)],
+        },
+        {
+          blockId: replaced.id!, role: "replace" as const, caseIndependentRemainder: false, confidence: 0.99,
+          explanation: "Replace the complete narrative.", inlineFields: [field("replaced_claim", "OLD-456", 14)],
+        },
+      ],
+      knownCaseSpecificValues: ["OLD-123", "OLD-456"],
+    }, input);
+
+    expect(result.blocks?.[0]?.inlineFields?.[0]?.role).toBe("keep");
+    expect(result.blocks?.[1]?.inlineFields?.[0]?.role).toBe("replace");
+    expect(promptForTemplateAnalysis(input)).toContain("block keep preserves the surrounding block");
+  });
+
+  it("repairs a model field offset when its exact text identifies one span", () => {
+    const text = "TOTAL MEDICAL EXPENSES: $12,345.67";
+    const structural = template([region({ paragraphIndex: 63, text })]);
+    const result = parseTemplateAnalysis({
+      decisions: [{
+        blockId: "word/document.xml:p:63",
+        role: "keep",
+        caseIndependentRemainder: true,
+        confidence: 0.99,
+        explanation: "Keep the label and replace the total.",
+        inlineFields: [{
+          key: "total_medical_expenses", label: "Total medical expenses",
+          start: 23, end: 32, originalText: "$12,345.67", kind: "amount",
+          confidence: 0.99, explanation: "Previous matter total.", role: "replace",
+        }],
+      }],
+      knownCaseSpecificValues: ["$12,345.67"],
+    }, { filename: structural.filename, templateHash: "e".repeat(64), structuralAnalysis: structural });
+
+    const field = result.blocks?.[0]?.inlineFields?.[0];
+    expect(field).toMatchObject({ start: text.indexOf("$12,345.67"), end: text.length });
+    expect(text.slice(field?.start, field?.end)).toBe("$12,345.67");
   });
 
   it("keeps every strict generation-schema property explicitly required", () => {

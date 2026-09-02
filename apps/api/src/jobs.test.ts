@@ -5,6 +5,7 @@ import {
   ensureEditableCoverage,
   requireCurrentSourceFingerprint,
   requireWholeContextFits,
+  terminalEventForJob,
   validateGrounding,
 } from "./jobs";
 import { deriveGenerationTargets } from "./template-map";
@@ -56,6 +57,34 @@ function analysis(regions: TemplateAnalysis["regions"], replacementCandidates: T
 }
 
 describe("grounded generation validation", () => {
+  it("reconstructs terminal stream events from the durable job row", () => {
+    expect(terminalEventForJob({
+      status: "completed",
+      progress: 100,
+      step: "Draft ready",
+      draftId: "30000000-0000-4000-8000-000000000030",
+      result: { version: 2 },
+    })).toEqual({
+      eventType: "completed",
+      payload: {
+        progress: 100,
+        step: "Draft ready",
+        draftId: "30000000-0000-4000-8000-000000000030",
+        version: 2,
+      },
+    });
+    expect(terminalEventForJob({
+      status: "failed",
+      progress: 30,
+      step: "Generation failed",
+      error: "Provider timed out",
+    })).toEqual({
+      eventType: "failed",
+      payload: { progress: 30, step: "Generation failed", error: "Provider timed out" },
+    });
+    expect(terminalEventForJob({ status: "processing" })).toBeNull();
+  });
+
   it("rejects an oversize whole packet without silently dropping pages", () => {
     const previous = process.env.WHOLE_CONTEXT_MAX_CHARS;
     process.env.WHOLE_CONTEXT_MAX_CHARS = "20";
